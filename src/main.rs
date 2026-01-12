@@ -1,10 +1,12 @@
 extern crate clap;
 extern crate shrust;
 pub mod utils;
+use bio::alphabets;
+use bio::alphabets::Alphabet;
 use bio::io::fasta;
 use bio::stats::Prob;
 use clap::{arg, Command};
-use genedex::FmIndex;
+// use genedex::FmIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use itertools::Itertools;
@@ -19,11 +21,13 @@ use indicatif::ProgressStyle;
 use rayon::prelude::*;
 use std::path::Path;
 use anyhow::Result;
-use genedex::{FmIndexConfig, alphabet};
+use genedex::{FmIndexConfig, alphabet, FmIndexFlat64};
 use flate2::read::GzDecoder;
 use ndarray_stats::QuantileExt;
 use chrono::Local;
 use savefile::prelude::*;
+
+use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
 pub struct ReadID(String);
@@ -69,7 +73,7 @@ impl std::ops::Deref for RefIdx {
 
 #[derive(Savefile)]
 pub struct IOFMIndex{
-    fmidx: FmIndex<i64>,
+    fmidx: FmIndexFlat64<i64>,
     idx_to_id: HashMap<RefIdx, RefID>,
     id_to_idx: HashMap<RefID, RefIdx>,
     idx_to_seq: HashMap<RefIdx, Vec<u8>>
@@ -83,13 +87,21 @@ type MatchLikelihoods = HashMap<RefIdx, Prob>;
 type ReadAlignments = HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, Prob)>>>;
 
 /// Filters the matches found for different kmers and removes repeated alignments.
-fn clean_kmer_matches(fmidx: &FmIndex<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->HashMap<RefIdx, HashSet<usize>>{
+fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->HashMap<RefIdx, HashSet<usize>>{
     let mut match_positions: HashMap<RefIdx, HashSet<usize>> = HashMap::new();
     let read_seq = record.seq();
     let kmer_size = kmer_length(read_seq.len(), *percent_mismatch);
 
 
-    fmidx.locate_many(record.seq().windows(kmer_size))
+
+    fmidx.locate_many(
+        record.seq().windows(kmer_size).filter(|kmer| {
+            let read_alphabet = Alphabet::new(*kmer);
+            let dna_alphabet = alphabets::dna::alphabet();
+            // dbg!(&read_alphabet.symbols, &dna_alphabet.symbols);
+            read_alphabet.intersection(&dna_alphabet)==read_alphabet
+        })
+    )
         .zip(record.seq().windows(kmer_size))
         .enumerate()
         .for_each(|(kmer_start_read, (hits, _read_kmer))| {
@@ -98,8 +110,6 @@ fn clean_kmer_matches(fmidx: &FmIndex<i64>, refs: &HashMap<RefIdx, Vec<u8>>, rec
                     let seq_idx: RefIdx = RefIdx(ref_entry.text_id);
                     let _seq = refs.get(&seq_idx).unwrap();
                     let ref_start_pos_kmer = ref_entry.position;
-
-                    // println!("{}\n{}\n{}\n\n",  str::from_utf8(&seq[ref_start_pos_kmer..ref_start_pos_kmer+kmer_size]).unwrap(), str::from_utf8(&read_seq[kmer_start_read..kmer_start_read+kmer_size]).unwrap(), str::from_utf8(read_kmer).unwrap())
 
                     if ref_start_pos_kmer>=kmer_start_read{
                         // start position of alignment in reference for read
@@ -117,7 +127,7 @@ fn clean_kmer_matches(fmidx: &FmIndex<i64>, refs: &HashMap<RefIdx, Vec<u8>>, rec
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndex<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->Result<(Alignments, MatchLikelihoods)>{
+fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->Result<(Alignments, MatchLikelihoods)>{
 
     let read_len = record.seq().len();
     let read_seq = record.seq();
@@ -166,7 +176,7 @@ fn query_read(fmidx: &FmIndex<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fa
     Ok((best_match.into_inner().unwrap(), match_likelihood.into_inner().unwrap()))
 }
 
-fn process_fastq_file(fmidx: &FmIndex<i64>, 
+fn process_fastq_file(fmidx: &FmIndexFlat64<i64>, 
                     refs: &HashMap<RefIdx, Vec<u8>>, 
                     fastq_file: &Path, 
                     percent_mismatch: &f32)-> Result<(ReadAlignments, HashSet<RefIdx>)>
@@ -196,7 +206,14 @@ fn process_fastq_file(fmidx: &FmIndex<i64>,
     
     fastq_records
         .iter()
+        // .filter(|record| {
+        //     let read_alphabet = Alphabet::new(record.seq());
+        //     let dna_alphabet = alphabets::dna::alphabet();
+        //     // dbg!(&read_alphabet.symbols, &dna_alphabet.symbols);
+        //     read_alphabet.intersection(&dna_alphabet)==read_alphabet
+        // })
         .map(|record| {
+            // dbg!(record.seq());
             let (best_hits, match_likelihoods) = query_read(fmidx, refs, record, percent_mismatch).unwrap();
             (record.id().to_string(), best_hits, match_likelihoods)
         })
@@ -415,8 +432,11 @@ fn main() -> Result<()>{
 
             println!("{}", log_str);
 
-            let dna_alphabet = alphabet::ascii_dna_iupac_as_dna_with_n();
-            let fmidx = FmIndexConfig::<i64>::new().construct_index(refs_texts.iter().map(|x| str::from_utf8(x).unwrap()).collect_vec(), dna_alphabet);
+            let dna_alphabet = alphabet::ascii_dna();
+            let fmidx: FmIndexFlat64<_> = FmIndexConfig::<i64, FlatTextWithRankSupport<i64, Block64>>::new()
+                .suffix_array_sampling_rate(1)
+                .lookup_table_depth(13)
+                .construct_index(refs_texts.iter().map(|x| str::from_utf8(x).unwrap()).collect_vec(), dna_alphabet);
 
             let io_struct = IOFMIndex{
                 fmidx,
@@ -492,7 +512,9 @@ fn main() -> Result<()>{
 
             let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
 
-            let fmidx: FmIndex<i64> = iofmidx.fmidx;
+            let fmidx: FmIndexFlat64<i64> = iofmidx.fmidx;
+
+            // dbg!(fmidx.alphabet());
 
             let ref_ids = iofmidx.id_to_idx;
             let ref_ids_rev = iofmidx.idx_to_id;
