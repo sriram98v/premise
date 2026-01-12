@@ -206,12 +206,6 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
     
     fastq_records
         .iter()
-        // .filter(|record| {
-        //     let read_alphabet = Alphabet::new(record.seq());
-        //     let dna_alphabet = alphabets::dna::alphabet();
-        //     // dbg!(&read_alphabet.symbols, &dna_alphabet.symbols);
-        //     read_alphabet.intersection(&dna_alphabet)==read_alphabet
-        // })
         .map(|record| {
             // dbg!(record.seq());
             let (best_hits, match_likelihoods) = query_read(fmidx, refs, record, percent_mismatch).unwrap();
@@ -432,7 +426,7 @@ fn main() -> Result<()>{
 
             println!("{}", log_str);
 
-            let dna_alphabet = alphabet::ascii_dna();
+            let dna_alphabet = alphabet::ascii_dna_iupac_as_dna_with_n();
             let fmidx: FmIndexFlat64<_> = FmIndexConfig::<i64, FlatTextWithRankSupport<i64, Block64>>::new()
                 .suffix_array_sampling_rate(1)
                 .lookup_table_depth(13)
