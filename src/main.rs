@@ -95,13 +95,13 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 
 
     fmidx.locate_many(
-        record.seq().windows(kmer_size).filter(|kmer| {
-            let read_alphabet = Alphabet::new(*kmer);
-            let dna_alphabet = alphabets::dna::alphabet();
-            // dbg!(&read_alphabet.symbols, &dna_alphabet.symbols);
-            read_alphabet.intersection(&dna_alphabet)==read_alphabet
-        })
-    )
+    record.seq().windows(kmer_size).filter(|kmer| {
+                let read_alphabet = Alphabet::new(*kmer);
+                let dna_alphabet = alphabets::dna::alphabet();
+                // dbg!(&read_alphabet.symbols, &dna_alphabet.symbols);
+                read_alphabet.intersection(&dna_alphabet)==read_alphabet
+            })
+        )
         .zip(record.seq().windows(kmer_size))
         .enumerate()
         .for_each(|(kmer_start_read, (hits, _read_kmer))| {
