@@ -1,0 +1,6 @@
+/target
+/.venv
+*.fastq
+*.fasta
+*.treefile
+*.matches
