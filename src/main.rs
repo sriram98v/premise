@@ -142,7 +142,7 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
 
     let other_matches = clean_kmer_matches(fmidx, refs, record, percent_mismatch);
     
-    other_matches.into_par_iter().for_each(|hit| {
+    other_matches.into_iter().for_each(|hit| {
         let ref_id = hit.0;
         let ref_seq = refs.get(&ref_id).unwrap();
         let ref_len = ref_seq.len();
@@ -197,17 +197,16 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
        _ => {panic!("Invalid file type for reads!")}
     };
 
-    let mut out_aligns: HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, Prob)>>> = HashMap::new();
+    let out_aligns: Mutex<HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, Prob)>>>> = Mutex::new(HashMap::new());
 
     let pb = ProgressBar::with_draw_target(Some(fastq_records.len() as u64), ProgressDrawTarget::stdout());
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
-    let mut all_ref_ids: HashSet<RefIdx> = HashSet::new();
+    let all_ref_ids: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
     
     fastq_records
-        .iter()
+        .par_iter()
         .map(|record| {
-            // dbg!(record.seq());
             let (best_hits, match_likelihoods) = query_read(fmidx, refs, record, percent_mismatch).unwrap();
             (record.id().to_string(), best_hits, match_likelihoods)
         })
@@ -215,9 +214,9 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
             match_likelihoods.iter()
                 .for_each(|x| {
                     let best_align = best_hits.get(x.0).unwrap();
-                    all_ref_ids.insert(*x.0);
+                    all_ref_ids.lock().unwrap().insert(*x.0);
 
-                    out_aligns.entry(ReadID(read_id.clone()))
+                    out_aligns.lock().unwrap().entry(ReadID(read_id.clone()))
                         .or_default()
                         .entry(*x.0).or_default().push_back((best_align.0, *x.1));
 
@@ -229,7 +228,7 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
 
     // dbg!(&out_aligns);
     
-    Ok((out_aligns, all_ref_ids))
+    Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
 
 fn proportions_penalty(props: &Array1<f64>, gamma: f64)->f64{
@@ -507,8 +506,6 @@ fn main() -> Result<()>{
             let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
 
             let fmidx: FmIndexFlat64<i64> = iofmidx.fmidx;
-
-            // dbg!(fmidx.alphabet());
 
             let ref_ids = iofmidx.id_to_idx;
             let ref_ids_rev = iofmidx.idx_to_id;
