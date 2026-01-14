@@ -1,3 +1,4 @@
+extern crate blas_src;
 extern crate clap;
 extern crate shrust;
 pub mod utils;
@@ -6,7 +7,6 @@ use bio::alphabets::Alphabet;
 use bio::io::fasta;
 use bio::stats::Prob;
 use clap::{arg, Command};
-// use genedex::FmIndex;
 use indicatif::ProgressBar;
 use indicatif::ProgressDrawTarget;
 use itertools::Itertools;
@@ -26,7 +26,6 @@ use flate2::read::GzDecoder;
 use ndarray_stats::QuantileExt;
 use chrono::Local;
 use savefile::prelude::*;
-
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
@@ -225,24 +224,20 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
         });
 
     pb.finish_with_message("");
-
-    // dbg!(&out_aligns);
     
     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
 
-fn proportions_penalty(props: &Array1<f64>, gamma: f64)->f64{
+fn _proportions_penalty(props: &Array1<f64>, gamma: f64)->f64{
     let new_props = 1_f64 + props/gamma;
     new_props.sum().ln()
 }
 
 #[allow(unused_assignments)]
-fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64, penalty_gamma: f64)->(Vec<(ReadIdx, usize)>, Vec<f64>){
+fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, _penalty_weight: f64, _penalty_gamma: f64)->(Vec<(ReadIdx, usize)>, Vec<f64>){
     let num_reads = ll_array.shape()[0];
     let num_srcs = ll_array.shape()[1];
 
-    let pb = ProgressBar::new(num_iter as u64);
-    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     let mut props = Array::<f64, _>::zeros((num_iter+1, num_srcs).f());
     let mut w = Array::<f64, _>::zeros((num_reads, num_srcs).f());
@@ -260,32 +255,25 @@ fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64,
         props[[0, ref_idx]] = (count as f64)/(total as f64);
     }
 
+    let pb = ProgressBar::new(num_iter as u64);
+    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
     for i in 0..num_iter {
-        let tmp_prop = props.slice_mut(s![i, ..num_srcs]);
-
-        w = ll_array.clone()*tmp_prop;
-
-        let penalty = penalty_weight*proportions_penalty(&props.slice(s![i, ..num_srcs]).into_owned(), penalty_gamma);
-
-        w -= penalty;
+        w = ll_array*&props.slice_mut(s![i, ..]);
 
         let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
-
         w = w/clik;
-        w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
+        
+        w.par_mapv_inplace(|x| if x.is_nan() { 0. } else { x });
 
-        props.slice_mut(s![i+1, ..num_srcs]).assign(w.mean_axis(Axis(0)).as_ref().unwrap());
+        props.slice_mut(s![i+1, ..num_srcs]).assign(&w.mean_axis(Axis(0)).unwrap());
 
         pb.inc(1);
 
     }
     pb.finish_with_message("");
 
-    let mut em_props = Array::<f64, _>::zeros((num_srcs).f());
-
-    em_props.assign(&props.slice(s![num_iter, ..]));
-
-    w = ll_array.clone()*em_props;
+    w = ll_array*&props.slice(s![num_iter, ..]);
 
     let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
 
@@ -304,11 +292,7 @@ fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64,
 
     pb.finish_with_message("");
 
-    let mut em_props = Array::<f64, _>::zeros((num_srcs).f());
-
-    em_props.assign(&props.slice(s![num_iter, ..]));
-
-    (results, em_props.to_vec())
+    (results, props.slice(s![num_iter, ..]).to_vec())
 }
 
 
@@ -507,16 +491,30 @@ fn main() -> Result<()>{
 
             let fmidx: FmIndexFlat64<i64> = iofmidx.fmidx;
 
-            let ref_ids = iofmidx.id_to_idx;
+            let _ref_ids = iofmidx.id_to_idx;
             let ref_ids_rev = iofmidx.idx_to_id;
             let refs = iofmidx.idx_to_seq;
 
 
-            let (out_alignments, all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
+            let (out_aligns, _all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
+
+            let mut all_refs_filtered: HashSet<RefIdx> = HashSet::new();
+            let out_alignments: ReadAlignments = out_aligns.into_iter().map(|(read_id, aligns)| {
+                let mut alignment_dist = aligns.iter()
+                    .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|(pos, ll)| (*pos, ll.0)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap()))
+                    .collect_vec();
+                alignment_dist.sort_by(|a, b| a.1.1.total_cmp(&b.1.1));
+                alignment_dist.reverse();
+                let best_aligns: HashMap<RefIdx, VecDeque<(usize, Prob)>> = alignment_dist.iter().map(|x| (x.0, VecDeque::from([(x.1.0, Prob(x.1.1))]))).collect();
+                for ref_idx in best_aligns.keys(){
+                    all_refs_filtered.insert(*ref_idx);
+                }
+                (read_id, best_aligns)
+            }).collect();
 
             let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
             let mut em_ref_ids_rev: HashMap<RefIdx, usize> = HashMap::new();
-            for (n,ref_idx) in all_refs.into_iter().enumerate(){
+            for (n,ref_idx) in all_refs_filtered.into_iter().enumerate(){
                 em_ref_ids.insert(n, ref_idx);
                 em_ref_ids_rev.insert(ref_idx, n);
 
@@ -530,7 +528,7 @@ fn main() -> Result<()>{
             }
 
             println!("Number of reads aligned: {}", out_alignments.len());
-            println!("Number of potential sources: {}", ref_ids.len());
+            println!("Number of potential sources: {}", em_ref_ids.len());
             println!("Min Mem required: {} Gb", em_ref_ids.len() as f64*read_ids.len() as f64*64_f64*"1e-9".parse::<f64>().unwrap());
 
             let mut ll_array: ArrayBase<ndarray::OwnedRepr<f64>, Dim<[usize; 2]>> = Array2::<f64>::zeros((read_ids.len(), em_ref_ids.len()));
