@@ -7,8 +7,7 @@ use bio::alphabets::Alphabet;
 use bio::io::fasta;
 use bio::stats::Prob;
 use clap::{arg, Command};
-use indicatif::ProgressBar;
-use indicatif::ProgressDrawTarget;
+use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
 use ndarray::Array2;
 use ndarray::prelude::*;
@@ -26,6 +25,7 @@ use flate2::read::GzDecoder;
 use ndarray_stats::QuantileExt;
 use chrono::Local;
 use savefile::prelude::*;
+use std::time::Instant;
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
@@ -224,20 +224,21 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
         });
 
     pb.finish_with_message("");
+
+    // dbg!(&out_aligns);
     
     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
 
-fn _proportions_penalty(props: &Array1<f64>, gamma: f64)->f64{
+fn proportions_penalty(props: &Array1<f64>, gamma: f64)->f64{
     let new_props = 1_f64 + props/gamma;
     new_props.sum().ln()
 }
 
 #[allow(unused_assignments)]
-fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, _penalty_weight: f64, _penalty_gamma: f64)->(Vec<(ReadIdx, usize)>, Vec<f64>){
+fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64, penalty_gamma: f64)->(HashMap<ReadIdx, usize>, Vec<f64>){
     let num_reads = ll_array.shape()[0];
     let num_srcs = ll_array.shape()[1];
-
 
     let mut props = Array::<f64, _>::zeros((num_iter+1, num_srcs).f());
     let mut w = Array::<f64, _>::zeros((num_reads, num_srcs).f());
@@ -255,16 +256,20 @@ fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, _penalty_weight: f64
         props[[0, ref_idx]] = (count as f64)/(total as f64);
     }
 
-    let pb = ProgressBar::new(num_iter as u64);
+    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stdout());
     pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     for i in 0..num_iter {
         w = ll_array*&props.slice_mut(s![i, ..]);
 
+        let penalty = penalty_weight*proportions_penalty(&props.slice(s![i, ..num_srcs]).into_owned(), penalty_gamma);
+
+        w -= penalty;
+
         let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
+
         w = w/clik;
-        
-        w.par_mapv_inplace(|x| if x.is_nan() { 0. } else { x });
+        w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
 
         props.slice_mut(s![i+1, ..num_srcs]).assign(&w.mean_axis(Axis(0)).unwrap());
 
@@ -280,10 +285,10 @@ fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, _penalty_weight: f64
     w = w/clik;
     w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
 
-    let pb = ProgressBar::new(w.shape()[0] as u64);
+    let pb = ProgressBar::with_draw_target(Some(w.shape()[0] as u64), ProgressDrawTarget::stdout());
     pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
-    let results: Vec<(ReadIdx, usize)> = w.axis_iter(Axis(0)).enumerate().par_bridge().map(|(row_idx, row)| {
+    let results: HashMap<ReadIdx, usize> = w.axis_iter(Axis(0)).enumerate().par_bridge().map(|(row_idx, row)| {
         // dbg!(&row);
         let row_argmax = row.argmax_skipnan().unwrap();
         pb.inc(1);
@@ -304,7 +309,7 @@ fn main() -> Result<()>{
         .author("Sriram Vijendran <vijendran.sriram@gmail.com>")
         .subcommand(
             Command::new("build")
-                .about("Build suffix tree index from reference fasta file")
+                .about("Build FM-index from reference fasta file")
                 .arg(arg!(-s --source <SRC_FILE> "Source file with sequences(fasta)")
                     .required(true)
                 )
@@ -317,7 +322,7 @@ fn main() -> Result<()>{
         .subcommand(
             Command::new("fasta")
                .about("Generate Fasta file containing sequences present in index")
-               .arg(arg!(-i --index <INDEX_FILE> "Source index file of reference sequences(.sufr)")
+               .arg(arg!(-i --index <INDEX_FILE> "Source index file of reference sequences(.fmidx)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                 )
@@ -325,14 +330,14 @@ fn main() -> Result<()>{
         .subcommand(
             Command::new("inspect")
                .about("Inspect a pre-built index")
-               .arg(arg!(-i --index <INDEX_FILE> "Source index file of reference sequences(.sufr)")
+               .arg(arg!(-i --index <INDEX_FILE> "Source index file of reference sequences(.fmidx)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                 )
         )
         .subcommand(
             Command::new("query")
-                .arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.sufr)")
+                .arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
@@ -340,7 +345,11 @@ fn main() -> Result<()>{
                     .required(true)
                     .value_parser(clap::value_parser!(f32))
                     )
-                .arg(arg!(-r --reads <READS>"Source file with read sequences(fasta)")
+                .arg(arg!(-c --cutoff <CUTOFF>"Cutoff likelihood for dropping alignments")
+                    .default_value("1e-4")
+                    .value_parser(clap::value_parser!(f64))
+                    )
+                .arg(arg!(-r --reads <READS>"Source file with read sequences(fastq or fastq.gz)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
@@ -438,6 +447,7 @@ fn main() -> Result<()>{
             let reads_file = sub_m.get_one::<String>("reads").expect("required").as_str();
             let num_iter = sub_m.get_one::<usize>("iter").expect("required");
             let percent_mismatch = sub_m.get_one::<f32>("percent_mismatch").expect("required");
+            let cutoff = *sub_m.get_one::<f64>("cutoff").expect("required");
             let gamma = sub_m.get_one::<f64>("gamma").expect("required");
             let lambda = sub_m.get_one::<f64>("lambda").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
@@ -472,20 +482,22 @@ fn main() -> Result<()>{
             };
 
             let read_len = fastq_records.iter().map(|x| x.seq().len()).sum::<usize>() as f32/(fastq_records.len() as f32);
+            let all_read_ids: HashSet<ReadID> = fastq_records.iter().map(|x| ReadID(x.id().to_string())).collect();
 
-            let log_str = format!("Timestamp: {}\nReads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nEM Iterations: {}\nOutput File: {}",
+            let log_str = format!("Timestamp: {}\nReads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nCutoff likelihood: {:e}\nEM Iterations: {}\nOutput File: {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
                 reads_file,
                 ref_file,
                 num_threads,
                 percent_mismatch,
+                cutoff,
                 num_iter,
                 outfile,
             );
 
             println!("{}", log_str);
             println!("Num reads: {}", fastq_records.len());
-            println!("Average read len: {}", read_len);
+            println!("Average read len: {:.3} bp", read_len);
 
             let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
 
@@ -495,30 +507,53 @@ fn main() -> Result<()>{
             let ref_ids_rev = iofmidx.idx_to_id;
             let refs = iofmidx.idx_to_seq;
 
+            let now = Instant::now();
 
             let (out_aligns, _all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
 
-            let mut all_refs_filtered: HashSet<RefIdx> = HashSet::new();
+            let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stdout());
+            pb.set_style(ProgressStyle::with_template("Filtering alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
+            let all_refs_filtered: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
             let out_alignments: ReadAlignments = out_aligns.into_iter().map(|(read_id, aligns)| {
                 let mut alignment_dist = aligns.iter()
                     .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|(pos, ll)| (*pos, ll.0)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap()))
                     .collect_vec();
                 alignment_dist.sort_by(|a, b| a.1.1.total_cmp(&b.1.1));
                 alignment_dist.reverse();
-                let best_aligns: HashMap<RefIdx, VecDeque<(usize, Prob)>> = alignment_dist.iter().map(|x| (x.0, VecDeque::from([(x.1.0, Prob(x.1.1))]))).collect();
-                for ref_idx in best_aligns.keys(){
-                    all_refs_filtered.insert(*ref_idx);
+
+                let num_alignments = alignment_dist.len();
+
+                let read_alignment_max_likelihood = alignment_dist[0].1.1.exp();
+                
+                let mut n = 0;
+                while n<num_alignments && alignment_dist[n].1.1.exp()/read_alignment_max_likelihood>= cutoff{
+                    n+=1;
                 }
+                let usable_alignments = n;
+
+                let best_aligns: HashMap<RefIdx, VecDeque<(usize, Prob)>> = alignment_dist.iter()
+                    .take(usable_alignments)
+                    .map(|x| (x.0, VecDeque::from([(x.1.0, Prob(x.1.1))])))
+                    .collect();
+                for ref_idx in best_aligns.keys(){
+                    all_refs_filtered.lock().unwrap().insert(*ref_idx);
+                }
+                pb.inc(1);
                 (read_id, best_aligns)
             }).collect();
 
+            pb.finish_with_message("");
+
+
+
             let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
             let mut em_ref_ids_rev: HashMap<RefIdx, usize> = HashMap::new();
-            for (n,ref_idx) in all_refs_filtered.into_iter().enumerate(){
+            for (n,ref_idx) in all_refs_filtered.into_inner().unwrap().into_iter().enumerate(){
                 em_ref_ids.insert(n, ref_idx);
                 em_ref_ids_rev.insert(ref_idx, n);
-
             }
+
 
             let mut read_ids: HashMap<ReadID, ReadIdx> = HashMap::new();
             let mut read_ids_rev: HashMap<ReadIdx, ReadID> = HashMap::new();
@@ -527,9 +562,9 @@ fn main() -> Result<()>{
                 read_ids_rev.insert(ReadIdx(n), read_id.clone());
             }
 
-            println!("Number of reads aligned: {}", out_alignments.len());
+            println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/fastq_records.len() as f64)*100_f64);
             println!("Number of potential sources: {}", em_ref_ids.len());
-            println!("Min Mem required: {} Gb", em_ref_ids.len() as f64*read_ids.len() as f64*64_f64*"1e-9".parse::<f64>().unwrap());
+            println!("Min Mem required: {:.3} Gb", em_ref_ids.len() as f64*read_ids.len() as f64*64_f64*1e-9);
 
             let mut ll_array: ArrayBase<ndarray::OwnedRepr<f64>, Dim<[usize; 2]>> = Array2::<f64>::zeros((read_ids.len(), em_ref_ids.len()));
             ll_array.fill(f64::NEG_INFINITY);
@@ -552,25 +587,38 @@ fn main() -> Result<()>{
             pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
 
-            for (read_idx, em_ref_idx) in read_assignments.into_iter(){
-                    let ref_idx = em_ref_ids.get(&em_ref_idx).unwrap();
-                    let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
-                    let read_id = read_ids_rev.get(&read_idx).unwrap();
-                    
-                    if !out_alignments.contains_key(read_id){
-                        continue;
-                    }
-                    if !out_alignments.get(read_id).unwrap().contains_key(ref_idx){
-                        continue;
-                    }
+            for read_id in all_read_ids{
+                if !out_alignments.contains_key(&read_id){
+                    let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                        *read_id,
+                        "unclassified".to_string(), 
+                        "-".to_string(), 
+                        "-".to_string()
+                    );
+                    match outpath.as_ref(){
+                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                        None => {print!("{}", outstr)},
+                    };
+                    continue;
+                }
 
-                    if out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array[[*read_idx, em_ref_idx]].is_finite(){
-                        let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
-                            *read_ids_rev.get(&read_idx).unwrap().clone(),
-                            *ref_id.clone(), 
-                            out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().unwrap().0, 
-                            ll_array[[*read_idx, em_ref_idx]]
-                        );
+                let read_idx = *read_ids.get(&read_id).unwrap();
+                let em_ref_idx = read_assignments.get(&read_idx).unwrap();
+                let ref_idx = em_ref_ids.get(&em_ref_idx).unwrap();
+                let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+                let read_id = read_ids_rev.get(&read_idx).unwrap();
+
+                if !out_alignments.get(read_id).unwrap().contains_key(ref_idx){
+                    continue;
+                }
+
+                if out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array[[*read_idx, *em_ref_idx]].is_finite(){
+                    let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                        *read_ids_rev.get(&read_idx).unwrap().clone(),
+                        *ref_id.clone(), 
+                        out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().unwrap().0, 
+                        ll_array[[*read_idx, *em_ref_idx]]
+                    );
                     match outpath.as_ref(){
                         Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
                         None => {print!("{}", outstr)},
@@ -578,7 +626,9 @@ fn main() -> Result<()>{
                 }
             }
 
-            println!("{} reads could not be classified!", fastq_records.len()-out_alignments.len());
+            println!("{} reads ({:.3}%) could not be classified!", fastq_records.len()-out_alignments.len(), (((fastq_records.len()-out_alignments.len()) as f64)/fastq_records.len() as f64)*100_f64);
+            let elapsed_time = now.elapsed();
+            println!("Total runtime: {:.2?}", elapsed_time);
 
             pb.finish_with_message("");
         },
