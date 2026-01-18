@@ -78,6 +78,8 @@ pub struct IOFMIndex{
     idx_to_seq: HashMap<RefIdx, Vec<u8>>
 }
 
+type EMProb = f32;
+
 /// type to store all alignments of a read to references
 type Alignments = HashMap<RefIdx, (usize, Prob)>;
 /// type to store the best alignments of reads to references
@@ -91,19 +93,18 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
     let read_seq = record.seq();
     let kmer_size = kmer_length(read_seq.len(), *percent_mismatch);
 
-
-
     fmidx.locate_many(
     record.seq().windows(kmer_size).filter(|kmer| {
                 let read_alphabet = Alphabet::new(*kmer);
                 let dna_alphabet = alphabets::dna::alphabet();
-                // dbg!(&read_alphabet.symbols, &dna_alphabet.symbols);
+
                 read_alphabet.intersection(&dna_alphabet)==read_alphabet
             })
         )
         .zip(record.seq().windows(kmer_size))
         .enumerate()
         .for_each(|(kmer_start_read, (hits, _read_kmer))| {
+
             hits.into_iter()
                 .for_each(|ref_entry| {
                     let seq_idx: RefIdx = RefIdx(ref_entry.text_id);
@@ -135,7 +136,6 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
 
     let best_match: Mutex<HashMap<RefIdx, (usize, Prob)>> = Mutex::new(HashMap::new());
     let match_likelihood: Mutex<HashMap<RefIdx, Prob>> = Mutex::new(HashMap::new());
-
 
     // let matches = match_read_kmers(fmidx, record, percent_mismatch)?;
 
@@ -198,7 +198,7 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
 
     let out_aligns: Mutex<HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, Prob)>>>> = Mutex::new(HashMap::new());
 
-    let pb = ProgressBar::with_draw_target(Some(fastq_records.len() as u64), ProgressDrawTarget::stdout());
+    let pb = ProgressBar::with_draw_target(Some(fastq_records.len() as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     let all_ref_ids: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
@@ -230,18 +230,85 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
 
-fn proportions_penalty(props: &Array1<f64>, gamma: f64)->f64{
-    let new_props = 1_f64 + props/gamma;
+fn proportions_penalty(props: &Array1<EMProb>, gamma: EMProb)->EMProb{
+    let new_props = 1 as EMProb + props/gamma;
     new_props.sum().ln()
 }
 
 #[allow(unused_assignments)]
-fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64, penalty_gamma: f64)->(HashMap<ReadIdx, usize>, Vec<f64>){
+fn get_proportions_par(ll_array: &Array2<EMProb>, num_iter: usize, penalty_weight: EMProb, penalty_gamma: EMProb)->(HashMap<ReadIdx, usize>, Vec<EMProb>){
     let num_reads = ll_array.shape()[0];
     let num_srcs = ll_array.shape()[1];
 
-    let mut props = Array::<f64, _>::zeros((num_iter+1, num_srcs).f());
-    let mut w = Array::<f64, _>::zeros((num_reads, num_srcs).f());
+    let mut props = Array::<EMProb, _>::zeros((num_iter+1, num_srcs).f());
+    let mut w = Array::<EMProb, _>::zeros((num_reads, num_srcs).f());
+
+    let initial_props: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
+
+    ll_array.axis_iter(Axis(0)).into_par_iter().for_each(|row| {
+        let row_argmax = row.argmax_skipnan().unwrap();
+        initial_props.lock().unwrap().entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
+    });
+
+    let total = initial_props.lock().unwrap().values().sum::<usize>();
+
+    for (ref_idx, count) in initial_props.into_inner().unwrap().into_iter(){
+        props[[0, ref_idx]] = (count as EMProb)/(total as EMProb);
+    }
+
+    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
+    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
+    for i in 0..num_iter {
+        w = ll_array*&props.slice_mut(s![i, ..]);
+
+        let penalty = penalty_weight as EMProb*proportions_penalty(&props.slice(s![i, ..num_srcs]).into_owned(), penalty_gamma);
+
+        w -= penalty;
+
+        let mut clik = Vec::with_capacity(num_reads);
+
+        w.axis_iter(Axis(0)).into_par_iter().map(|x| x.sum()).collect_into_vec(&mut clik);
+
+        w = w/Array::from_vec(clik).insert_axis(Axis(1));
+        w.par_mapv_inplace(|x| if x.is_nan() { 0. } else { x });
+
+        props.slice_mut(s![i+1, ..num_srcs]).assign(&w.mean_axis(Axis(0)).unwrap());
+
+        pb.inc(1);
+
+    }
+    pb.finish_with_message("");
+
+    w = ll_array*&props.slice(s![num_iter, ..]);
+
+    let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
+
+    w = w/clik;
+    w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
+
+    let pb = ProgressBar::with_draw_target(Some(w.shape()[0] as u64), ProgressDrawTarget::stderr());
+    pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
+    let results: HashMap<ReadIdx, usize> = w.axis_iter(Axis(0)).enumerate().par_bridge().map(|(row_idx, row)| {
+        // dbg!(&row);
+        let row_argmax = row.argmax_skipnan().unwrap();
+        pb.inc(1);
+        (ReadIdx(row_idx), row_argmax)
+    }).collect();
+
+    pb.finish_with_message("");
+
+    (results, props.slice(s![num_iter, ..]).to_vec())
+}
+
+#[allow(unused_assignments)]
+fn _get_proportions(ll_array: &Array2<EMProb>, num_iter: usize, penalty_weight: EMProb, penalty_gamma: EMProb)->(HashMap<ReadIdx, usize>, Vec<EMProb>){
+    let num_reads = ll_array.shape()[0];
+    let num_srcs = ll_array.shape()[1];
+
+    let mut props = Array::<EMProb, _>::zeros((num_iter+1, num_srcs).f());
+    let mut w = Array::<EMProb, _>::zeros((num_reads, num_srcs).f());
 
     let mut initial_props: HashMap<usize, usize> = HashMap::new();
 
@@ -253,16 +320,16 @@ fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64,
     let total = initial_props.values().sum::<usize>();
 
     for (ref_idx, count) in initial_props.into_iter(){
-        props[[0, ref_idx]] = (count as f64)/(total as f64);
+        props[[0, ref_idx]] = (count as EMProb)/(total as EMProb);
     }
 
-    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stdout());
+    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     for i in 0..num_iter {
         w = ll_array*&props.slice_mut(s![i, ..]);
 
-        let penalty = penalty_weight*proportions_penalty(&props.slice(s![i, ..num_srcs]).into_owned(), penalty_gamma);
+        let penalty = penalty_weight as EMProb*proportions_penalty(&props.slice(s![i, ..num_srcs]).into_owned(), penalty_gamma);
 
         w -= penalty;
 
@@ -285,7 +352,7 @@ fn get_proportions(ll_array: &Array2<f64>, num_iter: usize, penalty_weight: f64,
     w = w/clik;
     w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
 
-    let pb = ProgressBar::with_draw_target(Some(w.shape()[0] as u64), ProgressDrawTarget::stdout());
+    let pb = ProgressBar::with_draw_target(Some(w.shape()[0] as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     let results: HashMap<ReadIdx, usize> = w.axis_iter(Axis(0)).enumerate().par_bridge().map(|(row_idx, row)| {
@@ -343,11 +410,11 @@ fn main() -> Result<()>{
                     )
                 .arg(arg!(-p --percent_mismatch <PERCENT_MISMATCH>"Percent mismatch to reference sequences")
                     .required(true)
-                    .value_parser(clap::value_parser!(f32))
+                    .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-c --cutoff <CUTOFF>"Cutoff likelihood for dropping alignments")
                     .default_value("1e-4")
-                    .value_parser(clap::value_parser!(f64))
+                    .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-r --reads <READS>"Source file with read sequences(fastq or fastq.gz)")
                     .required(true)
@@ -359,11 +426,11 @@ fn main() -> Result<()>{
                     )
                 .arg(arg!(-g --gamma <GAMMA>"penalty weight")
                     .default_value("1e-20")
-                    .value_parser(clap::value_parser!(f64))
+                    .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-l --lambda <LAMBDA>"penalty weight") 
                     .default_value("0")
-                    .value_parser(clap::value_parser!(f64))
+                    .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-o --out <OUT_FILE>"Output file")
                     .default_value("out.matches")
@@ -446,10 +513,10 @@ fn main() -> Result<()>{
             let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
             let reads_file = sub_m.get_one::<String>("reads").expect("required").as_str();
             let num_iter = sub_m.get_one::<usize>("iter").expect("required");
-            let percent_mismatch = sub_m.get_one::<f32>("percent_mismatch").expect("required");
-            let cutoff = *sub_m.get_one::<f64>("cutoff").expect("required");
-            let gamma = sub_m.get_one::<f64>("gamma").expect("required");
-            let lambda = sub_m.get_one::<f64>("lambda").expect("required");
+            let percent_mismatch = sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
+            let cutoff = *sub_m.get_one::<EMProb>("cutoff").expect("required");
+            let gamma = sub_m.get_one::<EMProb>("gamma").expect("required");
+            let lambda = sub_m.get_one::<EMProb>("lambda").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
 
             let outpath = Some(Mutex::new(File::create(outfile).unwrap()));
@@ -495,8 +562,10 @@ fn main() -> Result<()>{
                 outfile,
             );
 
+            let num_reads = all_read_ids.len();
+
             println!("{}", log_str);
-            println!("Num reads: {}", fastq_records.len());
+            println!("Num reads: {}", num_reads);
             println!("Average read len: {:.3} bp", read_len);
 
             let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
@@ -511,13 +580,14 @@ fn main() -> Result<()>{
 
             let (out_aligns, _all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
 
-            let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stdout());
+            let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stderr());
             pb.set_style(ProgressStyle::with_template("Filtering alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
             let all_refs_filtered: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
-            let out_alignments: ReadAlignments = out_aligns.into_iter().map(|(read_id, aligns)| {
+            // let out_alignments: ReadAlignments = 
+            out_aligns.iter().for_each(|(_, aligns)| {
                 let mut alignment_dist = aligns.iter()
-                    .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|(pos, ll)| (*pos, ll.0)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap()))
+                    .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|(pos, ll)| (*pos, ll.0 as EMProb)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap()))
                     .collect_vec();
                 alignment_dist.sort_by(|a, b| a.1.1.total_cmp(&b.1.1));
                 alignment_dist.reverse();
@@ -534,17 +604,22 @@ fn main() -> Result<()>{
 
                 let best_aligns: HashMap<RefIdx, VecDeque<(usize, Prob)>> = alignment_dist.iter()
                     .take(usable_alignments)
-                    .map(|x| (x.0, VecDeque::from([(x.1.0, Prob(x.1.1))])))
+                    .map(|x| (x.0, VecDeque::from([(x.1.0, Prob(x.1.1.into()))])))
                     .collect();
                 for ref_idx in best_aligns.keys(){
                     all_refs_filtered.lock().unwrap().insert(*ref_idx);
                 }
                 pb.inc(1);
-                (read_id, best_aligns)
-            }).collect();
+            });
 
             pb.finish_with_message("");
 
+            let out_alignments: ReadAlignments = out_aligns.into_iter()
+                .map(|(read_id, mut aligns)| {
+                    aligns.retain(|&k, _| all_refs_filtered.lock().unwrap().contains(&k));
+                    (read_id, aligns)
+                })
+                .collect();
 
 
             let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
@@ -562,12 +637,12 @@ fn main() -> Result<()>{
                 read_ids_rev.insert(ReadIdx(n), read_id.clone());
             }
 
-            println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/fastq_records.len() as f64)*100_f64);
+            println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/num_reads as f64)*100_f64);
             println!("Number of potential sources: {}", em_ref_ids.len());
-            println!("Min Mem required: {:.3} Gb", em_ref_ids.len() as f64*read_ids.len() as f64*64_f64*1e-9);
+            println!("Min Mem required: {:.3} Gb", em_ref_ids.len() as f64*read_ids.len() as f64*32_f64*1e-9);
 
-            let mut ll_array: ArrayBase<ndarray::OwnedRepr<f64>, Dim<[usize; 2]>> = Array2::<f64>::zeros((read_ids.len(), em_ref_ids.len()));
-            ll_array.fill(f64::NEG_INFINITY);
+            let mut ll_array: ArrayBase<ndarray::OwnedRepr<EMProb>, Dim<[usize; 2]>> = Array2::<EMProb>::zeros((read_ids.len(), em_ref_ids.len()));
+            ll_array.fill(EMProb::NEG_INFINITY);
 
             for (read_id, alignments) in out_alignments.iter(){
                 for (ref_idx, positions) in alignments{
@@ -575,13 +650,13 @@ fn main() -> Result<()>{
                     let read_idx = read_ids.get(read_id).unwrap();
 
                     for (_, score) in positions.iter(){
-                        ll_array[[**read_idx, *em_ref_idx]] = **score;
+                        ll_array[[**read_idx, *em_ref_idx]] = **score as EMProb;
                     }
                 }
             }
 
 
-            let (read_assignments, _props) = get_proportions(&ll_array.exp(), *num_iter, *lambda, *gamma);
+            let (read_assignments, _props) = get_proportions_par(&ll_array.exp(), *num_iter, *lambda, *gamma);
 
             let pb = ProgressBar::new(read_assignments.len() as u64);
             pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
@@ -626,7 +701,7 @@ fn main() -> Result<()>{
                 }
             }
 
-            println!("{} reads ({:.3}%) could not be classified!", fastq_records.len()-out_alignments.len(), (((fastq_records.len()-out_alignments.len()) as f64)/fastq_records.len() as f64)*100_f64);
+            println!("{} reads ({:.3}%) could not be classified!", num_reads-out_alignments.len(), (((num_reads-out_alignments.len()) as f64)/num_reads as f64)*100_f64);
             let elapsed_time = now.elapsed();
             println!("Total runtime: {:.2?}", elapsed_time);
 
