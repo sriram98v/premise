@@ -1,4 +1,4 @@
-use bio::stats::Prob;
+use bio::stats::{LogProb, Prob};
 use itertools::izip;
 use std::path::Path;
 use std::{io::Write, fs};
@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 
 /// Compute probability of match given ref is true source
-pub fn compute_match_log_prob(q_seq: &[u8], quality_score_vec: &[u8], aligned_ref_seq: &[u8]) -> Prob{
+pub fn compute_match_log_prob(q_seq: &[u8], quality_score_vec: &[u8], aligned_ref_seq: &[u8]) -> LogProb{
     let mut match_log_likelihood = 0_f64;
     for (read_char,reference_char,quality_score) in izip!(q_seq.iter(), aligned_ref_seq.iter(), quality_score_vec){
         match read_char==reference_char{
@@ -14,7 +14,7 @@ pub fn compute_match_log_prob(q_seq: &[u8], quality_score_vec: &[u8], aligned_re
             false => match_log_likelihood += (*error_prob(*quality_score)*(1_f64/3_f64)).log10(),
         }
     }
-    Prob(match_log_likelihood)
+    LogProb(match_log_likelihood)
 }
 
 /// Compute minimum length of match required for a partial match.
