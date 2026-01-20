@@ -5,7 +5,7 @@ pub mod utils;
 use bio::alphabets;
 use bio::alphabets::Alphabet;
 use bio::io::fasta;
-use bio::stats::Prob;
+use bio::stats::LogProb;
 use clap::{arg, Command};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
@@ -81,11 +81,11 @@ pub struct IOFMIndex{
 type EMProb = f32;
 
 /// type to store all alignments of a read to references
-type Alignments = HashMap<RefIdx, (usize, Prob)>;
+type Alignments = HashMap<RefIdx, (usize, LogProb)>;
 /// type to store the best alignments of reads to references
-type MatchLikelihoods = HashMap<RefIdx, Prob>;
+type MatchLikelihoods = HashMap<RefIdx, LogProb>;
 /// type to store all alignments of all reads to references
-type ReadAlignments = HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, Prob)>>>;
+type ReadAlignments = HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, LogProb)>>>;
 
 /// Filters the matches found for different kmers and removes repeated alignments.
 fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->HashMap<RefIdx, HashSet<usize>>{
@@ -134,8 +134,8 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
     let read_qual = record.qual();
     let max_num_mismatches: usize = (read_len as f32 * (percent_mismatch/100_f32)).floor() as usize;
 
-    let best_match: Mutex<HashMap<RefIdx, (usize, Prob)>> = Mutex::new(HashMap::new());
-    let match_likelihood: Mutex<HashMap<RefIdx, Prob>> = Mutex::new(HashMap::new());
+    let best_match: Mutex<HashMap<RefIdx, (usize, LogProb)>> = Mutex::new(HashMap::new());
+    let match_likelihood: Mutex<HashMap<RefIdx, LogProb>> = Mutex::new(HashMap::new());
 
     // let matches = match_read_kmers(fmidx, record, percent_mismatch)?;
 
@@ -196,7 +196,7 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
        _ => {panic!("Invalid file type for reads!")}
     };
 
-    let out_aligns: Mutex<HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, Prob)>>>> = Mutex::new(HashMap::new());
+    let out_aligns: Mutex<HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, LogProb)>>>> = Mutex::new(HashMap::new());
 
     let pb = ProgressBar::with_draw_target(Some(fastq_records.len() as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
@@ -602,9 +602,9 @@ fn main() -> Result<()>{
                 }
                 let usable_alignments = n;
 
-                let best_aligns: HashMap<RefIdx, VecDeque<(usize, Prob)>> = alignment_dist.iter()
+                let best_aligns: HashMap<RefIdx, VecDeque<(usize, LogProb)>> = alignment_dist.iter()
                     .take(usable_alignments)
-                    .map(|x| (x.0, VecDeque::from([(x.1.0, Prob(x.1.1.into()))])))
+                    .map(|x| (x.0, VecDeque::from([(x.1.0, LogProb(x.1.1.into()))])))
                     .collect();
                 for ref_idx in best_aligns.keys(){
                     all_refs_filtered.lock().unwrap().insert(*ref_idx);
