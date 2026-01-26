@@ -27,6 +27,7 @@ use chrono::Local;
 use savefile::prelude::*;
 use std::time::Instant;
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
+use std::cmp;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
 pub struct ReadID(String);
@@ -87,9 +88,60 @@ type MatchLikelihoods = HashMap<RefIdx, LogProb>;
 /// type to store all alignments of all reads to references
 type ReadAlignments = HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, LogProb)>>>;
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Savefile)]
+pub struct MEMPos{
+    pub ref_start: usize,
+    pub ref_end: usize,
+    pub read_start: usize, 
+    pub read_end: usize,
+}
+
+impl MEMPos{
+    fn is_consecutive(&self, kmer: &MEMPos)->bool{
+        if kmer.read_start>=self.read_start{
+            if kmer.ref_start>=self.ref_start{
+                return true;
+            }
+        }
+        false
+    }
+    fn is_overlapping(&self, kmer: &MEMPos)->bool{
+        if kmer.read_start-self.read_start == kmer.ref_start-self.ref_start{
+            if kmer.read_end-self.read_end == kmer.ref_end-self.ref_end{
+                return true;
+            }
+        }
+        false
+    }
+    fn merge(&mut self, kmer: &MEMPos){
+        self.read_start = cmp::min(kmer.read_start, self.read_start);
+        self.read_end = cmp::max(kmer.read_end, self.read_end);
+        self.ref_start = cmp::min(kmer.ref_start, self.ref_start);
+        self.ref_end = cmp::max(kmer.ref_end, self.ref_end);
+    }
+}
+
+
+fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
+    let mut out_vec = Vec::with_capacity(kmer_matches.len());
+    out_vec.push(kmer_matches[0]);
+    for kmer_match in kmer_matches{
+        for running_mem in out_vec.iter_mut(){
+            if running_mem.is_consecutive(kmer_match){
+                if running_mem.is_overlapping(kmer_match){
+                    running_mem.merge(kmer_match);
+                }
+            }
+        }
+    }
+
+    out_vec
+}
+
 /// Filters the matches found for different kmers and removes repeated alignments.
-fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->HashMap<RefIdx, HashSet<usize>>{
+fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
     let mut match_positions: HashMap<RefIdx, HashSet<usize>> = HashMap::new();
+    let mut mems: HashMap<RefIdx, VecDeque<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a references denoted by 
     let read_seq = record.seq();
     let kmer_size = kmer_length(read_seq.len(), *percent_mismatch);
 
@@ -111,6 +163,15 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
                     let _seq = refs.get(&seq_idx).unwrap();
                     let ref_start_pos_kmer = ref_entry.position;
 
+                    mems.entry(seq_idx)
+                        .or_insert(VecDeque::new())
+                        .push_back(
+                                MEMPos { ref_start: ref_start_pos_kmer, 
+                                    ref_end: ref_start_pos_kmer+kmer_size,
+                                    read_start: kmer_start_read, 
+                                    read_end: kmer_start_read+kmer_size }
+                        );
+
                     if ref_start_pos_kmer>=kmer_start_read{
                         // start position of alignment in reference for read
                         let align_start = ref_start_pos_kmer-kmer_start_read;
@@ -120,49 +181,59 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 
                 })
         });
+    
+    let merged_mems: HashMap<RefIdx, Vec<MEMPos>> = mems.into_iter().map(|(k, v)| (k, merge_kmer_matches(&v))).collect();
 
-    match_positions
+    (match_positions, merged_mems)
 }
 
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->Result<(Alignments, MatchLikelihoods)>{
+fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->Result<(Alignments, MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
 
     let read_len = record.seq().len();
     let read_seq = record.seq();
     let read_qual = record.qual();
     let max_num_mismatches: usize = (read_len as f32 * (percent_mismatch/100_f32)).floor() as usize;
 
-    let best_match: Mutex<HashMap<RefIdx, (usize, LogProb)>> = Mutex::new(HashMap::new());
-    let match_likelihood: Mutex<HashMap<RefIdx, LogProb>> = Mutex::new(HashMap::new());
 
-    // let matches = match_read_kmers(fmidx, record, percent_mismatch)?;
+    let mut best_match: HashMap<RefIdx, (usize, LogProb)> = HashMap::new();
+    let mut match_likelihood: HashMap<RefIdx, LogProb> = HashMap::new();
+    let mut softclipped: HashMap<RefIdx, HashSet<MEMPos>> = HashMap::new();
 
-    let other_matches = clean_kmer_matches(fmidx, refs, record, percent_mismatch);
+    let (_other_matches, mems) = clean_kmer_matches(fmidx, refs, record, percent_mismatch);
     
-    other_matches.into_iter().for_each(|hit| {
+    mems.into_iter().for_each(|hit| {
         let ref_id = hit.0;
         let ref_seq = refs.get(&ref_id).unwrap();
         let ref_len = ref_seq.len();
         
-        for ref_pos in hit.1.iter(){
+        for mem in hit.1.iter(){
+            let read_pos = mem.read_start;
+
+            if mem.ref_start<read_pos{
+                softclipped.entry(ref_id)
+                    .or_insert(HashSet::new())
+                    .insert(*mem);
+                continue;
+            }
+            let ref_pos = mem.ref_start-mem.read_start;
             if ref_pos+read_len<ref_len{
-                let ref_match_seg = &ref_seq[*ref_pos..ref_pos+read_len];
+                let ref_match_seg = &ref_seq[ref_pos..ref_pos+read_len];
                 if num_mismatches(read_seq, ref_match_seg)<=max_num_mismatches{
-                    // dbg!(str::from_utf8(read_seq).unwrap(), str::from_utf8(ref_match_seg).unwrap());
                     let match_log_prob = compute_match_log_prob(read_seq, read_qual, ref_match_seg);
 
-                    best_match.lock().unwrap().entry(ref_id)
+                    best_match.entry(ref_id)
                         .and_modify(|e| {
                             if e.1<=match_log_prob{
-                                *e = (*ref_pos, match_log_prob);
+                                *e = (ref_pos, match_log_prob);
                             }
                         })
-                        .or_insert((*ref_pos, match_log_prob));
+                        .or_insert((ref_pos, match_log_prob));
 
                     // update match score
-                    match_likelihood.lock().unwrap().entry(ref_id)
+                    match_likelihood.entry(ref_id)
                         .and_modify(|e| {
                             *e = *e + match_log_prob;
                         })
@@ -172,7 +243,7 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
         }
     });
 
-    Ok((best_match.into_inner().unwrap(), match_likelihood.into_inner().unwrap()))
+    Ok((best_match, match_likelihood, softclipped))
 }
 
 fn process_fastq_file(fmidx: &FmIndexFlat64<i64>, 
@@ -202,11 +273,21 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     let all_ref_ids: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
+
+    let softclipped_alignments: Mutex<HashMap<ReadID, HashMap<RefIdx, HashSet<MEMPos>>>> = Mutex::new(HashMap::new());
     
     fastq_records
         .par_iter()
         .map(|record| {
-            let (best_hits, match_likelihoods) = query_read(fmidx, refs, record, percent_mismatch).unwrap();
+            let (best_hits, match_likelihoods, softclipped) = query_read(fmidx, refs, record, percent_mismatch).unwrap();
+
+            if softclipped.len()>0 && match_likelihoods.len()==0{
+                softclipped_alignments.lock().unwrap()
+                    .entry(ReadID(record.id().to_string()))
+                    .or_insert(HashMap::new())
+                    .extend(softclipped);
+            }
+
             (record.id().to_string(), best_hits, match_likelihoods)
         })
         .for_each(|(read_id, best_hits, match_likelihoods)| {
@@ -224,8 +305,6 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
         });
 
     pb.finish_with_message("");
-
-    // dbg!(&out_aligns);
     
     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
