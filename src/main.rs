@@ -375,13 +375,13 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
             let f = File::open(fastq_file)?;
             let decoder = GzDecoder::new(f);
 
-            fastq::Reader::from_bufread(BufReader::new(decoder)).records().map(|x| x.unwrap()).collect_vec()
+            fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
             // fastq::Reader::from_bufread(GzDecoder::new(reader)).records()
        },
        Some("fastq")|Some("fq") => {
             let f = File::open(fastq_file)?;
             let reader = BufReader::new(f);
-            fastq::Reader::from_bufread(reader).records().map(|x| x.unwrap()).collect_vec()
+            fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
         },
        _ => {panic!("Invalid file type for reads!")}
     };
@@ -813,12 +813,12 @@ fn main() -> Result<()>{
                 Some("gz") => {
                     let f = File::open(reads_file)?;
                     let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder)).records().map(|x| x.unwrap()).collect_vec()
+                    fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
                 },
                 Some("fastq")|Some("fq") => {
                     let f = File::open(reads_file)?;
                     let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader).records().map(|x| x.unwrap()).collect_vec()
+                    fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
                 },
                 _ => panic!("Invalid file type for reads!")
             };
