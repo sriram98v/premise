@@ -678,6 +678,29 @@ fn main() -> Result<()>{
                 )
         )
         .subcommand(
+            Command::new("align")
+                .arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
+                    .required(true)
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(-p --percent_mismatch <PERCENT_MISMATCH>"Percent mismatch to reference sequences")
+                    .required(true)
+                    .value_parser(clap::value_parser!(EMProb))
+                    )
+                .arg(arg!(-r --reads <READS>"Source file with read sequences(fastq or fastq.gz)")
+                    .required(true)
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(-o --out <OUT_FILE>"Output file")
+                    .default_value("out.aligns")
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
+                    .default_value("2")
+                    .value_parser(clap::value_parser!(usize))
+                    )
+        )
+        .subcommand(
             Command::new("query")
                 .arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
                     .required(true)
@@ -783,6 +806,129 @@ fn main() -> Result<()>{
                 }
             };
 
+        },
+        Some(("align",  sub_m)) => {
+            let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
+            let reads_file = sub_m.get_one::<String>("reads").expect("required").as_str();
+            let percent_mismatch = sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
+            let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
+
+            let outpath = Some(Mutex::new(File::create(outfile).unwrap()));
+            let outstr = "ReadID\tRefID\tStart_pos\tLikelihood\n".to_string();
+            match outpath.as_ref(){
+                Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                None => {print!("{}", outstr)},
+            };
+
+
+            let num_threads = match sub_m.get_one::<usize>("threads").expect("required"){
+                0 => thread::available_parallelism()?.get(),
+                _ => *sub_m.get_one::<usize>("threads").expect("required"),
+            };
+            
+            rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
+
+            let fastq_records = match get_extension_from_filename(reads_file){
+                Some("gz") => {
+                    let f = File::open(reads_file)?;
+                    let decoder = GzDecoder::new(f);
+                    fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
+                },
+                Some("fastq")|Some("fq") => {
+                    let f = File::open(reads_file)?;
+                    let reader = BufReader::new(f);
+                    fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
+                },
+                _ => panic!("Invalid file type for reads!")
+            };
+
+            let read_len = fastq_records.iter().map(|x| x.seq().len()).sum::<usize>() as f32/(fastq_records.len() as f32);
+            let all_read_ids: HashSet<ReadID> = fastq_records.iter().map(|x| ReadID(x.id().to_string())).collect();
+
+            let log_str = format!("Timestamp: {}\nReads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nOutput File: {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                reads_file,
+                ref_file,
+                num_threads,
+                percent_mismatch,
+                outfile,
+            );
+
+            let num_reads = all_read_ids.len();
+
+            println!("{}", log_str);
+            println!("Num reads: {}", num_reads);
+            println!("Average read len: {:.3} bp", read_len);
+
+            let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
+
+            let fmidx: FmIndexFlat64<i64> = iofmidx.fmidx;
+
+            let _ref_ids = iofmidx.id_to_idx;
+            let ref_ids_rev = iofmidx.idx_to_id;
+            let refs = iofmidx.idx_to_seq;
+
+            let now = Instant::now();
+
+            let (out_alignments, _all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
+
+            let mut read_ids: HashMap<ReadID, ReadIdx> = HashMap::new();
+            let mut read_ids_rev: HashMap<ReadIdx, ReadID> = HashMap::new();
+            for (n, read_id) in out_alignments.keys().enumerate() {
+                read_ids.insert(read_id.clone(), ReadIdx(n));
+                read_ids_rev.insert(ReadIdx(n), read_id.clone());
+            }
+
+            println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/num_reads as f64)*100_f64);
+
+            let pb = ProgressBar::new(out_alignments.len() as u64);
+            pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
+
+            for read_id in all_read_ids{
+                if !out_alignments.contains_key(&read_id){
+                    let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                        *read_id,
+                        "unclassified".to_string(), 
+                        "-".to_string(), 
+                        "-".to_string()
+                    );
+                    match outpath.as_ref(){
+                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                        None => {print!("{}", outstr)},
+                    };
+                    continue;
+                }
+
+                let read_idx = *read_ids.get(&read_id).unwrap();
+
+                let read_aligns = out_alignments.get(&read_id).unwrap();
+                for (ref_idx,aligns) in read_aligns{
+
+                    let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+
+                    for (pos,likelihood) in aligns{
+                        let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                            *read_ids_rev.get(&read_idx).unwrap().clone(),
+                            *ref_id.clone(), 
+                            pos, 
+                            likelihood.exp(),
+                        );
+                        match outpath.as_ref(){
+                            Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                            None => {print!("{}", outstr)},
+                        };
+                    }
+
+                }
+
+            }
+
+            println!("{} reads ({:.3}%) could not be classified!", num_reads-out_alignments.len(), (((num_reads-out_alignments.len()) as f64)/num_reads as f64)*100_f64);
+            let elapsed_time = now.elapsed();
+            println!("Total runtime: {:.2?}", elapsed_time);
+
+            pb.finish_with_message("");
         },
         Some(("query",  sub_m)) => {
             let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
