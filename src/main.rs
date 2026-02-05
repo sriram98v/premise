@@ -1,16 +1,13 @@
-extern crate blas_src;
 extern crate clap;
-extern crate shrust;
 pub mod utils;
 use bio::alphabets;
 use bio::alphabets::Alphabet;
 use bio::io::fasta;
 use bio::stats::LogProb;
 use clap::{arg, Command};
+use dashmap::DashMap;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
-use ndarray::Array2;
-use ndarray::prelude::*;
 use utils::*;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
@@ -24,7 +21,6 @@ use std::path::Path;
 use anyhow::Result;
 use genedex::{FmIndexConfig, alphabet, FmIndexFlat64};
 use flate2::read::GzDecoder;
-use ndarray_stats::QuantileExt;
 use chrono::Local;
 use savefile::prelude::*;
 use std::time::Instant;
@@ -82,7 +78,7 @@ pub struct IOFMIndex{
     idx_to_seq: HashMap<RefIdx, Vec<u8>>
 }
 
-type EMProb = f32;
+type EMProb = f64;
 
 /// type to store all alignments of a read to references
 type Alignments = HashMap<RefIdx, (usize, LogProb)>;
@@ -143,6 +139,13 @@ impl<T: Copy + Send + Sync + Debug> SparseArray<T>{
         self.values.get(&index)
     }
 
+    fn contains_key(&self, index: &(ReadIdx, RefIdx)) -> bool {
+        self.values.contains_key(&index)
+    }
+
+    fn contains_ref(&self, index: &RefIdx) -> bool {
+        self.ref_idxs_read_map.contains_key(&index)
+    }
 
     fn get_read_idxs(&self)->HashSet<ReadIdx>{
         self.read_idxs_ref_map.keys().cloned().collect()
@@ -152,7 +155,7 @@ impl<T: Copy + Send + Sync + Debug> SparseArray<T>{
         self.ref_idxs_read_map.keys().cloned().collect()
     }
 
-    fn get_all_read_hits(&self, read_idx: &ReadIdx)->Vec<T>{
+    fn _get_all_read_hits(&self, read_idx: &ReadIdx)->Vec<T>{
         let ref_idxs: &Vec<RefIdx> = self.read_idxs_ref_map.get(read_idx).unwrap();
         let mut out: Vec<T> = Vec::with_capacity(ref_idxs.len());
 
@@ -164,7 +167,7 @@ impl<T: Copy + Send + Sync + Debug> SparseArray<T>{
         out
     }
 
-    fn get_all_read_hits_par(&self, read_idx: &ReadIdx)->Vec<T>{
+    fn _get_all_read_hits_par(&self, read_idx: &ReadIdx)->Vec<T>{
         let ref_idxs: &Vec<RefIdx> = self.read_idxs_ref_map.get(read_idx).unwrap();
         let out: Mutex<Vec<T>> = Mutex::new(Vec::with_capacity(ref_idxs.len()));
 
@@ -258,7 +261,7 @@ fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
 }
 
 /// Filters the matches found for different kmers and removes repeated alignments.
-fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
+fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
     let mut match_positions: HashMap<RefIdx, HashSet<usize>> = HashMap::new();
     let mut mems: HashMap<RefIdx, VecDeque<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a references denoted by 
     let read_seq = record.seq();
@@ -309,12 +312,12 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &f32)->Result<(Alignments, MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
+fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb)->Result<(Alignments, MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
 
     let read_len = record.seq().len();
     let read_seq = record.seq();
     let read_qual = record.qual();
-    let max_num_mismatches: usize = (read_len as f32 * (percent_mismatch/100_f32)).floor() as usize;
+    let max_num_mismatches: usize = (read_len as EMProb * (percent_mismatch/100 as EMProb)).floor() as usize;
 
 
     let mut best_match: HashMap<RefIdx, (usize, LogProb)> = HashMap::new();
@@ -368,7 +371,7 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
 fn process_fastq_file(fmidx: &FmIndexFlat64<i64>, 
                     refs: &HashMap<RefIdx, Vec<u8>>, 
                     fastq_file: &Path, 
-                    percent_mismatch: &f32)-> Result<(ReadAlignments, HashSet<RefIdx>)>
+                    percent_mismatch: &EMProb)-> Result<(ReadAlignments, HashSet<RefIdx>)>
 {
     let fastq_records = match get_extension_from_filename(fastq_file.to_str().expect("Invalid reads file!")){
        Some("gz") => {
@@ -428,56 +431,69 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
 
-fn _proportions_penalty(props: &Array1<EMProb>, gamma: EMProb)->EMProb{
-    let new_props = 1 as EMProb + props/gamma;
-    new_props.sum().ln()
-}
-
-#[allow(unused_assignments)]
 fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _penalty_weight: EMProb, _penalty_gamma: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
     let num_reads = ll_array.num_reads();
 
+    let read_idxs = ll_array.get_read_idxs();
+    // let ref_idxs = ll_array.get_ref_idxs();
+
     let mut props: Vec<HashMap<RefIdx, EMProb>> = vec![HashMap::new();num_iter+1];
-    let w: Mutex<SparseArray<EMProb>> = Mutex::new(SparseArray::default());
+    let mut w: SparseArray<EMProb> = SparseArray::default();
 
-    let initial_props: Mutex<HashMap<RefIdx, usize>> = Mutex::new(HashMap::new());
+    let initial_props: DashMap<RefIdx, usize> = DashMap::new();
 
-    ll_array.get_read_idxs().into_par_iter().for_each(|read_idx| {
+    read_idxs.par_iter().for_each(|read_idx| {
         let row_argmax = ll_array.get_all_read_hits_idx(&read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
             EMProb::total_cmp(f1, f2)
         }).unwrap().0;
-        initial_props.lock().unwrap().entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
+        initial_props.entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
     });
 
-    let total = initial_props.lock().unwrap().values().sum::<usize>();
+    let total = initial_props.iter().map(|x| *x.value()).sum::<usize>();
 
-    for (ref_idx, count) in initial_props.into_inner().unwrap().into_iter(){
+    for (ref_idx, count) in initial_props.into_iter(){
         props[0].insert(ref_idx, (count as EMProb)/(total as EMProb));
     }
 
     let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
+
     for i in 0..num_iter {
 
-        ll_array.triples().par_bridge().for_each(|(x, val)| {
-            w.lock().unwrap().insert(x.0, x.1, val*props[i].get(&x.1).unwrap_or(&(0 as EMProb)));
+        // dbg!(i, "update w");
+        ll_array.triples().for_each(|(x, val)| {
+            if props[i].contains_key(&x.1){
+                w.insert(x.0, x.1, val*props[i].get(&x.1).unwrap_or(&(0 as EMProb)));
+            }
         });
 
-        let clik: HashMap<ReadIdx, EMProb> = ll_array.get_read_idxs()
+        // dbg!(i, "compute clik");
+        let clik: DashMap<ReadIdx, EMProb> = DashMap::new();
+        
+        read_idxs
             .iter()
-            .map(|read_idx| (*read_idx, w.lock().unwrap().get_all_read_hits_par(read_idx).iter().sum::<EMProb>()))
-            .collect();
+            .par_bridge()
+            .for_each(|read_idx| {
+                let pr_rspr_s = ll_array.get_all_read_hits_idx(read_idx).into_iter().map(|(ref_idx, val)| val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb))).sum::<EMProb>();
+                clik.entry(*read_idx).and_modify(|e| *e += pr_rspr_s).or_insert(pr_rspr_s);
+            });
 
-        ll_array.triples().par_bridge().for_each(|(x, _) | {
-            w.lock().unwrap()[*x] /= clik[&x.0];
+
+        // dbg!(i, "compute posterior");
+        ll_array.triples().for_each(|(x, _) | {
+            if w.contains_key(x){
+                w[*x] /= *clik.get(&x.0).unwrap();
+            }
         });
 
+        // dbg!(i, "update props");
         props[i+1] = ll_array.get_ref_idxs()
             .par_iter()
+            .filter(|x| w.contains_ref(x))
             .map(|ref_idx| {
-                let vals = w.lock().unwrap().get_all_ref_hits(ref_idx);
-                (*ref_idx, vals.iter().sum::<EMProb>()/(vals.len() as EMProb))
+                let vals = w.get_all_ref_hits(ref_idx);
+                (*ref_idx, vals.iter().sum::<EMProb>()/(num_reads as EMProb))
             })
             .collect();
 
@@ -486,23 +502,12 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
     }
     pb.finish_with_message("");
 
-    ll_array.triples().par_bridge().for_each(|(x, val)| {
-        w.lock().unwrap().insert(x.0, x.1, val*props[num_iter].get(&x.1).unwrap_or(&(0 as EMProb)));
-    });
-
-    let clik: HashMap<ReadIdx, EMProb> = ll_array.get_read_idxs()
-        .par_iter()
-        .map(|read_idx| (*read_idx, w.lock().unwrap().get_all_read_hits(read_idx).iter().sum::<EMProb>()))
-        .collect();
-
-    ll_array.triples().par_bridge().for_each(|(x, _) | {
-        w.lock().unwrap()[*x] /= clik[&x.0];
-    });
-
     let pb = ProgressBar::with_draw_target(Some(num_reads as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
-    let results: HashMap<ReadIdx, RefIdx> = w.lock().unwrap().get_read_idxs().iter().par_bridge().map(|read_idx| {
+    let ref_idxs = w.get_read_idxs();
+
+    let results: HashMap<ReadIdx, RefIdx> = ref_idxs.iter().par_bridge().map(|read_idx| {
         let row_argmax = ll_array.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
             EMProb::total_cmp(f1, f2)
         }).unwrap().0;
@@ -512,137 +517,8 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
 
     pb.finish_with_message("");
 
-    (results, props[num_iter].clone(), w.into_inner().unwrap())
+    (results, props[num_iter].clone(), w)
 }
-
-
-#[allow(unused_assignments)]
-fn _get_proportions_par(ll_array: &Array2<EMProb>, num_iter: usize, _penalty_weight: EMProb, _penalty_gamma: EMProb)->(HashMap<ReadIdx, usize>, Vec<EMProb>){
-    let num_reads = ll_array.shape()[0];
-    let num_srcs = ll_array.shape()[1];
-
-    let mut props = Array::<EMProb, _>::zeros((num_iter+1, num_srcs).f());
-    let mut w = Array::<EMProb, _>::zeros((num_reads, num_srcs).f());
-
-    let initial_props: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
-
-    ll_array.axis_iter(Axis(0)).into_par_iter().for_each(|row| {
-        let row_argmax = row.argmax_skipnan().unwrap();
-        initial_props.lock().unwrap().entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
-    });
-
-    let total = initial_props.lock().unwrap().values().sum::<usize>();
-
-    for (ref_idx, count) in initial_props.into_inner().unwrap().into_iter(){
-        props[[0, ref_idx]] = (count as EMProb)/(total as EMProb);
-    }
-
-    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
-
-    for i in 0..num_iter {
-        w = ll_array*&props.slice_mut(s![i, ..]);
-
-        let mut clik = Vec::with_capacity(num_reads);
-
-        w.axis_iter(Axis(0)).into_par_iter().map(|x| x.sum()).collect_into_vec(&mut clik);
-
-        w = w/Array::from_vec(clik).insert_axis(Axis(1));
-        w.par_mapv_inplace(|x| if x.is_nan() { 0. } else { x });
-
-        props.slice_mut(s![i+1, ..num_srcs]).assign(&w.mean_axis(Axis(0)).unwrap());
-
-        pb.inc(1);
-
-    }
-    pb.finish_with_message("");
-
-    w = ll_array*&props.slice(s![num_iter, ..]);
-
-    let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
-
-    w = w/clik;
-    w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
-
-    let pb = ProgressBar::with_draw_target(Some(w.shape()[0] as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
-
-    let results: HashMap<ReadIdx, usize> = w.axis_iter(Axis(0)).enumerate().par_bridge().map(|(row_idx, row)| {
-        let row_argmax = row.argmax_skipnan().unwrap();
-        pb.inc(1);
-        (ReadIdx(row_idx), row_argmax)
-    }).collect();
-
-    pb.finish_with_message("");
-
-    (results, props.slice(s![num_iter, ..]).to_vec())
-}
-
-#[allow(unused_assignments)]
-fn _get_proportions(ll_array: &Array2<EMProb>, num_iter: usize, _penalty_weight: EMProb, _penalty_gamma: EMProb)->(HashMap<ReadIdx, usize>, Vec<EMProb>){
-    let num_reads = ll_array.shape()[0];
-    let num_srcs = ll_array.shape()[1];
-
-    let mut props = Array::<EMProb, _>::zeros((num_iter+1, num_srcs).f());
-    let mut w = Array::<EMProb, _>::zeros((num_reads, num_srcs).f());
-
-    let mut initial_props: HashMap<usize, usize> = HashMap::new();
-
-    ll_array.axis_iter(Axis(0)).for_each(|row| {
-        let row_argmax = row.argmax_skipnan().unwrap();
-        initial_props.entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
-    });
-
-    let total = initial_props.values().sum::<usize>();
-
-    for (ref_idx, count) in initial_props.into_iter(){
-        props[[0, ref_idx]] = (count as EMProb)/(total as EMProb);
-    }
-
-    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
-
-    for i in 0..num_iter {
-        w = ll_array*&props.slice_mut(s![i, ..]);
-
-        // let penalty = penalty_weight as EMProb*proportions_penalty(&props.slice(s![i, ..num_srcs]).into_owned(), penalty_gamma);
-
-        // w -= penalty;
-
-        let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
-
-        w = w/clik;
-        w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
-
-        props.slice_mut(s![i+1, ..num_srcs]).assign(&w.mean_axis(Axis(0)).unwrap());
-
-        pb.inc(1);
-
-    }
-    pb.finish_with_message("");
-
-    w = ll_array*&props.slice(s![num_iter, ..]);
-
-    let clik = w.sum_axis(Axis(1)).insert_axis(Axis(1));
-
-    w = w/clik;
-    w.mapv_inplace(|x| if x.is_nan() { 0. } else { x });
-
-    let pb = ProgressBar::with_draw_target(Some(w.shape()[0] as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
-
-    let results: HashMap<ReadIdx, usize> = w.axis_iter(Axis(0)).enumerate().par_bridge().map(|(row_idx, row)| {
-        let row_argmax = row.argmax_skipnan().unwrap();
-        pb.inc(1);
-        (ReadIdx(row_idx), row_argmax)
-    }).collect();
-
-    pb.finish_with_message("");
-
-    (results, props.slice(s![num_iter, ..]).to_vec())
-}
-
-
 
 
 fn main() -> Result<()>{
@@ -1106,11 +982,11 @@ fn main() -> Result<()>{
                 }
 
                 if out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array[(read_idx, *ref_idx)].is_finite(){
-                    let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                    let outstr = format!("{}\t{}\t{}\t{:.5e}\n", 
                         *read_ids_rev.get(&read_idx).unwrap().clone(),
                         *ref_id.clone(), 
                         out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().unwrap().0, 
-                        posteriors.get(&(read_idx, *ref_idx)).expect("Read-reference alignment was never found!").ln(),
+                        posteriors.get(&(read_idx, *ref_idx)).expect("Read-reference alignment was never found!"),
                     );
                     match outpath.as_ref(){
                         Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
