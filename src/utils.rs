@@ -5,6 +5,8 @@ use std::{io::Write, fs};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 
+use crate::EMProb;
+
 /// Compute probability of match given ref is true source
 pub fn compute_match_log_prob(q_seq: &[u8], quality_score_vec: &[u8], aligned_ref_seq: &[u8]) -> LogProb{
     let mut match_log_likelihood = 0_f64;
@@ -18,8 +20,8 @@ pub fn compute_match_log_prob(q_seq: &[u8], quality_score_vec: &[u8], aligned_re
 }
 
 /// Compute minimum length of match required for a partial match.
-pub fn kmer_length(seq_len: usize, percent_mismatch: f32)->usize{
-    let num_mismatches: usize = (seq_len as f32 * (percent_mismatch/100_f32)).floor() as usize;
+pub fn kmer_length(seq_len: usize, percent_mismatch: EMProb)->usize{
+    let num_mismatches: usize = (seq_len as EMProb * (percent_mismatch/100 as EMProb)).floor() as usize;
     seq_len/(num_mismatches+1)
 }
 
