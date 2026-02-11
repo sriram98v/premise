@@ -3,21 +3,20 @@ pub mod utils;
 use bio::alphabets;
 use bio::alphabets::Alphabet;
 use bio::io::fasta;
-use bio::stats::LogProb;
+use bio::stats::{LogProb, Prob};
 use clap::{arg, Command};
 use dashmap::DashMap;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
+use num::{Float, Zero};
 use utils::*;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
-use std::ops::IndexMut;
 use std::thread;
 use std::{collections::HashMap, fs::File, io::{BufReader, Write}, sync::Mutex};
 use bio::io::fastq;
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
-use std::path::Path;
 use anyhow::Result;
 use genedex::{FmIndexConfig, alphabet, FmIndexFlat64};
 use flate2::read::GzDecoder;
@@ -26,7 +25,12 @@ use savefile::prelude::*;
 use std::time::Instant;
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 use std::cmp;
-use std::ops::Index;
+
+pub struct ReadPair{
+    read_id: ReadID,
+    r1: fastq::Record,
+    r2: fastq::Record,
+}
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
 pub struct ReadID(String);
@@ -97,18 +101,14 @@ pub struct MEMPos{
 
 impl MEMPos{
     fn is_consecutive(&self, kmer: &MEMPos)->bool{
-        if kmer.read_start>=self.read_start{
-            if kmer.ref_start>=self.ref_start{
-                return true;
-            }
+        if kmer.read_start>=self.read_start && kmer.ref_start>=self.ref_start{
+            return true;
         }
         false
     }
     fn is_overlapping(&self, kmer: &MEMPos)->bool{
-        if kmer.read_start-self.read_start == kmer.ref_start-self.ref_start{
-            if kmer.read_end-self.read_end == kmer.ref_end-self.ref_end{
-                return true;
-            }
+        if kmer.read_start-self.read_start == kmer.ref_start-self.ref_start && kmer.read_end-self.read_end == kmer.ref_end-self.ref_end{
+            return true;
         }
         false
     }
@@ -121,66 +121,39 @@ impl MEMPos{
 }
 
 /// Dictionary of Keys (DoK) format for sparse array to store likelihoods
-#[derive(Debug, Clone, Savefile, Default)]
-pub struct SparseArray<T: Copy + Send + Sync + Debug>{
-    values: HashMap<(ReadIdx,RefIdx), T>,
-    read_idxs_ref_map: HashMap<ReadIdx, Vec<RefIdx>>,
-    ref_idxs_read_map: HashMap<RefIdx, Vec<ReadIdx>>,
+#[derive(Debug, Clone, Default)]
+pub struct SparseArray<T: Float + Zero + Copy + Send + Sync + Debug>{
+    pub values: DashMap<(ReadIdx,RefIdx), T>,
+    pub read_idxs_ref_map: DashMap<ReadIdx, HashSet<RefIdx>>,
+    pub ref_idxs_read_map: DashMap<RefIdx, HashSet<ReadIdx>>,
 }
 
-impl<T: Copy + Send + Sync + Debug> SparseArray<T>{
+impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T>{
     fn insert(&mut self, read_idx: ReadIdx, ref_idx: RefIdx, val: T){
         self.values.insert((read_idx, ref_idx), val);
-        self.read_idxs_ref_map.entry(read_idx).or_insert(vec![]).push(ref_idx);
-        self.ref_idxs_read_map.entry(ref_idx).or_insert(vec![]).push(read_idx);
+        self.read_idxs_ref_map.entry(read_idx).or_default().insert(ref_idx);
+        self.ref_idxs_read_map.entry(ref_idx).or_default().insert(read_idx);
     }
 
-    fn get(&self, index: &(ReadIdx, RefIdx)) -> Option<&T> {
-        self.values.get(&index)
-    }
-
-    fn contains_key(&self, index: &(ReadIdx, RefIdx)) -> bool {
-        self.values.contains_key(&index)
-    }
-
-    fn contains_ref(&self, index: &RefIdx) -> bool {
-        self.ref_idxs_read_map.contains_key(&index)
+    fn get(&self, index: &(ReadIdx, RefIdx)) -> T {
+        if self.values.contains_key(index){
+            *self.values.get(index).unwrap()
+        }
+        else {
+            T::zero()
+        }
     }
 
     fn get_read_idxs(&self)->HashSet<ReadIdx>{
-        self.read_idxs_ref_map.keys().cloned().collect()
+        self.read_idxs_ref_map.iter().map(|x| *x.key()).collect()
     }
 
     fn get_ref_idxs(&self)->HashSet<RefIdx>{
-        self.ref_idxs_read_map.keys().cloned().collect()
-    }
-
-    fn _get_all_read_hits(&self, read_idx: &ReadIdx)->Vec<T>{
-        let ref_idxs: &Vec<RefIdx> = self.read_idxs_ref_map.get(read_idx).unwrap();
-        let mut out: Vec<T> = Vec::with_capacity(ref_idxs.len());
-
-        for ref_idx in ref_idxs{
-            if let Some(x) = self.values.get(&(*read_idx, *ref_idx)) {
-                out.push(*x);
-            }
-        }
-        out
-    }
-
-    fn _get_all_read_hits_par(&self, read_idx: &ReadIdx)->Vec<T>{
-        let ref_idxs: &Vec<RefIdx> = self.read_idxs_ref_map.get(read_idx).unwrap();
-        let out: Mutex<Vec<T>> = Mutex::new(Vec::with_capacity(ref_idxs.len()));
-
-        ref_idxs.par_iter().for_each(|ref_idx | {
-            if let Some(x) = self.values.get(&(*read_idx, *ref_idx)) {
-                out.lock().unwrap().push(*x);
-            }
-        });
-        out.into_inner().unwrap()
+        self.ref_idxs_read_map.iter().map(|x| *x.key()).collect()
     }
 
     fn get_all_read_hits_idx(&self, read_idx: &ReadIdx)->Vec<(RefIdx, T)>{
-        let ref_idxs: &Vec<RefIdx> = self.read_idxs_ref_map.get(read_idx).unwrap();
+        let ref_idxs: &HashSet<RefIdx> = &self.read_idxs_ref_map.get(read_idx).unwrap();
         let mut out: Vec<(RefIdx, T)> = Vec::with_capacity(ref_idxs.len());
 
         for ref_idx in ref_idxs{
@@ -192,8 +165,9 @@ impl<T: Copy + Send + Sync + Debug> SparseArray<T>{
     }
 
     fn get_all_ref_hits(&self, ref_idx: &RefIdx)->Vec<T>{
-        let read_idxs: &Vec<ReadIdx> = self.ref_idxs_read_map.get(ref_idx).unwrap();
+        let read_idxs: &HashSet<ReadIdx> = &self.ref_idxs_read_map.get(ref_idx).unwrap();
         let mut out: Vec<T> = Vec::with_capacity(read_idxs.len());
+
 
         for read_idx in read_idxs{
             if let Some(x) = self.values.get(&(*read_idx, *ref_idx)) {
@@ -203,56 +177,18 @@ impl<T: Copy + Send + Sync + Debug> SparseArray<T>{
         out
     }
 
-    fn _get_all_ref_hits_par(&self, ref_idx: &RefIdx)->Vec<T>{
-        let read_idxs: &Vec<ReadIdx> = self.ref_idxs_read_map.get(ref_idx).unwrap();
-        let out: Mutex<Vec<T>> = Mutex::new(Vec::with_capacity(read_idxs.len()));
-
-        read_idxs.par_iter().for_each(|read_idx | {
-            if let Some(x) = self.values.get(&(*read_idx, *ref_idx)) {
-                out.lock().unwrap().push(*x);
-            }
-        });
-        out.into_inner().unwrap()
-    }
-
     fn num_reads(&self)->usize{
         self.get_read_idxs().len()
     }
-
-    fn _num_refs(&self)->usize{
-        self.get_ref_idxs().len()
-    }
-
-    fn triples(&self)->impl Iterator<Item=(&(ReadIdx, RefIdx), &T)>{
-        self.values.iter()
-    }
-
 }
-
-impl<T: Copy + Send + Sync + Debug> Index<(ReadIdx, RefIdx)> for SparseArray<T>{
-    type Output = T;
-
-    fn index(&self, index: (ReadIdx, RefIdx)) -> &Self::Output {
-        self.values.get(&index).expect("Invalid key!")
-    }
-}
-
-impl<T: Copy + Send + Sync + Debug> IndexMut<(ReadIdx, RefIdx)> for SparseArray<T>{
-    fn index_mut(&mut self, index: (ReadIdx, RefIdx)) -> &mut Self::Output {
-        self.values.get_mut(&index).expect("Invalid key!")
-    }
-}
-
 
 fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
     let mut out_vec = Vec::with_capacity(kmer_matches.len());
     out_vec.push(kmer_matches[0]);
     for kmer_match in kmer_matches{
         for running_mem in out_vec.iter_mut(){
-            if running_mem.is_consecutive(kmer_match){
-                if running_mem.is_overlapping(kmer_match){
+            if running_mem.is_consecutive(kmer_match) && running_mem.is_overlapping(kmer_match){
                     running_mem.merge(kmer_match);
-                }
             }
         }
     }
@@ -261,14 +197,17 @@ fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
 }
 
 /// Filters the matches found for different kmers and removes repeated alignments.
-fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
+fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
     let mut match_positions: HashMap<RefIdx, HashSet<usize>> = HashMap::new();
     let mut mems: HashMap<RefIdx, VecDeque<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a references denoted by 
-    let read_seq = record.seq();
+    let read_seq = match complement {
+        true => bio::alphabets::dna::revcomp(record.seq()),
+        false => record.seq().to_vec(),
+    };
     let kmer_size = kmer_length(read_seq.len(), *percent_mismatch);
 
     fmidx.locate_many(
-    record.seq().windows(kmer_size).filter(|kmer| {
+        read_seq.windows(kmer_size).filter(|kmer| {
                 let read_alphabet = Alphabet::new(*kmer);
                 let dna_alphabet = alphabets::dna::alphabet();
 
@@ -286,7 +225,7 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
                     let ref_start_pos_kmer = ref_entry.position;
 
                     mems.entry(seq_idx)
-                        .or_insert(VecDeque::new())
+                        .or_default()
                         .push_back(
                                 MEMPos { ref_start: ref_start_pos_kmer, 
                                     ref_end: ref_start_pos_kmer+kmer_size,
@@ -312,19 +251,24 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb)->Result<(Alignments, MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
+fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->Result<(Alignments, MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
 
     let read_len = record.seq().len();
-    let read_seq = record.seq();
-    let read_qual = record.qual();
+    let read_seq = match complement {
+        true => bio::alphabets::dna::revcomp(record.seq()),
+        false => record.seq().to_vec(),
+    };
+    let read_qual = match complement {
+        true => record.qual().iter().rev().cloned().collect_vec(),
+        false => record.qual().to_vec(),
+    };
     let max_num_mismatches: usize = (read_len as EMProb * (percent_mismatch/100 as EMProb)).floor() as usize;
-
 
     let mut best_match: HashMap<RefIdx, (usize, LogProb)> = HashMap::new();
     let mut match_likelihood: HashMap<RefIdx, LogProb> = HashMap::new();
     let mut softclipped: HashMap<RefIdx, HashSet<MEMPos>> = HashMap::new();
 
-    let (_other_matches, mems) = clean_kmer_matches(fmidx, refs, record, percent_mismatch);
+    let (_other_matches, mems) = clean_kmer_matches(fmidx, refs, record, percent_mismatch, complement);
     
     mems.into_iter().for_each(|hit| {
         let ref_id = hit.0;
@@ -336,15 +280,15 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
 
             if mem.ref_start<read_pos{
                 softclipped.entry(ref_id)
-                    .or_insert(HashSet::new())
+                    .or_default()
                     .insert(*mem);
                 continue;
             }
             let ref_pos = mem.ref_start-mem.read_start;
             if ref_pos+read_len<ref_len{
                 let ref_match_seg = &ref_seq[ref_pos..ref_pos+read_len];
-                if num_mismatches(read_seq, ref_match_seg)<=max_num_mismatches{
-                    let match_log_prob = compute_match_log_prob(read_seq, read_qual, ref_match_seg);
+                if num_mismatches(&read_seq, ref_match_seg)<=max_num_mismatches{
+                    let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, &ref_match_seg);
 
                     best_match.entry(ref_id)
                         .and_modify(|e| {
@@ -357,7 +301,7 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
                     // update match score
                     match_likelihood.entry(ref_id)
                         .and_modify(|e| {
-                            *e = *e + match_log_prob;
+                            *e += match_log_prob;
                         })
                         .or_insert(match_log_prob);
                 }
@@ -368,49 +312,52 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
     Ok((best_match, match_likelihood, softclipped))
 }
 
-fn process_fastq_file(fmidx: &FmIndexFlat64<i64>, 
+fn process_read_pairs(fmidx: &FmIndexFlat64<i64>, 
                     refs: &HashMap<RefIdx, Vec<u8>>, 
-                    fastq_file: &Path, 
+                    read_pairs: &[ReadPair], 
                     percent_mismatch: &EMProb)-> Result<(ReadAlignments, HashSet<RefIdx>)>
 {
-    let fastq_records = match get_extension_from_filename(fastq_file.to_str().expect("Invalid reads file!")){
-       Some("gz") => {
-            let f = File::open(fastq_file)?;
-            let decoder = GzDecoder::new(f);
+    let out_aligns: Mutex<ReadAlignments> = Mutex::new(HashMap::new());
 
-            fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
-            // fastq::Reader::from_bufread(GzDecoder::new(reader)).records()
-       },
-       Some("fastq")|Some("fq") => {
-            let f = File::open(fastq_file)?;
-            let reader = BufReader::new(f);
-            fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
-        },
-       _ => {panic!("Invalid file type for reads!")}
-    };
-
-    let out_aligns: Mutex<HashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, LogProb)>>>> = Mutex::new(HashMap::new());
-
-    let pb = ProgressBar::with_draw_target(Some(fastq_records.len() as u64), ProgressDrawTarget::stderr());
+    let pb = ProgressBar::with_draw_target(Some(read_pairs.len() as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     let all_ref_ids: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
 
-    let softclipped_alignments: Mutex<HashMap<ReadID, HashMap<RefIdx, HashSet<MEMPos>>>> = Mutex::new(HashMap::new());
     
-    fastq_records
+    read_pairs
         .par_iter()
-        .map(|record| {
-            let (best_hits, match_likelihoods, softclipped) = query_read(fmidx, refs, record, percent_mismatch).unwrap();
+        .map(|read_pair| {
+            let r1_rec = &read_pair.r1;
+            let r2_rec = &read_pair.r2;
 
-            if softclipped.len()>0 && match_likelihoods.len()==0{
-                softclipped_alignments.lock().unwrap()
-                    .entry(ReadID(record.id().to_string()))
-                    .or_insert(HashMap::new())
-                    .extend(softclipped);
-            }
+            let mut best_hits: HashMap<RefIdx, (usize, LogProb)> = HashMap::new();
+            let mut match_likelihoods: HashMap<RefIdx, LogProb> = HashMap::new();
 
-            (record.id().to_string(), best_hits, match_likelihoods)
+            let (r1_best_hits, r1_match_likelihoods, _) = query_read(fmidx, refs, &r1_rec, percent_mismatch, false).unwrap();
+            let (r1_rc_best_hits, r1_rc_match_likelihoods, _) = query_read(fmidx, refs, &r1_rec, percent_mismatch, true).unwrap();
+            
+            let (_, r2_match_likelihoods, _) = query_read(fmidx, refs, &r2_rec, percent_mismatch, false).unwrap();
+            let (_, r2_rc_match_likelihoods, _) = query_read(fmidx, refs, &r2_rec, percent_mismatch, true).unwrap();
+
+            let r1_keys: HashSet<RefIdx> = r1_match_likelihoods.keys().cloned().collect();
+            let r1_rc_keys: HashSet<RefIdx> = r1_rc_match_likelihoods.keys().cloned().collect();
+            let r2_keys: HashSet<RefIdx> = r2_match_likelihoods.keys().cloned().collect();
+            let r2_rc_keys: HashSet<RefIdx> = r2_rc_match_likelihoods.keys().cloned().collect();
+
+            r1_keys.intersection(&r2_rc_keys).for_each(|x| {
+                best_hits.insert(*x, *r1_best_hits.get(x).unwrap());
+                let match_prob = LogProb::from(Prob(0.5)) + r1_match_likelihoods.get(x).unwrap() + r2_rc_match_likelihoods.get(x).unwrap();
+                match_likelihoods.insert(*x, match_prob);
+            });
+
+            r1_rc_keys.intersection(&r2_keys).for_each(|x| {
+                best_hits.insert(*x, *r1_rc_best_hits.get(x).unwrap());
+                let match_prob = LogProb::from(Prob(0.5)) + r1_rc_match_likelihoods.get(x).unwrap() + r2_match_likelihoods.get(x).unwrap();
+                match_likelihoods.entry(*x).and_modify(|v| *v = LogProb::from(Prob(v.exp() + match_prob.exp()))).or_insert(match_prob);
+            });
+
+            (read_pair.read_id.to_string(), best_hits, match_likelihoods)
         })
         .for_each(|(read_id, best_hits, match_likelihoods)| {
             match_likelihoods.iter()
@@ -431,19 +378,81 @@ fn process_fastq_file(fmidx: &FmIndexFlat64<i64>,
     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
 }
 
+// fn process_fastq_file(fmidx: &FmIndexFlat64<i64>, 
+//                     refs: &HashMap<RefIdx, Vec<u8>>, 
+//                     fastq_file: &Path, 
+//                     percent_mismatch: &EMProb)-> Result<(ReadAlignments, HashSet<RefIdx>)>
+// {
+//     let fastq_records = match get_extension_from_filename(fastq_file.to_str().expect("Invalid reads file!")){
+//        Some("gz") => {
+//             let f = File::open(fastq_file)?;
+//             let decoder = GzDecoder::new(f);
+
+//             fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
+//        },
+//        Some("fastq")|Some("fq") => {
+//             let f = File::open(fastq_file)?;
+//             let reader = BufReader::new(f);
+//             fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
+//         },
+//        _ => {panic!("Invalid file type for reads!")}
+//     };
+
+//     let out_aligns: Mutex<ReadAlignments> = Mutex::new(HashMap::new());
+
+//     let pb = ProgressBar::with_draw_target(Some(fastq_records.len() as u64), ProgressDrawTarget::stderr());
+//     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
+//     let all_ref_ids: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
+
+//     let softclipped_alignments: Mutex<HashMap<ReadID, HashMap<RefIdx, HashSet<MEMPos>>>> = Mutex::new(HashMap::new());
+    
+//     fastq_records
+//         .par_iter()
+//         .map(|record| {
+//             let (best_hits, match_likelihoods, softclipped) = query_read(fmidx, refs, record, percent_mismatch, false).unwrap();
+
+//             if !softclipped.is_empty() && match_likelihoods.is_empty(){
+//                 softclipped_alignments.lock().unwrap()
+//                     .entry(ReadID(record.id().to_string()))
+//                     .or_default()
+//                     .extend(softclipped);
+//             }
+
+//             (record.id().to_string(), best_hits, match_likelihoods)
+//         })
+//         .for_each(|(read_id, best_hits, match_likelihoods)| {
+//             match_likelihoods.iter()
+//                 .for_each(|x| {
+//                     let best_align = best_hits.get(x.0).unwrap();
+//                     all_ref_ids.lock().unwrap().insert(*x.0);
+
+//                     out_aligns.lock().unwrap().entry(ReadID(read_id.clone()))
+//                         .or_default()
+//                         .entry(*x.0).or_default().push_back((best_align.0, *x.1));
+
+//                 });
+//             pb.inc(1);
+//         });
+
+//     pb.finish_with_message("");
+    
+//     Ok((out_aligns.into_inner().unwrap(), all_ref_ids.into_inner().unwrap()))
+// }
+
 fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _penalty_weight: EMProb, _penalty_gamma: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
-    // let ref_idxs = ll_array.get_ref_idxs();
+    let _ref_idxs = ll_array.get_ref_idxs();
 
     let mut props: Vec<HashMap<RefIdx, EMProb>> = vec![HashMap::new();num_iter+1];
-    let mut w: SparseArray<EMProb> = SparseArray::default();
+    let w: SparseArray<EMProb> = SparseArray::default();
 
     let initial_props: DashMap<RefIdx, usize> = DashMap::new();
 
     read_idxs.par_iter().for_each(|read_idx| {
-        let row_argmax = ll_array.get_all_read_hits_idx(&read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
+        let row_argmax = ll_array.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
             EMProb::total_cmp(f1, f2)
         }).unwrap().0;
         initial_props.entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
@@ -461,36 +470,42 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
 
     for i in 0..num_iter {
 
-        // dbg!(i, "update w");
-        ll_array.triples().for_each(|(x, val)| {
-            if props[i].contains_key(&x.1){
-                w.insert(x.0, x.1, val*props[i].get(&x.1).unwrap_or(&(0 as EMProb)));
-            }
-        });
+        read_idxs.iter()
+            .par_bridge()
+            .for_each(|x| {
+                for (ref_idx, val) in ll_array.get_all_read_hits_idx(x){
+                    w.values.insert((*x, ref_idx), val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb)));
+                    w.read_idxs_ref_map.entry(*x).or_default().insert(ref_idx);
+                    w.ref_idxs_read_map.entry(ref_idx).or_default().insert(*x);
+                }
+            });
 
-        // dbg!(i, "compute clik");
         let clik: DashMap<ReadIdx, EMProb> = DashMap::new();
         
         read_idxs
             .iter()
             .par_bridge()
             .for_each(|read_idx| {
-                let pr_rspr_s = ll_array.get_all_read_hits_idx(read_idx).into_iter().map(|(ref_idx, val)| val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb))).sum::<EMProb>();
+                let pr_rspr_s = ll_array.get_all_read_hits_idx(read_idx)
+                    .into_iter()
+                    .map(|(ref_idx, val)| val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb))).sum::<EMProb>();
+
                 clik.entry(*read_idx).and_modify(|e| *e += pr_rspr_s).or_insert(pr_rspr_s);
             });
 
+        read_idxs.iter()
+            .par_bridge()
+            .for_each(|x| {
+                for (ref_idx, val) in ll_array.get_all_read_hits_idx(x){
+                    w.values.insert(
+                        (*x, ref_idx),
+                        (val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb)))/ *clik.get(x).unwrap()
+                    );
+                }
+            });
 
-        // dbg!(i, "compute posterior");
-        ll_array.triples().for_each(|(x, _) | {
-            if w.contains_key(x){
-                w[*x] /= *clik.get(&x.0).unwrap();
-            }
-        });
-
-        // dbg!(i, "update props");
         props[i+1] = ll_array.get_ref_idxs()
             .par_iter()
-            .filter(|x| w.contains_ref(x))
             .map(|ref_idx| {
                 let vals = w.get_all_ref_hits(ref_idx);
                 (*ref_idx, vals.iter().sum::<EMProb>()/(num_reads as EMProb))
@@ -505,10 +520,8 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
     let pb = ProgressBar::with_draw_target(Some(num_reads as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
-    let ref_idxs = w.get_read_idxs();
-
-    let results: HashMap<ReadIdx, RefIdx> = ref_idxs.iter().par_bridge().map(|read_idx| {
-        let row_argmax = ll_array.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
+    let results: HashMap<ReadIdx, RefIdx> = read_idxs.iter().par_bridge().map(|read_idx| {
+        let row_argmax = w.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
             EMProb::total_cmp(f1, f2)
         }).unwrap().0;
         pb.inc(1);
@@ -563,7 +576,11 @@ fn main() -> Result<()>{
                     .required(true)
                     .value_parser(clap::value_parser!(EMProb))
                     )
-                .arg(arg!(-r --reads <READS>"Source file with read sequences(fastq or fastq.gz)")
+                .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
+                    .required(true)
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(-'2' --r2 <READS2>"Source file with reverse read sequences(fastq or fastq.gz)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
@@ -590,7 +607,11 @@ fn main() -> Result<()>{
                     .default_value("1e-4")
                     .value_parser(clap::value_parser!(EMProb))
                     )
-                .arg(arg!(-r --reads <READS>"Source file with read sequences(fastq or fastq.gz)")
+                .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
+                    .required(true)
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(-'2' --r2 <READS2>"Source file with reverse read sequences(fastq or fastq.gz)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
@@ -607,7 +628,7 @@ fn main() -> Result<()>{
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-o --out <OUT_FILE>"Output file")
-                    .default_value("out.matches")
+                    .default_value("out")
                     .value_parser(clap::value_parser!(String))
                     )
                 .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
@@ -685,12 +706,13 @@ fn main() -> Result<()>{
         },
         Some(("align",  sub_m)) => {
             let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
-            let reads_file = sub_m.get_one::<String>("reads").expect("required").as_str();
+            let forward_reads_file = sub_m.get_one::<String>("r1").expect("required").as_str();
+            let reverse_reads_file = sub_m.get_one::<String>("r2").expect("required").as_str();
             let percent_mismatch = sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
 
             let outpath = Some(Mutex::new(File::create(outfile).unwrap()));
-            let outstr = "ReadID\tRefID\tStart_pos\tLikelihood\n".to_string();
+            let outstr = "ReadID\tRefID\tProbability\n".to_string();
             match outpath.as_ref(){
                 Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
                 None => {print!("{}", outstr)},
@@ -704,26 +726,73 @@ fn main() -> Result<()>{
             
             rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
 
-            let fastq_records = match get_extension_from_filename(reads_file){
+            let forward_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(forward_reads_file){
                 Some("gz") => {
-                    let f = File::open(reads_file)?;
+                    let f = File::open(forward_reads_file)?;
                     let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
+                    fastq::Reader::from_bufread(BufReader::new(decoder))
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
                 },
                 Some("fastq")|Some("fq") => {
-                    let f = File::open(reads_file)?;
+                    let f = File::open(forward_reads_file)?;
                     let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
+                    fastq::Reader::from_bufread(reader)
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
+
                 },
                 _ => panic!("Invalid file type for reads!")
             };
 
-            let read_len = fastq_records.iter().map(|x| x.seq().len()).sum::<usize>() as f32/(fastq_records.len() as f32);
-            let all_read_ids: HashSet<ReadID> = fastq_records.iter().map(|x| ReadID(x.id().to_string())).collect();
+            let reverse_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(reverse_reads_file){
+                Some("gz") => {
+                    let f = File::open(reverse_reads_file)?;
+                    let decoder = GzDecoder::new(f);
+                    fastq::Reader::from_bufread(BufReader::new(decoder))
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
+                },
+                Some("fastq")|Some("fq") => {
+                    let f = File::open(reverse_reads_file)?;
+                    let reader = BufReader::new(f);
+                    fastq::Reader::from_bufread(reader)
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
 
-            let log_str = format!("Timestamp: {}\nReads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nOutput File: {}",
+                },
+                _ => panic!("Invalid file type for reads!")
+            };
+
+            let all_reads: Vec<ReadPair> = reverse_fastq_records.into_iter()
+                .filter(|(read_id, _)| {
+                    forward_fastq_records.contains_key(&read_id)
+                })
+                .map(|(read_id, rev_rec)| {
+                    let fw_rec = forward_fastq_records.get(&read_id).unwrap();
+                    let read_pair = ReadPair{
+                            read_id: read_id,
+                            r1: fw_rec.clone(),
+                            r2: rev_rec,
+                    };
+                    read_pair
+                })
+                .collect();
+
+            let read_len = forward_fastq_records.values().map(|x| x.seq().len()).sum::<usize>() as f32/(forward_fastq_records.len() as f32);
+            let all_read_ids: HashSet<ReadID> = forward_fastq_records.into_keys().collect();
+
+            let log_str = format!("Timestamp: {}\nForward Reads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nOutput File: {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
-                reads_file,
+                forward_reads_file,
                 ref_file,
                 num_threads,
                 percent_mismatch,
@@ -746,7 +815,7 @@ fn main() -> Result<()>{
 
             let now = Instant::now();
 
-            let (out_alignments, _all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
+            let (out_alignments, _all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch)?;
 
             let mut read_ids: HashMap<ReadID, ReadIdx> = HashMap::new();
             let mut read_ids_rev: HashMap<ReadIdx, ReadID> = HashMap::new();
@@ -763,11 +832,10 @@ fn main() -> Result<()>{
 
             for read_id in all_read_ids{
                 if !out_alignments.contains_key(&read_id){
-                    let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                    let outstr = format!("{}\t{}\t{}\n", 
                         *read_id,
-                        "unclassified".to_string(), 
-                        "-".to_string(), 
-                        "-".to_string()
+                        "unclassified",
+                        "-"
                     );
                     match outpath.as_ref(){
                         Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
@@ -783,11 +851,10 @@ fn main() -> Result<()>{
 
                     let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
 
-                    for (pos,likelihood) in aligns{
-                        let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                    for (_,likelihood) in aligns{
+                        let outstr = format!("{}\t{}\t{:.5e}\n", 
                             *read_ids_rev.get(&read_idx).unwrap().clone(),
                             *ref_id.clone(), 
-                            pos, 
                             likelihood.exp(),
                         );
                         match outpath.as_ref(){
@@ -808,7 +875,8 @@ fn main() -> Result<()>{
         },
         Some(("query",  sub_m)) => {
             let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
-            let reads_file = sub_m.get_one::<String>("reads").expect("required").as_str();
+            let forward_reads_file = sub_m.get_one::<String>("r1").expect("required").as_str();
+            let reverse_reads_file = sub_m.get_one::<String>("r2").expect("required").as_str();
             let num_iter = sub_m.get_one::<usize>("iter").expect("required");
             let percent_mismatch = sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
             let cutoff = *sub_m.get_one::<EMProb>("cutoff").expect("required");
@@ -816,8 +884,11 @@ fn main() -> Result<()>{
             let lambda = sub_m.get_one::<EMProb>("lambda").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
 
-            let outpath = Some(Mutex::new(File::create(outfile).unwrap()));
-            let outstr = "ReadID\tRefID\tStart_pos\tPosterior\n".to_string();
+            let outpath = Some(Mutex::new(File::create(format!("{}.matches", outfile)).unwrap()));
+            let out_posteriors = Some(Mutex::new(File::create(format!("{}.posteriors", outfile)).unwrap()));
+            let out_props = Some(Mutex::new(File::create(format!("{}.props", outfile)).unwrap()));
+
+            let outstr = "ReadID\tRefID\tPosterior\n".to_string();
             match outpath.as_ref(){
                 Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
                 None => {print!("{}", outstr)},
@@ -831,26 +902,73 @@ fn main() -> Result<()>{
             
             rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
 
-            let fastq_records = match get_extension_from_filename(reads_file){
+            let forward_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(forward_reads_file){
                 Some("gz") => {
-                    let f = File::open(reads_file)?;
+                    let f = File::open(forward_reads_file)?;
                     let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder)).records().filter_map(|x| x.ok()).collect_vec()
+                    fastq::Reader::from_bufread(BufReader::new(decoder))
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
                 },
                 Some("fastq")|Some("fq") => {
-                    let f = File::open(reads_file)?;
+                    let f = File::open(forward_reads_file)?;
                     let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader).records().filter_map(|x| x.ok()).collect_vec()
+                    fastq::Reader::from_bufread(reader)
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
+
                 },
                 _ => panic!("Invalid file type for reads!")
             };
 
-            let read_len = fastq_records.iter().map(|x| x.seq().len()).sum::<usize>() as f32/(fastq_records.len() as f32);
-            let all_read_ids: HashSet<ReadID> = fastq_records.iter().map(|x| ReadID(x.id().to_string())).collect();
+            let reverse_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(reverse_reads_file){
+                Some("gz") => {
+                    let f = File::open(reverse_reads_file)?;
+                    let decoder = GzDecoder::new(f);
+                    fastq::Reader::from_bufread(BufReader::new(decoder))
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
+                },
+                Some("fastq")|Some("fq") => {
+                    let f = File::open(reverse_reads_file)?;
+                    let reader = BufReader::new(f);
+                    fastq::Reader::from_bufread(reader)
+                        .records()
+                        .filter_map(|x| x.ok())
+                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .collect()
+
+                },
+                _ => panic!("Invalid file type for reads!")
+            };
+
+            let all_reads: Vec<ReadPair> = reverse_fastq_records.into_iter()
+                .filter(|(read_id, _)| {
+                    forward_fastq_records.contains_key(&read_id)
+                })
+                .map(|(read_id, rev_rec)| {
+                    let fw_rec = forward_fastq_records.get(&read_id).unwrap();
+                    let read_pair = ReadPair{
+                            read_id: read_id,
+                            r1: fw_rec.clone(),
+                            r2: rev_rec,
+                    };
+                    read_pair
+                })
+                .collect();
+
+            let read_len = forward_fastq_records.values().map(|x| x.seq().len()).sum::<usize>() as f32/(forward_fastq_records.len() as f32);
+            let all_read_ids: HashSet<ReadID> = forward_fastq_records.into_keys().collect();
 
             let log_str = format!("Timestamp: {}\nReads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nCutoff likelihood: {:e}\nEM Iterations: {}\nOutput File: {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
-                reads_file,
+                forward_reads_file,
                 ref_file,
                 num_threads,
                 percent_mismatch,
@@ -875,13 +993,12 @@ fn main() -> Result<()>{
 
             let now = Instant::now();
 
-            let (out_aligns, _all_refs) = process_fastq_file(&fmidx, &refs, Path::new(reads_file), percent_mismatch)?;
+            let (out_aligns, _all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch)?;
 
             let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stderr());
             pb.set_style(ProgressStyle::with_template("Filtering alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
             let all_refs_filtered: Mutex<HashSet<RefIdx>> = Mutex::new(HashSet::new());
-            // let out_alignments: ReadAlignments = 
             out_aligns.iter().for_each(|(_, aligns)| {
                 let mut alignment_dist = aligns.iter()
                     .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|(pos, ll)| (*pos, ll.0 as EMProb)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap()))
@@ -901,7 +1018,7 @@ fn main() -> Result<()>{
 
                 let best_aligns: HashMap<RefIdx, VecDeque<(usize, LogProb)>> = alignment_dist.iter()
                     .take(usable_alignments)
-                    .map(|x| (x.0, VecDeque::from([(x.1.0, LogProb(x.1.1.into()))])))
+                    .map(|x| (x.0, VecDeque::from([(x.1.0, LogProb(x.1.1))])))
                     .collect();
                 for ref_idx in best_aligns.keys(){
                     all_refs_filtered.lock().unwrap().insert(*ref_idx);
@@ -920,10 +1037,8 @@ fn main() -> Result<()>{
 
 
             let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
-            // let mut em_ref_ids_rev: HashMap<RefIdx, usize> = HashMap::new();
             for (n,ref_idx) in all_refs_filtered.into_inner().unwrap().into_iter().enumerate(){
                 em_ref_ids.insert(n, ref_idx);
-                // em_ref_ids_rev.insert(ref_idx, n);
             }
             let num_em_refs = em_ref_ids.len();
 
@@ -951,19 +1066,70 @@ fn main() -> Result<()>{
             }
 
 
-            let (read_assignments, _props, posteriors) = get_proportions_par_sparse(&ll_array, *num_iter, *lambda, *gamma);
+            let (read_assignments, props, posteriors) = get_proportions_par_sparse(&ll_array, *num_iter, *lambda, *gamma);
 
             let pb = ProgressBar::new(read_assignments.len() as u64);
             pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
 
+            for (ref_idx,prop) in props{
+                if prop>0.0{
+                    let ref_id = ref_ids_rev.get(&ref_idx).unwrap();
+                    let outstr = format!("{}\t{:.5e}\n", 
+                        **ref_id,
+                        prop, 
+                    );
+
+                    match out_props.as_ref(){
+                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                        None => {print!("{}", outstr)},
+                    };
+                }
+            }
+
+            for read_id in all_read_ids.iter(){
+                if !out_alignments.contains_key(read_id){
+                    let outstr = format!("{}\t{}\t{}\n", 
+                        **read_id,
+                        "unclassified", 
+                        "-"
+                    );
+                    match out_posteriors.as_ref(){
+                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                        None => {print!("{}", outstr)},
+                    };
+                    continue;
+                }
+
+                let read_idx = *read_ids.get(read_id).unwrap();
+
+                let read_aligns = out_alignments.get(read_id).unwrap();
+                for (ref_idx,aligns) in read_aligns{
+
+                    let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+
+                    for (_,_) in aligns{
+                        let outstr = format!("{}\t{}\t{:.5e}\n", 
+                            *read_ids_rev.get(&read_idx).unwrap().clone(),
+                            *ref_id.clone(), 
+                            posteriors.get(&(read_idx, *ref_idx)),
+                        );
+                        match out_posteriors.as_ref(){
+                            Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
+                            None => {print!("{}", outstr)},
+                        };
+                    }
+
+                }
+
+            }
+
             for read_id in all_read_ids{
                 if !out_alignments.contains_key(&read_id){
-                    let outstr = format!("{}\t{}\t{}\t{:.5}\n", 
+                    let outstr = format!("{}\t{}\t{:.5}\n", 
                         *read_id,
-                        "unclassified".to_string(), 
-                        "-".to_string(), 
-                        "-".to_string()
+                        "unclassified",
+                        "-", 
                     );
                     match outpath.as_ref(){
                         Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
@@ -981,12 +1147,11 @@ fn main() -> Result<()>{
                     continue;
                 }
 
-                if out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array[(read_idx, *ref_idx)].is_finite(){
-                    let outstr = format!("{}\t{}\t{}\t{:.5e}\n", 
+                if out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array.get(&(read_idx, *ref_idx)).is_finite(){
+                    let outstr = format!("{}\t{}\t{:.5e}\n", 
                         *read_ids_rev.get(&read_idx).unwrap().clone(),
                         *ref_id.clone(), 
-                        out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().unwrap().0, 
-                        posteriors.get(&(read_idx, *ref_idx)).expect("Read-reference alignment was never found!"),
+                        posteriors.get(&(read_idx, *ref_idx)),
                     );
                     match outpath.as_ref(){
                         Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
