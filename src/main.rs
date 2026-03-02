@@ -26,12 +26,6 @@ use std::time::Instant;
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 use std::cmp;
 
-pub struct ReadPair{
-    read_id: ReadID,
-    r1: fastq::Record,
-    r2: fastq::Record,
-}
-
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
 pub struct ReadID(String);
 
@@ -119,6 +113,20 @@ impl MEMPos{
         self.ref_end = cmp::max(kmer.ref_end, self.ref_end);
     }
 }
+
+pub struct ReadPair{
+    read_id: ReadID,
+    r1: fastq::Record,
+    r2: fastq::Record,
+}
+
+
+// pub struct ReadAlignment{
+//     read_id: &'static ReadID,
+//     ref_id: &'static RefID,
+//     pos1: usize,
+//     pos2: usize,
+// }
 
 /// Dictionary of Keys (DoK) format for sparse array to store likelihoods
 #[derive(Debug, Clone, Default)]
@@ -465,7 +473,23 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
     }
 
     let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta}) ({msg})").unwrap());
+
+    let clik: DashMap<ReadIdx, EMProb> = DashMap::new();
+
+    read_idxs
+        .iter()
+        .par_bridge()
+        .for_each(|read_idx| {
+            let pr_rspr_s = ll_array.get_all_read_hits_idx(read_idx)
+                .into_iter()
+                .map(|(ref_idx, val)| val*props[0].get(&ref_idx).unwrap_or(&(0 as EMProb))).sum::<EMProb>();
+
+            clik.entry(*read_idx).and_modify(|e| *e += pr_rspr_s).or_insert(pr_rspr_s);
+        });
+
+    
+    let mut prev_data_loglikelihood = clik.iter().map(|x| x.value().ln()).sum::<EMProb>();
 
 
     for i in 0..num_iter {
@@ -504,6 +528,12 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
                 }
             });
 
+        let data_loglikelihood = clik.iter().map(|x| x.value().ln()).sum::<EMProb>();
+
+        let data_loglikelihood_diff= data_loglikelihood-prev_data_loglikelihood;
+
+        prev_data_loglikelihood = data_loglikelihood;
+
         props[i+1] = ll_array.get_ref_idxs()
             .par_iter()
             .map(|ref_idx| {
@@ -512,23 +542,25 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
             })
             .collect();
 
+        pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
+
         pb.inc(1);
 
     }
-    pb.finish_with_message("");
+    pb.finish_with_message(format!("Final data Loglikelihood: {prev_data_loglikelihood}"));
 
-    let pb = ProgressBar::with_draw_target(Some(num_reads as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+    // let pb = ProgressBar::with_draw_target(Some(num_reads as u64), ProgressDrawTarget::stderr());
+    // pb.set_style(ProgressStyle::with_template("Finding optimal assignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
     let results: HashMap<ReadIdx, RefIdx> = read_idxs.iter().par_bridge().map(|read_idx| {
         let row_argmax = w.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
             EMProb::total_cmp(f1, f2)
         }).unwrap().0;
-        pb.inc(1);
+        // pb.inc(1);
         (*read_idx, row_argmax)
     }).collect();
 
-    pb.finish_with_message("");
+    // pb.finish_with_message("");
 
     (results, props[num_iter].clone(), w)
 }
