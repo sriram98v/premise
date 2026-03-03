@@ -941,7 +941,7 @@ fn main() -> Result<()>{
                     fastq::Reader::from_bufread(BufReader::new(decoder))
                         .records()
                         .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .map(|rec| (ReadID(rec.id().strip_suffix("/1").unwrap().to_string()), rec))
                         .collect()
                 },
                 Some("fastq")|Some("fq") => {
@@ -950,7 +950,7 @@ fn main() -> Result<()>{
                     fastq::Reader::from_bufread(reader)
                         .records()
                         .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .map(|rec| (ReadID(rec.id().strip_suffix("/1").unwrap_or(rec.id()).to_string()), rec))
                         .collect()
 
                 },
@@ -964,7 +964,7 @@ fn main() -> Result<()>{
                     fastq::Reader::from_bufread(BufReader::new(decoder))
                         .records()
                         .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .map(|rec| (ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()), rec))
                         .collect()
                 },
                 Some("fastq")|Some("fq") => {
@@ -973,7 +973,7 @@ fn main() -> Result<()>{
                     fastq::Reader::from_bufread(reader)
                         .records()
                         .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .map(|rec| (ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()), rec))
                         .collect()
 
                 },
