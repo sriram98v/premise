@@ -11,7 +11,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 After installing the above command you can run the following to install premise:
 ```bash
-
+cargo install --git=https://github.com/sriram98v/premise
 ```
 
 Alternatively, you can install premise by cloning this repository and building it locally:
@@ -34,7 +34,7 @@ This will create an index file with the extension ```.fmidx```.
 ### Classifying reads
 You can now begin classifying read using the following command.
 ```bash
-premise query -s <reference sequence file path> -p <Percent mismatch> -1 <Forward Reads> -2 <Reverse Reads> -t <Threads [Default: 2]> -o <Output file [Default: out.matches]>
+premise query -s <reference sequence file path> -p <Percent mismatch> -1 <Forward Reads> - <Reverse Reads> -t <Threads [Default: 2]> -o <Output file [Default: out.matches]>
 ```
 
 You can refer the man page for premise for more details by running
