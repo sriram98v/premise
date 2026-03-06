@@ -289,20 +289,23 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
                 let ref_match_seg = &ref_seq[ref_pos..ref_pos+read_len];
                     let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, &ref_match_seg);
 
-                    best_match.entry(ref_id)
-                        .and_modify(|e| {
-                            if e.1<=match_log_prob{
-                                *e = (ref_pos, match_log_prob);
-                            }
-                        })
-                        .or_insert((ref_pos, match_log_prob));
+                    if match_log_prob.exp()!=0.0{
+                        best_match.entry(ref_id)
+                            .and_modify(|e| {
+                                if e.1<=match_log_prob{
+                                    *e = (ref_pos, match_log_prob);
+                                }
+                            })
+                            .or_insert((ref_pos, match_log_prob));
 
-                    // update match score
-                    match_likelihood.entry(ref_id)
-                        .and_modify(|e| {
-                            *e += match_log_prob;
-                        })
-                        .or_insert(match_log_prob);
+                        // update match score
+                        match_likelihood.entry(ref_id)
+                            .and_modify(|e| {
+                                *e += match_log_prob;
+                            })
+                            .or_insert(match_log_prob);
+
+                    }
             }
         }
     });
@@ -1018,8 +1021,7 @@ fn main() -> Result<()>{
                     let read_idx = read_ids.get(read_id).unwrap();
 
                     for (_, score) in positions.iter(){
-                        // dbg!(*read_idx, *ref_idx, score.exp() as EMProb);
-                        if score.exp().is_finite(){
+                        if score.exp().is_finite() && score.exp()!=0.0{
                             ll_array.insert(*read_idx, *ref_idx, score.exp() as EMProb);
                         }
                     }
