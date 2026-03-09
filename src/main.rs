@@ -10,6 +10,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
 use num::{Float, Zero};
 use utils::*;
+use core::f64;
 use std::collections::{HashSet, VecDeque};
 use std::fmt::Debug;
 use std::thread;
@@ -79,11 +80,11 @@ pub struct IOFMIndex{
 type EMProb = f64;
 
 /// type to store all alignments of a read to references
-type Alignments = HashMap<RefIdx, (usize, LogProb)>;
+// type Alignments = HashMap<RefIdx, LogProb>;
 /// type to store the best alignments of reads to references
 type MatchLikelihoods = HashMap<RefIdx, LogProb>;
 /// type to store all alignments of all reads to references
-type ReadAlignments = DashMap<ReadID, HashMap<RefIdx, VecDeque<(usize, LogProb)>>>;
+type ReadAlignments<'a> = DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<LogProb>>>;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Savefile)]
 pub struct MEMPos{
@@ -251,7 +252,7 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->Result<(Alignments, MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
+fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->Result<(MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
 
     let read_len = record.seq().len();
     let read_seq = match complement {
@@ -263,7 +264,6 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
         false => record.qual().to_vec(),
     };
 
-    let mut best_match: HashMap<RefIdx, (usize, LogProb)> = HashMap::new();
     let mut match_likelihood: HashMap<RefIdx, LogProb> = HashMap::new();
     let mut softclipped: HashMap<RefIdx, HashSet<MEMPos>> = HashMap::new();
 
@@ -290,33 +290,25 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
                     let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, &ref_match_seg);
 
                     if match_log_prob.exp()!=0.0{
-                        best_match.entry(ref_id)
-                            .and_modify(|e| {
-                                if e.1<=match_log_prob{
-                                    *e = (ref_pos, match_log_prob);
-                                }
-                            })
-                            .or_insert((ref_pos, match_log_prob));
-
                         // update match score
                         match_likelihood.entry(ref_id)
                             .and_modify(|e| {
                                 *e += match_log_prob;
                             })
                             .or_insert(match_log_prob);
-
                     }
             }
         }
     });
 
-    Ok((best_match, match_likelihood, softclipped))
+    Ok((match_likelihood, softclipped))
 }
 
-fn process_read_pairs(fmidx: &FmIndexFlat64<i64>, 
+fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>, 
                     refs: &HashMap<RefIdx, Vec<u8>>, 
-                    read_pairs: &[ReadPair], 
-                    percent_mismatch: &EMProb)-> Result<(ReadAlignments, DashSet<RefIdx>)>
+                    read_pairs: &'a[ReadPair], 
+                    percent_mismatch: &EMProb,
+                    cutoff: LogProb)-> Result<(ReadAlignments<'a>, DashSet<RefIdx>)>
 {
     let out_aligns: ReadAlignments = DashMap::new();
 
@@ -333,38 +325,51 @@ fn process_read_pairs(fmidx: &FmIndexFlat64<i64>,
             let r1_rec = &read_pair.r1;
             let r2_rec = &read_pair.r2;
 
-            let mut best_hits: HashMap<RefIdx, (usize, LogProb)> = HashMap::new();
             let mut match_likelihoods: HashMap<RefIdx, LogProb> = HashMap::new();
 
-            let (r1_best_hits, r1_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, false).unwrap();
-            let (r1_rc_best_hits, r1_rc_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, true).unwrap();
+            let (r1_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, false).unwrap();
+            let (r1_rc_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, true).unwrap();
             
-            let (_, r2_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, false).unwrap();
-            let (_, r2_rc_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, true).unwrap();
+            let (r2_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, false).unwrap();
+            let (r2_rc_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, true).unwrap();
 
             r1_match_likelihoods.keys().filter(|k| r2_rc_match_likelihoods.contains_key(k)).for_each(|x| {
-                best_hits.insert(*x, *r1_best_hits.get(x).unwrap());
                 let match_prob = half_log_prob + r1_match_likelihoods.get(x).unwrap() + r2_rc_match_likelihoods.get(x).unwrap();
                 match_likelihoods.insert(*x, match_prob);
             });
 
             r1_rc_match_likelihoods.keys().filter(|k| r2_match_likelihoods.contains_key(k)).for_each(|x| {
-                best_hits.insert(*x, *r1_rc_best_hits.get(x).unwrap());
                 let match_prob = half_log_prob + r1_rc_match_likelihoods.get(x).unwrap() + r2_match_likelihoods.get(x).unwrap();
                 match_likelihoods.entry(*x).and_modify(|v| *v = LogProb::from(Prob(v.exp() + match_prob.exp()))).or_insert(match_prob);
             });
 
-            (read_pair.read_id.to_string(), best_hits, match_likelihoods)
+            // let mut sorted_alignments = match_likelihoods.values().map(|x| x.exp()).collect_vec();
+            // sorted_alignments.sort_by(|a, b| a.total_cmp(&b));
+            let all_keys = match_likelihoods.keys().cloned().collect_vec();
+            if match_likelihoods.len()>=1{
+                let max_likelihood = match_likelihoods.values().max_by(|a, b| a.total_cmp(&b)).unwrap().clone();
+                for k in all_keys.iter(){
+                    if match_likelihoods.get(k).unwrap()-max_likelihood<=cutoff{
+                        // dbg!(k, match_likelihoods.get(k).unwrap(), max_likelihood, LogProb::from(Prob::from(1e-6)));
+                        match_likelihoods.remove(k);
+                    }
+                }
+            }
+
+            // if all_keys.len()>match_likelihoods.len(){
+            //     dbg!(all_keys.len()-match_likelihoods.len());
+            // }
+
+            (&read_pair.read_id, match_likelihoods)
         })
-        .for_each(|(read_id, best_hits, match_likelihoods)| {
+        .for_each(|(read_id, match_likelihoods)| {
             match_likelihoods.iter()
                 .for_each(|x| {
-                    let best_align = best_hits.get(x.0).unwrap();
                     all_ref_ids.insert(*x.0);
 
-                    out_aligns.entry(ReadID(read_id.clone()))
+                    out_aligns.entry(read_id)
                         .or_default()
-                        .entry(*x.0).or_default().push_back((best_align.0, *x.1));
+                        .entry(*x.0).or_default().push_back(*x.1);
 
                 });
             pb.inc(1);
@@ -375,7 +380,7 @@ fn process_read_pairs(fmidx: &FmIndexFlat64<i64>,
     Ok((out_aligns, all_ref_ids))
 }
 
-fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _penalty_weight: EMProb, _penalty_gamma: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
+fn _get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -455,25 +460,45 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
                 }
             });
 
-        let data_loglikelihood = clik.iter().filter(|x| *x.value()!=0.0).map(|x| x.value().ln()).sum::<EMProb>();
+        let ejs: HashMap<RefIdx, EMProb> = ll_array.get_ref_idxs()
+            .par_iter()
+            .map(|ref_idx| {
+                let vals = w.get_all_ref_hits(ref_idx);
+                (*ref_idx, vals.iter().sum::<EMProb>()) 
+            }).collect();
+
+        let lambda_init = ejs.values()
+            .map(|x| x-20.0).max_by(|f1, f2| {
+            EMProb::total_cmp(f1, f2)
+        }).unwrap();
+
+        let lambda = _update_lambda(20.0, 1e-20, &ejs, lambda_init, num_iter);
+
+        props[i+1] = ll_array.get_ref_idxs()
+            .par_iter()
+            .map(|ref_idx| {
+                let tmp_pi = _update_pi(20.0, 1e-20, *ejs.get(ref_idx).unwrap(), lambda);
+                if tmp_pi>0.0{
+                    (*ref_idx, tmp_pi)
+                }
+                else{
+                    (*ref_idx, 0.0)
+                }
+            })
+            .collect();
+
+        let data_loglikelihood = clik.iter().par_bridge().filter(|x| *x.value()!=0.0).map(|x| x.value().ln()).sum::<EMProb>();
 
         let data_loglikelihood_diff= data_loglikelihood-prev_data_loglikelihood;
 
         prev_data_loglikelihood = data_loglikelihood;
 
-        props[i+1] = ll_array.get_ref_idxs()
-            .par_iter()
-            .map(|ref_idx| {
-                let vals = w.get_all_ref_hits(ref_idx);
-                let new_prop_count = vals.iter().sum::<EMProb>();
-                match new_prop_count>=1.0{
-                    true => (*ref_idx, new_prop_count/(num_reads as EMProb)),
-                    _ => (*ref_idx, 0.0),
-                }
-            })
-            .collect();
-
         pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
+
+        if data_loglikelihood_diff>0.0 && data_loglikelihood_diff.abs()<=1e-6{
+            break;
+        }
+
 
         pb.inc(1);
 
@@ -487,8 +512,197 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, _
         (*read_idx, row_argmax)
     }).collect();
 
-    (results, props[num_iter].iter().filter(|(_,v)| **v>0.0).map(|(k,v)|(*k,*v)).collect(), w)
+    (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w)
 }
+
+fn _update_pi(rho: EMProb, omega: EMProb, ej: EMProb, lambda: EMProb)-> EMProb{
+    let phi = _compute_phi(lambda, omega, rho, ej);
+    (-phi + (phi*phi - 4.0*lambda*ej*omega).sqrt())/(2.0*lambda)
+}
+
+fn _update_lambda(rho: EMProb, omega: EMProb, ejs: &HashMap<RefIdx, EMProb>, lambda_init: EMProb, iterations: usize)-> EMProb{
+    let mut lambda = lambda_init;
+    for _ in 0..iterations{
+        // dbg!(lambda, _compute_f(lambda, omega, rho, ejs), _compute_deriv_f(lambda, omega, rho, ejs));
+        lambda -= (_compute_f(lambda, omega, rho, ejs))/(_compute_deriv_f(lambda, omega, rho, ejs)); 
+        if _compute_f(lambda, omega, rho, ejs)==0.0{
+            break;
+        }
+    };
+    // dbg!(lambda, _compute_f(lambda, omega, rho, ejs), _compute_deriv_f(lambda, omega, rho, ejs));
+    lambda
+}
+
+fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, EMProb>)-> EMProb{
+    ejs.keys()
+        .map(|ref_idx| {
+            let ej = *ejs.get(ref_idx).unwrap();
+            let phi = _compute_phi(lambda, omega, rho, ej);
+            -phi + (phi*phi - 4.0*lambda*ej*omega).sqrt()
+        }).sum::<EMProb>() - 2.0*lambda
+}
+
+fn _compute_deriv_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, EMProb>)-> EMProb{
+    ejs.keys()
+        .map(|ref_idx| {
+            let ej = *ejs.get(ref_idx).unwrap();
+            let phi = _compute_phi(lambda, omega, rho, ej);
+            omega + 0.5*(1.0/(phi*phi - 4.0*lambda*ej*omega).sqrt())*(2.0*phi*omega-4.0*ej*omega)
+        }).sum::<EMProb>() - 2.0
+}
+
+fn _compute_phi(lambda: EMProb, omega: EMProb, rho: EMProb, ej: EMProb)-> EMProb{
+    return lambda*omega+rho-ej
+}
+
+fn _l1_norm(props: &HashMap<RefIdx, EMProb>)->EMProb{
+    props.values().sum()
+}
+
+fn _l2_norm_sq(props: &HashMap<RefIdx, EMProb>)->EMProb{
+    props.values().map(|x| x*x).sum()
+}
+
+fn _penalty(props: &HashMap<RefIdx, EMProb>, omega: EMProb)->EMProb{
+    props.values().map(|x| (1.0+(x/omega)).ln()).sum()
+}
+
+fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
+    let num_reads = ll_array.num_reads();
+
+    let read_idxs = ll_array.get_read_idxs();
+    let _ref_idxs = ll_array.get_ref_idxs();
+
+    let mut props: Vec<HashMap<RefIdx, EMProb>> = vec![HashMap::new();num_iter+1];
+    let w: SparseArray<EMProb> = SparseArray::default();
+
+    let initial_props: DashMap<RefIdx, usize> = DashMap::new();
+
+    read_idxs.par_iter().for_each(|read_idx| {
+        let row_argmax = ll_array.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
+            EMProb::total_cmp(f1, f2)
+        }).unwrap().0;
+        initial_props.entry(row_argmax).and_modify(|e| { *e += 1 }).or_insert(1);
+    });
+
+    let total = initial_props.iter().map(|x| *x.value()).sum::<usize>();
+
+    for (ref_idx, count) in initial_props.into_iter(){
+        props[0].insert(ref_idx, (count as EMProb)/(total as EMProb));
+    }
+
+    let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
+    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta}) ({msg})").unwrap());
+
+    let clik: DashMap<ReadIdx, EMProb> = DashMap::new();
+
+    read_idxs
+        .iter()
+        .par_bridge()
+        .for_each(|read_idx| {
+            let pr_rspr_s = ll_array.get_all_read_hits_idx(read_idx)
+                .into_iter()
+                .map(|(ref_idx, val)| val*props[0].get(&ref_idx).unwrap_or(&(0 as EMProb))).sum::<EMProb>();
+
+            clik.entry(*read_idx).and_modify(|e| *e += pr_rspr_s).or_insert(pr_rspr_s);
+        });
+
+    
+    let mut prev_data_loglikelihood = clik.iter().filter(|x| *x.value()!=0.0).map(|x| x.value().ln()).sum::<EMProb>();
+
+    for i in 0..num_iter {
+
+        read_idxs.iter()
+            .par_bridge()
+            .for_each(|x| {
+                for (ref_idx, val) in ll_array.get_all_read_hits_idx(x){
+                    w.values.insert((*x, ref_idx), val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb)));
+                    w.read_idxs_ref_map.entry(*x).or_default().insert(ref_idx);
+                    w.ref_idxs_read_map.entry(ref_idx).or_default().insert(*x);
+                }
+            });
+
+        let clik: DashMap<ReadIdx, EMProb> = DashMap::new();
+        
+        read_idxs
+            .iter()
+            .par_bridge()
+            .for_each(|read_idx| {
+                let pr_rspr_s = ll_array.get_all_read_hits_idx(read_idx)
+                    .into_iter()
+                    .map(|(ref_idx, val)| val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb))).sum::<EMProb>();
+
+                clik.entry(*read_idx).and_modify(|e| *e += pr_rspr_s).or_insert(pr_rspr_s);
+            });
+
+        read_idxs.iter()
+            .par_bridge()
+            .for_each(|x| {
+                for (ref_idx, val) in ll_array.get_all_read_hits_idx(x){
+                    let new_val = (val*props[i].get(&ref_idx).unwrap_or(&(0 as EMProb)))/ *clik.get(x).unwrap();
+                    match new_val.is_finite(){
+                        true => w.values.insert((*x, ref_idx),new_val),
+                        _ => w.values.insert((*x, ref_idx),0.0),
+                    };
+                }
+            });
+
+        let data_loglikelihood = clik.iter().par_bridge().filter(|x| *x.value()!=0.0).map(|x| x.value().ln()).sum::<EMProb>();
+
+        let data_loglikelihood_diff= data_loglikelihood-prev_data_loglikelihood;
+
+        prev_data_loglikelihood = data_loglikelihood;
+
+        let ejs: HashMap<RefIdx, EMProb> = ll_array.get_ref_idxs()
+            .par_iter()
+            .map(|ref_idx| {
+                let vals = w.get_all_ref_hits(ref_idx);
+                (*ref_idx, vals.iter().sum::<EMProb>()) 
+            }).collect();
+
+        let lambda_init = ejs.values()
+            .map(|x| x-rho).max_by(|f1, f2| {
+            EMProb::total_cmp(f1, f2)
+        }).unwrap();
+
+        let lambda = _update_lambda(rho, omega, &ejs, lambda_init, num_iter);
+
+        props[i+1] = ll_array.get_ref_idxs()
+            .par_iter()
+            .map(|ref_idx| {
+                let tmp_pi = _update_pi(rho, 1e-20, *ejs.get(ref_idx).unwrap(), lambda);
+                if tmp_pi>0.0{
+                    (*ref_idx, tmp_pi)
+                }
+                else{
+                    (*ref_idx, 0.0)
+                }
+            })
+            .collect();
+
+        pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
+
+        if i>20 && data_loglikelihood_diff>0.0 && data_loglikelihood_diff<=1e-6{
+            props[num_iter] = props[i+1].clone();
+            break;
+        }
+
+
+        pb.inc(1);
+
+    }
+    pb.finish_with_message(format!("Final data LL: {prev_data_loglikelihood}"));
+
+    let results: HashMap<ReadIdx, RefIdx> = read_idxs.iter().par_bridge().map(|read_idx| {
+        let row_argmax = w.get_all_read_hits_idx(read_idx).iter().max_by(|&(_, f1), &(_, f2)| {
+            EMProb::total_cmp(f1, f2)
+        }).unwrap().0;
+        (*read_idx, row_argmax)
+    }).collect();
+
+    (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w)
+}
+
 
 
 fn main() -> Result<()>{
@@ -581,7 +795,7 @@ fn main() -> Result<()>{
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-l --lambda <LAMBDA>"penalty weight") 
-                    .default_value("0")
+                    .default_value("20")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-o --out <OUT_FILE>"Output file")
@@ -699,7 +913,7 @@ fn main() -> Result<()>{
                     fastq::Reader::from_bufread(reader)
                         .records()
                         .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .map(|rec| (ReadID(rec.id().strip_suffix("/1").unwrap_or(rec.id()).to_string()), rec))
                         .collect()
 
                 },
@@ -722,7 +936,7 @@ fn main() -> Result<()>{
                     fastq::Reader::from_bufread(reader)
                         .records()
                         .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
+                        .map(|rec| (ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()), rec))
                         .collect()
 
                 },
@@ -772,13 +986,13 @@ fn main() -> Result<()>{
 
             let now = Instant::now();
 
-            let (out_alignments, _all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch)?;
+            let (out_alignments, _all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch, LogProb(f64::NEG_INFINITY))?;
 
-            let mut read_ids: HashMap<ReadID, ReadIdx> = HashMap::new();
-            let mut read_ids_rev: HashMap<ReadIdx, ReadID> = HashMap::new();
+            let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
+            let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
             for (n, read_id) in out_alignments.iter().enumerate() {
-                read_ids.insert(read_id.key().clone(), ReadIdx(n));
-                read_ids_rev.insert(ReadIdx(n), read_id.key().clone());
+                read_ids.insert(*read_id.key(), ReadIdx(n));
+                read_ids_rev.insert(ReadIdx(n), read_id.key());
             }
 
             println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/num_reads as f64)*100_f64);
@@ -808,9 +1022,9 @@ fn main() -> Result<()>{
 
                     let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
 
-                    for (_,likelihood) in aligns{
+                    for likelihood in aligns{
                         let outstr = format!("{}\t{}\t{:.5e}\n", 
-                            *read_ids_rev.get(&read_idx).unwrap().clone(),
+                            ***read_ids_rev.get(&read_idx).unwrap(),
                             *ref_id.clone(), 
                             likelihood.exp(),
                         );
@@ -951,76 +1165,76 @@ fn main() -> Result<()>{
 
             let now = Instant::now();
 
-            let (out_aligns, _all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch)?;
+            let (out_aligns, all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch, LogProb(cutoff.ln()))?;
 
-            let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stderr());
-            pb.set_style(ProgressStyle::with_template("Filtering alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+            // let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stderr());
+            // pb.set_style(ProgressStyle::with_template("Filtering alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
 
-            let all_refs_filtered: DashSet<RefIdx> = DashSet::new();
-            out_aligns.iter().for_each(|val| {
-                let aligns = val.value();
-                let mut alignment_dist = aligns.iter()
-                    .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|(pos, ll)| (*pos, ll.0 as EMProb)).max_by(|a, b| a.1.total_cmp(&b.1)).unwrap()))
-                    .collect_vec();
-                alignment_dist.sort_by(|a, b| a.1.1.total_cmp(&b.1.1));
-                alignment_dist.reverse();
+            // let all_refs_filtered: DashSet<RefIdx> = DashSet::new();
+            // out_aligns.iter().for_each(|val| {
+            //     let aligns = val.value();
+            //     let mut alignment_dist = aligns.iter()
+            //         .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|ll| ll.0 as EMProb).max_by(|a, b| a.total_cmp(&b)).unwrap()))
+            //         .collect_vec();
+            //     alignment_dist.sort_by(|a, b| a.1.total_cmp(&b.1));
+            //     alignment_dist.reverse();
 
-                let num_alignments = alignment_dist.len();
+            //     let num_alignments = alignment_dist.len();
 
-                let read_alignment_max_loglikelihood = alignment_dist[0].1.1;
+            //     let read_alignment_max_loglikelihood = alignment_dist[0].1;
                 
-                let mut n = 0;
-                while n<num_alignments && alignment_dist[n].1.1>=cutoff.ln() && alignment_dist[n].1.1 - read_alignment_max_loglikelihood>= cutoff.ln(){
-                    n+=1;
-                }
-                let usable_alignments = n;
+            //     let mut n = 0;
+            //     while n<num_alignments && alignment_dist[n].1>=cutoff.ln() && alignment_dist[n].1 - read_alignment_max_loglikelihood>= cutoff.ln(){
+            //         n+=1;
+            //     }
+            //     let usable_alignments = n;
 
-                let best_aligns: HashMap<RefIdx, VecDeque<(usize, LogProb)>> = alignment_dist.iter()
-                    .take(usable_alignments)
-                    .map(|x| (x.0, VecDeque::from([(x.1.0, LogProb(x.1.1))])))
-                    .collect();
-                for ref_idx in best_aligns.keys(){
-                    all_refs_filtered.insert(*ref_idx);
-                }
-                pb.inc(1);
-            });
+            //     let best_aligns: HashMap<RefIdx, VecDeque<LogProb>> = alignment_dist.iter()
+            //         .take(usable_alignments)
+            //         .map(|x| (x.0, VecDeque::from([LogProb(x.1)])))
+            //         .collect();
+            //     for ref_idx in best_aligns.keys(){
+            //         all_refs_filtered.insert(*ref_idx);
+            //     }
+            //     pb.inc(1);
+            // });
 
-            pb.finish_with_message("");
+            // pb.finish_with_message("");
 
-            let out_alignments: ReadAlignments = out_aligns.into_iter()
-                .map(|(read_id, mut aligns)| {
-                    aligns.retain(|&k, _| all_refs_filtered.contains(&k));
-                    (read_id, aligns)
-                })
-                .collect();
+            // let out_alignments: ReadAlignments = out_aligns.into_iter()
+            //     .map(|(read_id, mut aligns)| {
+            //         aligns.retain(|&k, _| all_refs_filtered.contains(&k));
+            //         (read_id, aligns)
+            //     })
+            //     .collect();
 
 
-            let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
-            for (n,ref_idx) in all_refs_filtered.into_iter().enumerate(){
-                em_ref_ids.insert(n, ref_idx);
+            // let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
+            // for (n,ref_idx) in all_refs_filtered.into_iter().enumerate(){
+            //     em_ref_ids.insert(n, ref_idx);
+            // }
+            // let num_em_refs = em_ref_ids.len();
+
+
+            let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
+            let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
+            for (n, read_id) in out_aligns.iter().enumerate() {
+                read_ids.insert(*read_id.key(), ReadIdx(n));
+                read_ids_rev.insert(ReadIdx(n), *read_id.key());
             }
-            let num_em_refs = em_ref_ids.len();
 
-
-            let mut read_ids: HashMap<ReadID, ReadIdx> = HashMap::new();
-            let mut read_ids_rev: HashMap<ReadIdx, ReadID> = HashMap::new();
-            for (n, read_id) in out_alignments.iter().enumerate() {
-                read_ids.insert(read_id.key().clone(), ReadIdx(n));
-                read_ids_rev.insert(ReadIdx(n), read_id.key().clone());
-            }
-
-            println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/num_reads as f64)*100_f64);
-            println!("Number of potential sources: {}", num_em_refs);
+            println!("Number of reads aligned: {} ({:.2}%)", out_aligns.len(), (out_aligns.len() as f64/num_reads as f64)*100_f64);
+            println!("Number of potential sources: {}", all_refs.len());
 
             let mut ll_array: SparseArray<EMProb> = SparseArray::default();
 
-            for val in out_alignments.iter(){
+            for val in out_aligns.iter(){
                 let read_id = val.key();
                 let alignments = val.value();
                 for (ref_idx, positions) in alignments{
                     let read_idx = read_ids.get(read_id).unwrap();
 
-                    for (_, score) in positions.iter(){
+                    for score in positions.iter(){
                         if score.exp().is_finite() && score.exp()!=0.0{
                             ll_array.insert(*read_idx, *ref_idx, score.exp() as EMProb);
                         }
@@ -1029,7 +1243,9 @@ fn main() -> Result<()>{
             }
 
 
-            let (read_assignments, props, posteriors) = get_proportions_par_sparse(&ll_array, *num_iter, *lambda, *gamma);
+            let (read_assignments, props, posteriors) = get_proportions_par_sparse_l1_reg(&ll_array, *num_iter, *lambda, *gamma);
+
+            // let (read_assignments, props, posteriors) = get_proportions_par_sparse_l1_reg(&ll_array, *num_iter, *lambda);
 
             let pb = ProgressBar::new(read_assignments.len() as u64);
             pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
@@ -1051,7 +1267,8 @@ fn main() -> Result<()>{
             }
 
             for read_id in all_read_ids.iter(){
-                if !out_alignments.contains_key(read_id){
+                let read_idx = read_ids.get(&read_id);
+                if !out_aligns.contains_key(&read_id) || !read_assignments.contains_key(read_idx.unwrap()){
                     let outstr = format!("{}\t{}\t{}\n", 
                         **read_id,
                         "unclassified", 
@@ -1066,14 +1283,14 @@ fn main() -> Result<()>{
 
                 let read_idx = *read_ids.get(read_id).unwrap();
 
-                let read_aligns = out_alignments.get(read_id).unwrap();
+                let read_aligns = out_aligns.get(read_id).unwrap();
                 for (ref_idx,aligns) in read_aligns.value(){
 
                     let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
 
-                    for (_,_) in aligns{
+                    for _ in aligns{
                         let outstr = format!("{}\t{}\t{:.5e}\n", 
-                            *read_ids_rev.get(&read_idx).unwrap().clone(),
+                            ***read_ids_rev.get(&read_idx).unwrap(),
                             *ref_id.clone(), 
                             posteriors.get(&(read_idx, *ref_idx)),
                         );
@@ -1087,11 +1304,11 @@ fn main() -> Result<()>{
 
             }
 
-            for read_id in all_read_ids{
+            for read_id in all_read_ids.iter(){
                 let read_idx = read_ids.get(&read_id);
-                if !out_alignments.contains_key(&read_id) || read_idx.is_none() || !read_assignments.contains_key(read_idx.unwrap()){
+                if !out_aligns.contains_key(&read_id) || read_idx.is_none() || !read_assignments.contains_key(read_idx.unwrap()){
                     let outstr = format!("{}\t{}\t{:.5}\n", 
-                        *read_id,
+                        **read_id,
                         "unclassified",
                         "-", 
                     );
@@ -1106,13 +1323,13 @@ fn main() -> Result<()>{
                 let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
                 let read_id = read_ids_rev.get(read_idx.unwrap()).unwrap();
 
-                if !out_alignments.get(read_id).unwrap().contains_key(ref_idx){
+                if !out_aligns.get(read_id).unwrap().contains_key(ref_idx){
                     continue;
                 }
 
-                if out_alignments.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array.get(&(*read_idx.unwrap(), *ref_idx)).is_finite(){
+                if out_aligns.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array.get(&(*read_idx.unwrap(), *ref_idx)).is_finite(){
                     let outstr = format!("{}\t{}\t{:.5e}\n", 
-                        *read_ids_rev.get(read_idx.unwrap()).unwrap().clone(),
+                        ***read_ids_rev.get(read_idx.unwrap()).unwrap(),
                         *ref_id.clone(), 
                         posteriors.get(&(*read_idx.unwrap(), *ref_idx)),
                     );
@@ -1123,7 +1340,7 @@ fn main() -> Result<()>{
                 }
             }
 
-            println!("{} reads ({:.3}%) could not be classified!", num_reads-out_alignments.len(), (((num_reads-out_alignments.len()) as f64)/num_reads as f64)*100_f64);
+            println!("{} reads ({:.3}%) could not be classified!", num_reads-out_aligns.len(), (((num_reads-out_aligns.len()) as f64)/num_reads as f64)*100_f64);
             let elapsed_time = now.elapsed();
             println!("Total runtime: {:.2?}", elapsed_time);
 
