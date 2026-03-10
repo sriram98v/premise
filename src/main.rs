@@ -4,17 +4,17 @@ use bio::alphabets;
 use bio::alphabets::Alphabet;
 use bio::io::fasta;
 use bio::stats::{LogProb, Prob};
-use clap::{arg, Command};
+use clap::{Arg, ArgAction, Command, arg};
 use dashmap::{DashMap, DashSet};
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
 use num::{Float, Zero};
 use utils::*;
 use core::f64;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::thread;
-use std::{collections::HashMap, fs::File, io::{BufReader, Write}, sync::Mutex};
+use std::{collections::HashMap, fs::File, io::BufReader};
 use bio::io::fastq;
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
@@ -24,10 +24,12 @@ use flate2::read::GzDecoder;
 use chrono::Local;
 use savefile::prelude::*;
 use std::time::Instant;
+use std::io::Cursor;
+use tiny_http::{Server, Response, Header, StatusCode};
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 use std::cmp;
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile, PartialOrd, Ord)]
 pub struct ReadID(String);
 
 impl std::ops::Deref for ReadID {
@@ -380,7 +382,7 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
     Ok((out_aligns, all_ref_ids))
 }
 
-fn _get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
+fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -422,6 +424,11 @@ fn _get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)-
 
     
     let mut prev_data_loglikelihood = clik.iter().filter(|x| *x.value()!=0.0).map(|x| x.value().ln()).sum::<EMProb>();
+
+    let mut data_likelihoods: Vec<EMProb> = Vec::new();
+
+    data_likelihoods.push(prev_data_loglikelihood);
+
 
     for i in 0..num_iter {
 
@@ -493,6 +500,8 @@ fn _get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)-
 
         prev_data_loglikelihood = data_loglikelihood;
 
+        data_likelihoods.push(prev_data_loglikelihood);
+
         pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
 
         if data_loglikelihood_diff>0.0 && data_loglikelihood_diff.abs()<=1e-6{
@@ -512,7 +521,7 @@ fn _get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)-
         (*read_idx, row_argmax)
     }).collect();
 
-    (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w)
+    (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w, data_likelihoods)
 }
 
 fn _update_pi(rho: EMProb, omega: EMProb, ej: EMProb, lambda: EMProb)-> EMProb{
@@ -567,7 +576,7 @@ fn _penalty(props: &HashMap<RefIdx, EMProb>, omega: EMProb)->EMProb{
     props.values().map(|x| (1.0+(x/omega)).ln()).sum()
 }
 
-fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>){
+fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -609,6 +618,10 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
 
     
     let mut prev_data_loglikelihood = clik.iter().filter(|x| *x.value()!=0.0).map(|x| x.value().ln()).sum::<EMProb>();
+
+    let mut data_likelihoods: Vec<EMProb> = Vec::new();
+
+    data_likelihoods.push(prev_data_loglikelihood);
 
     for i in 0..num_iter {
 
@@ -652,6 +665,8 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
         let data_loglikelihood_diff= data_loglikelihood-prev_data_loglikelihood;
 
         prev_data_loglikelihood = data_loglikelihood;
+
+        data_likelihoods.push(prev_data_loglikelihood);
 
         let ejs: HashMap<RefIdx, EMProb> = ll_array.get_ref_idxs()
             .par_iter()
@@ -700,10 +715,568 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
         (*read_idx, row_argmax)
     }).collect();
 
-    (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w)
+    (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w, data_likelihoods)
 }
 
 
+
+fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
+    let cursor = Cursor::new(fasta_data);
+    let reader = BufReader::new(cursor);
+    let records = fasta::Reader::new(reader).records();
+
+    let mut ref_ids: HashMap<RefID, RefIdx> = HashMap::new();
+    let mut ref_ids_rev: HashMap<RefIdx, RefID> = HashMap::new();
+    let mut refs: HashMap<RefIdx, Vec<u8>> = HashMap::new();
+    let mut refs_texts: Vec<Vec<u8>> = vec![];
+
+    for (idx, result) in records.enumerate() {
+        let record = result.map_err(|e| anyhow::anyhow!("FASTA parse error: {}", e))?;
+        ref_ids.insert(RefID(record.id().to_string()), RefIdx(idx));
+        ref_ids_rev.insert(RefIdx(idx), RefID(record.id().to_string()));
+        refs.insert(RefIdx(idx), record.seq().to_vec());
+        refs_texts.push(record.seq().to_vec());
+    }
+
+    if refs_texts.is_empty() {
+        return Err(anyhow::anyhow!("No sequences found in FASTA file"));
+    }
+
+    let log_str = format!("Timestamp: {}\nNum references: {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                ref_ids.len(),
+            );
+    println!("{}", log_str);
+
+    let dna_alphabet = alphabet::ascii_dna_iupac_as_dna_with_n();
+    let fmidx: FmIndexFlat64<_> = FmIndexConfig::<i64, FlatTextWithRankSupport<i64, Block64>>::new()
+        .suffix_array_sampling_rate(1)
+        .lookup_table_depth(13)
+        .construct_index(
+            refs_texts.iter().map(|x| str::from_utf8(x).unwrap()).collect_vec(),
+            dna_alphabet,
+        );
+
+    let io_struct = IOFMIndex {
+        fmidx,
+        idx_to_id: ref_ids_rev,
+        id_to_idx: ref_ids,
+        idx_to_seq: refs,
+    };
+
+    let bytes = save_to_mem(0, &io_struct).map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?;
+    Ok((bytes, log_str))
+}
+
+fn handle_api_build(mut request: tiny_http::Request) {
+    let result: Result<(Vec<u8>, String)> = (|| {
+        let mut body = Vec::new();
+        request.as_reader().read_to_end(&mut body)?;
+        if body.is_empty() {
+            return Err(anyhow::anyhow!("Empty request body"));
+        }
+        build_index_from_bytes(&body)
+    })();
+
+    match result {
+        Ok((data, log_str)) => {
+            println!("{}", log_str);
+            let log_header_val = log_str.replace('\n', " | ");
+            let ct = Header::from_bytes(b"Content-Type", b"application/octet-stream").unwrap();
+            let cd = Header::from_bytes(b"Content-Disposition", b"attachment; filename=\"output.fmidx\"").unwrap();
+            let lg = Header::from_bytes(b"X-Premise-Log", log_header_val.as_bytes())
+                .unwrap_or_else(|_| Header::from_bytes(b"X-Premise-Log", b"").unwrap());
+            let _ = request.respond(Response::from_data(data).with_header(ct).with_header(cd).with_header(lg));
+        }
+        Err(e) => {
+            let _ = request.respond(
+                Response::from_string(e.to_string()).with_status_code(StatusCode(500)),
+            );
+        }
+    }
+}
+
+// ─── Align helpers ────────────────────────────────────────────────────────────
+
+struct AlignSession {
+    dir: std::path::PathBuf,
+    r1_ext: Option<String>,
+    r2_ext: Option<String>,
+}
+
+fn new_session_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
+}
+
+fn parse_qs(url: &str) -> HashMap<String, String> {
+    url.split('?')
+        .nth(1)
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| {
+            let mut it = pair.splitn(2, '=');
+            let k = it.next()?.to_string();
+            let v = it.next().unwrap_or("").to_string();
+            Some((k, v))
+        })
+        .collect()
+}
+
+fn load_fastq_forward(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
+    match get_extension_from_filename(path) {
+        Some("gz") => {
+            let f = File::open(path)?;
+            Ok(fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f)))
+                .records()
+                .filter_map(|x| x.ok())
+                .map(|rec| (ReadID(rec.id().to_string()), rec))
+                .collect())
+        }
+        Some("fastq") | Some("fq") => {
+            let f = File::open(path)?;
+            Ok(fastq::Reader::from_bufread(BufReader::new(f))
+                .records()
+                .filter_map(|x| x.ok())
+                .map(|rec| (ReadID(rec.id().strip_suffix("/1").unwrap_or(rec.id()).to_string()), rec))
+                .collect())
+        }
+        _ => Err(anyhow::anyhow!("Unsupported R1 file type: {}", path)),
+    }
+}
+
+fn load_fastq_reverse(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
+    match get_extension_from_filename(path) {
+        Some("gz") => {
+            let f = File::open(path)?;
+            Ok(fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f)))
+                .records()
+                .filter_map(|x| x.ok())
+                .map(|rec| (ReadID(rec.id().to_string()), rec))
+                .collect())
+        }
+        Some("fastq") | Some("fq") => {
+            let f = File::open(path)?;
+            Ok(fastq::Reader::from_bufread(BufReader::new(f))
+                .records()
+                .filter_map(|x| x.ok())
+                .map(|rec| (ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()), rec))
+                .collect())
+        }
+        _ => Err(anyhow::anyhow!("Unsupported R2 file type: {}", path)),
+    }
+}
+
+fn run_alignment(
+    ref_file: &str,
+    r1_file: &str,
+    r2_file: &str,
+    percent_mismatch: EMProb,
+    threads: usize,
+) -> Result<(String, String)> {
+    let num_threads = if threads == 0 {
+        thread::available_parallelism()?.get()
+    } else {
+        threads
+    };
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global();
+
+    let forward_fastq_records = load_fastq_forward(r1_file)?;
+    let reverse_fastq_records = load_fastq_reverse(r2_file)?;
+
+    let all_reads: Vec<ReadPair> = reverse_fastq_records
+        .into_iter()
+        .filter(|(read_id, _)| forward_fastq_records.contains_key(read_id))
+        .map(|(read_id, rev_rec)| {
+            let fw_rec = forward_fastq_records.get(&read_id).unwrap();
+            ReadPair { read_id, r1: fw_rec.clone(), r2: rev_rec }
+        })
+        .collect();
+
+    let all_read_ids: BTreeSet<ReadID> = forward_fastq_records.into_keys().collect();
+    let num_reads = all_read_ids.len();
+
+    let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
+    let fmidx = iofmidx.fmidx;
+    let ref_ids_rev = iofmidx.idx_to_id;
+    let refs = iofmidx.idx_to_seq;
+
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                num_threads,
+                percent_mismatch,
+            );
+    println!("{}", log_str);
+
+    let (out_alignments, _) = process_read_pairs(
+        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY),
+    )?;
+
+    let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
+    let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
+    for (n, entry) in out_alignments.iter().enumerate() {
+        read_ids.insert(*entry.key(), ReadIdx(n));
+        read_ids_rev.insert(ReadIdx(n), entry.key());
+    }
+
+
+    let mut out = String::from("ReadID\tRefID\tProbability\n");
+    for read_id in &all_read_ids {
+        if !out_alignments.contains_key(read_id) {
+            out.push_str(&format!("{}\tunclassified\t-\n", **read_id));
+            continue;
+        }
+        let read_idx = *read_ids.get(read_id).unwrap();
+        let read_aligns = out_alignments.get(read_id).unwrap();
+        for (ref_idx, aligns) in read_aligns.iter() {
+            let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+            for likelihood in aligns {
+                out.push_str(&format!(
+                    "{}\t{}\t{:.5e}\n",
+                    ***read_ids_rev.get(&read_idx).unwrap(),
+                    *ref_id,
+                    likelihood.exp(),
+                ));
+            }
+        }
+    }
+    println!(
+        "{} of {} reads could not be classified.",
+        num_reads - out_alignments.len(),
+        num_reads
+    );
+    Ok((out, log_str))
+}
+
+fn run_query(
+    ref_file: &str,
+    r1_file: &str,
+    r2_file: &str,
+    percent_mismatch: EMProb,
+    cutoff: EMProb,
+    num_iter: usize,
+    lambda: EMProb,
+    gamma: EMProb,
+    use_penalty: bool,
+    threads: usize,
+) -> Result<(String, String, String, Vec<EMProb>, String)> {
+    let num_threads = if threads == 0 {
+        thread::available_parallelism()?.get()
+    } else {
+        threads
+    };
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global();
+
+    let forward_fastq_records = load_fastq_forward(r1_file)?;
+    let reverse_fastq_records = load_fastq_reverse(r2_file)?;
+
+    let all_reads: Vec<ReadPair> = reverse_fastq_records
+        .into_iter()
+        .filter(|(read_id, _)| forward_fastq_records.contains_key(read_id))
+        .map(|(read_id, rev_rec)| {
+            let fw_rec = forward_fastq_records.get(&read_id).unwrap();
+            ReadPair { read_id, r1: fw_rec.clone(), r2: rev_rec }
+        })
+        .collect();
+
+    let all_read_ids: BTreeSet<ReadID> = forward_fastq_records.into_keys().collect();
+
+    let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
+    let fmidx = iofmidx.fmidx;
+    let ref_ids_rev = iofmidx.idx_to_id;
+    let refs = iofmidx.idx_to_seq;
+
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nCutoff likelihood: {:e} ({:.2})\nEM Iterations: {}",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        num_threads,
+        percent_mismatch,
+        cutoff,
+        cutoff.ln(),
+        num_iter,
+    );
+    println!("{}", log_str);
+
+    let (out_aligns, _all_refs) = process_read_pairs(
+        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(cutoff.ln()),
+    )?;
+
+    let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
+    let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
+    for (n, val) in out_aligns.iter().enumerate() {
+        read_ids.insert(*val.key(), ReadIdx(n));
+        read_ids_rev.insert(ReadIdx(n), *val.key());
+    }
+
+    let mut ll_array: SparseArray<EMProb> = SparseArray::default();
+    for val in out_aligns.iter() {
+        let read_id = val.key();
+        let alignments = val.value();
+        for (ref_idx, positions) in alignments {
+            let read_idx = read_ids.get(read_id).unwrap();
+            for score in positions.iter() {
+                if score.exp().is_finite() && score.exp() != 0.0 {
+                    ll_array.insert(*read_idx, *ref_idx, score.exp() as EMProb);
+                }
+            }
+        }
+    }
+
+    let (read_assignments, props, posteriors, em_data_likelihoods) = if use_penalty {
+        get_proportions_par_sparse_l1_reg(&ll_array, num_iter, lambda, gamma)
+    } else {
+        get_proportions_par_sparse(&ll_array, num_iter)
+    };
+
+    // Build props TSV (no header — just ref_id \t proportion)
+    let mut props_tsv = String::new();
+    for (ref_idx, prop) in &props {
+        if *prop > 0.0 {
+            let ref_id = ref_ids_rev.get(ref_idx).unwrap();
+            props_tsv.push_str(&format!("{}\t{:.5e}\n", **ref_id, prop));
+        }
+    }
+
+    // Build posteriors TSV
+    let mut posteriors_tsv = String::from("ReadID\tRefID\tPosterior\n");
+    for read_id in all_read_ids.iter() {
+        let read_idx = read_ids.get(&read_id);
+        if !out_aligns.contains_key(read_id)
+            || read_idx.is_none()
+            || !read_assignments.contains_key(read_idx.unwrap())
+        {
+            posteriors_tsv.push_str(&format!("{}\tunclassified\t-\n", **read_id));
+            continue;
+        }
+        let read_idx = *read_ids.get(read_id).unwrap();
+        let read_aligns = out_aligns.get(read_id).unwrap();
+        for (ref_idx, aligns) in read_aligns.value() {
+            let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+            for _ in aligns {
+                posteriors_tsv.push_str(&format!(
+                    "{}\t{}\t{:.5e}\n",
+                    ***read_ids_rev.get(&read_idx).unwrap(),
+                    *ref_id.clone(),
+                    posteriors.get(&(read_idx, *ref_idx)),
+                ));
+            }
+        }
+    }
+
+    // Build matches TSV
+    let mut matches_tsv = String::from("ReadID\tRefID\tPosterior\n");
+    for read_id in all_read_ids.iter() {
+        let read_idx = read_ids.get(&read_id);
+        if !out_aligns.contains_key(read_id)
+            || read_idx.is_none()
+            || !read_assignments.contains_key(read_idx.unwrap())
+        {
+            matches_tsv.push_str(&format!("{}\tunclassified\t-\n", **read_id));
+            continue;
+        }
+        let ref_idx = read_assignments.get(read_idx.unwrap()).unwrap();
+        let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+        let read_id = read_ids_rev.get(read_idx.unwrap()).unwrap();
+
+        if !out_aligns.get(read_id).unwrap().contains_key(ref_idx) {
+            continue;
+        }
+
+        if out_aligns.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some()
+            && ll_array.get(&(*read_idx.unwrap(), *ref_idx)).is_finite()
+        {
+            matches_tsv.push_str(&format!(
+                "{}\t{}\t{:.5e}\n",
+                ***read_ids_rev.get(read_idx.unwrap()).unwrap(),
+                *ref_id.clone(),
+                posteriors.get(&(*read_idx.unwrap(), *ref_idx)),
+            ));
+        }
+    }
+
+    Ok((matches_tsv, posteriors_tsv, props_tsv, em_data_likelihoods, log_str))
+}
+
+fn do_align_upload(
+    request: &mut tiny_http::Request,
+    sessions: &mut HashMap<String, AlignSession>,
+) -> Result<String> {
+    let url = request.url().to_string();
+    let qs = parse_qs(&url);
+    let part = qs.get("part").map(|s| s.as_str()).unwrap_or("").to_string();
+    let ext  = qs.get("ext").cloned().unwrap_or_else(|| "fastq".to_string());
+
+    let session_id = if qs.get("session").map(|s| s.as_str()) == Some("new")
+        || !qs.contains_key("session")
+    {
+        let id = new_session_id();
+        let dir = std::env::temp_dir().join(format!("premise_{}", id));
+        std::fs::create_dir_all(&dir)?;
+        sessions.insert(id.clone(), AlignSession { dir, r1_ext: None, r2_ext: None });
+        id
+    } else {
+        qs.get("session").unwrap().clone()
+    };
+
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+
+    let file_name = match part.as_str() {
+        "index" => "index.fmidx".to_string(),
+        "r1"    => { session.r1_ext = Some(ext.clone()); format!("r1.{}", ext) }
+        "r2"    => { session.r2_ext = Some(ext.clone()); format!("r2.{}", ext) }
+        _       => return Err(anyhow::anyhow!("Unknown upload part: {}", part)),
+    };
+
+    let file_path = session.dir.join(&file_name);
+    let mut out_file = File::create(&file_path)?;
+    std::io::copy(request.as_reader(), &mut out_file)?;
+
+    Ok(format!(r#"{{"session":"{}","ok":true}}"#, session_id))
+}
+
+fn handle_align_upload(mut request: tiny_http::Request, sessions: &mut HashMap<String, AlignSession>) {
+    match do_align_upload(&mut request, sessions) {
+        Ok(json) => {
+            let ct = Header::from_bytes(b"Content-Type", b"application/json").unwrap();
+            let _ = request.respond(Response::from_string(json).with_header(ct));
+        }
+        Err(e) => {
+            let _ = request.respond(
+                Response::from_string(e.to_string()).with_status_code(StatusCode(500)),
+            );
+        }
+    }
+}
+
+fn do_align_run(
+    request: &tiny_http::Request,
+    sessions: &HashMap<String, AlignSession>,
+) -> Result<String> {
+    let url = request.url().to_string();
+    let qs = parse_qs(&url);
+    let session_id = qs.get("session").ok_or_else(|| anyhow::anyhow!("Missing session"))?;
+    let mismatch: EMProb = qs.get("mismatch").and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    let threads: usize   = qs.get("threads").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let session = sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+
+    let r1_ext = session.r1_ext.as_deref().unwrap_or("fastq");
+    let r2_ext = session.r2_ext.as_deref().unwrap_or("fastq");
+
+    let ref_path = session.dir.join("index.fmidx");
+    let r1_path  = session.dir.join(format!("r1.{}", r1_ext));
+    let r2_path  = session.dir.join(format!("r2.{}", r2_ext));
+
+    let (tsv, log_str) = run_alignment(
+        ref_path.to_str().unwrap(),
+        r1_path.to_str().unwrap(),
+        r2_path.to_str().unwrap(),
+        mismatch,
+        threads,
+    )?;
+    Ok(format!(
+        r#"{{"ok":true,"tsv":"{}","log":"{}"}}"#,
+        json_escape(&tsv),
+        json_escape(&log_str),
+    ))
+}
+
+fn handle_align_run(request: tiny_http::Request, sessions: &HashMap<String, AlignSession>) {
+    match do_align_run(&request, sessions) {
+        Ok(json) => {
+            let ct = Header::from_bytes(b"Content-Type", b"application/json").unwrap();
+            let _ = request.respond(Response::from_string(json).with_header(ct));
+        }
+        Err(e) => {
+            let _ = request.respond(
+                Response::from_string(e.to_string()).with_status_code(StatusCode(500)),
+            );
+        }
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c    => out.push(c),
+        }
+    }
+    out
+}
+
+fn do_query_run(
+    request: &tiny_http::Request,
+    sessions: &HashMap<String, AlignSession>,
+) -> Result<String> {
+    let url = request.url().to_string();
+    let qs = parse_qs(&url);
+    let session_id = qs.get("session").ok_or_else(|| anyhow::anyhow!("Missing session"))?;
+    let mismatch: EMProb  = qs.get("mismatch").and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    let cutoff: EMProb    = qs.get("cutoff").and_then(|s| s.parse().ok()).unwrap_or(1e-4);
+    let num_iter: usize   = qs.get("iter").and_then(|s| s.parse().ok()).unwrap_or(100);
+    let lambda: EMProb    = qs.get("lambda").and_then(|s| s.parse().ok()).unwrap_or(20.0);
+    let gamma: EMProb     = qs.get("gamma").and_then(|s| s.parse().ok()).unwrap_or(1e-20);
+    let no_penalty: bool  = qs.get("no_penalty").map(|s| s == "true").unwrap_or(false);
+    let use_penalty       = !no_penalty;
+    let threads: usize    = qs.get("threads").and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    let session = sessions
+        .get(session_id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+
+    let r1_ext = session.r1_ext.as_deref().unwrap_or("fastq");
+    let r2_ext = session.r2_ext.as_deref().unwrap_or("fastq");
+
+    let ref_path = session.dir.join("index.fmidx");
+    let r1_path  = session.dir.join(format!("r1.{}", r1_ext));
+    let r2_path  = session.dir.join(format!("r2.{}", r2_ext));
+
+    let (matches_tsv, posteriors_tsv, props_tsv, em_likelihoods, log_str) = run_query(
+        ref_path.to_str().unwrap(),
+        r1_path.to_str().unwrap(),
+        r2_path.to_str().unwrap(),
+        mismatch, cutoff, num_iter, lambda, gamma, use_penalty, threads,
+    )?;
+
+    let convergence_json = format!("[{}]",
+        em_likelihoods.iter()
+            .map(|v| if v.is_finite() { format!("{:.10e}", v) } else { "null".to_string() })
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+
+    Ok(format!(
+        r#"{{"ok":true,"matches":"{}","posteriors":"{}","props":"{}","convergence":{},"log":"{}"}}"#,
+        json_escape(&matches_tsv),
+        json_escape(&posteriors_tsv),
+        json_escape(&props_tsv),
+        convergence_json,
+        json_escape(&log_str),
+    ))
+}
+
+fn handle_query_run(request: tiny_http::Request, sessions: &HashMap<String, AlignSession>) {
+    match do_query_run(&request, sessions) {
+        Ok(json) => {
+            let ct = Header::from_bytes(b"Content-Type", b"application/json").unwrap();
+            let _ = request.respond(Response::from_string(json).with_header(ct));
+        }
+        Err(e) => {
+            let _ = request.respond(
+                Response::from_string(e.to_string()).with_status_code(StatusCode(500)),
+            );
+        }
+    }
+}
 
 fn main() -> Result<()>{
     let matches = Command::new("Maximum Likelihood Metagenomic Classification")
@@ -802,10 +1375,33 @@ fn main() -> Result<()>{
                     .default_value("out")
                     .value_parser(clap::value_parser!(String))
                     )
+                .arg(Arg::new("no-penalty")
+                    .long("no-penalty")
+                    .help("Disable penalty")
+                    .required(false)
+                    .num_args(0)
+                    .action(ArgAction::SetFalse))
                 .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
                     )
+        )
+        .subcommand(
+            Command::new("server")
+                .about("Start a local HTTP server serving the web interface")
+                .arg(Arg::new("port")
+                    .long("port")
+                    .short('p')
+                    .help("Port to listen on")
+                    .default_value("8080")
+                    .value_parser(clap::value_parser!(u16))
+                )
+                .arg(Arg::new("ip")
+                    .long("ip")
+                    .help("IP address to bind to")
+                    .default_value("127.0.0.1")
+                    .value_parser(clap::value_parser!(String))
+                )
         )
         .about("Maximum Likelihood Metagenomic classifier using Suffix trees")
         .get_matches();
@@ -815,541 +1411,108 @@ fn main() -> Result<()>{
             let src_file = sub_m.get_one::<String>("source").expect("required").as_str();
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
 
-            let f = File::open(src_file)?;
-            let reader = BufReader::new(f);
+            let fasta_data = std::fs::read(src_file)?;
+            let (idx_bytes, _) = build_index_from_bytes(&fasta_data)?;
 
-            let records = fasta::Reader::new(reader).records();
-
-            let mut nb_reads = 0;
-            let mut nb_bases = 0;
-
-            let mut ref_ids: HashMap<RefID, RefIdx> = HashMap::new();
-            let mut ref_ids_rev: HashMap<RefIdx, RefID> = HashMap::new();
-            let mut refs: HashMap<RefIdx, Vec<u8>> = HashMap::new();
-            let mut refs_texts = vec![];
-
-            for (idx, result) in records.enumerate() {
-                let record = result.expect("Error during reference parsing");
-
-                ref_ids.insert(RefID(record.id().to_string()), RefIdx(idx));
-                ref_ids_rev.insert(RefIdx(idx), RefID(record.id().to_string()));
-                refs.insert(RefIdx(idx), record.seq().to_vec());
-                refs_texts.push(record.seq().to_vec());
-
-                nb_reads += 1;
-                nb_bases += record.seq().len();
-
-            }
-
-            let log_str = format!("Timestamp: {}\nReference Index: {}\nNum references: {}\n Num bases: {}\nOutput File: {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                src_file,
-                nb_reads,
-                nb_bases,
-                outfile,
-            );
-
-            println!("{}", log_str);
-
-            let dna_alphabet = alphabet::ascii_dna_iupac_as_dna_with_n();
-            let fmidx: FmIndexFlat64<_> = FmIndexConfig::<i64, FlatTextWithRankSupport<i64, Block64>>::new()
-                .suffix_array_sampling_rate(1)
-                .lookup_table_depth(13)
-                .construct_index(refs_texts.iter().map(|x| str::from_utf8(x).unwrap()).collect_vec(), dna_alphabet);
-
-            let io_struct = IOFMIndex{
-                fmidx,
-                idx_to_id: ref_ids_rev,
-                id_to_idx: ref_ids,
-                idx_to_seq: refs,
+            let out_path = match outfile {
+                "" => format!("{}.fmidx", src_file),
+                p  => p.to_string(),
             };
-
-            
-            match outfile{
-                "" => {
-                    save_file(format!("{}.fmidx", src_file), 0, &io_struct)?;
-                },
-                _ => {
-                    save_file(outfile, 0, &io_struct)?;
-                }
-            };
+            std::fs::write(&out_path, &idx_bytes)?;
+            println!("Index written to {}", out_path);
 
         },
         Some(("align",  sub_m)) => {
             let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
-            let forward_reads_file = sub_m.get_one::<String>("r1").expect("required").as_str();
-            let reverse_reads_file = sub_m.get_one::<String>("r2").expect("required").as_str();
-            let percent_mismatch = sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
+            let r1_file = sub_m.get_one::<String>("r1").expect("required").as_str();
+            let r2_file = sub_m.get_one::<String>("r2").expect("required").as_str();
+            let percent_mismatch = *sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
-
-            let outpath = Some(Mutex::new(File::create(outfile).unwrap()));
-            let outstr = "ReadID\tRefID\tProbability\n".to_string();
-            match outpath.as_ref(){
-                Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                None => {print!("{}", outstr)},
-            };
-
-
-            let num_threads = match sub_m.get_one::<usize>("threads").expect("required"){
-                0 => thread::available_parallelism()?.get(),
-                _ => *sub_m.get_one::<usize>("threads").expect("required"),
-            };
-            
-            rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
-
-            let forward_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(forward_reads_file){
-                Some("gz") => {
-                    let f = File::open(forward_reads_file)?;
-                    let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder))
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
-                        .collect()
-                },
-                Some("fastq")|Some("fq") => {
-                    let f = File::open(forward_reads_file)?;
-                    let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader)
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().strip_suffix("/1").unwrap_or(rec.id()).to_string()), rec))
-                        .collect()
-
-                },
-                _ => panic!("Invalid file type for reads!")
-            };
-
-            let reverse_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(reverse_reads_file){
-                Some("gz") => {
-                    let f = File::open(reverse_reads_file)?;
-                    let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder))
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
-                        .collect()
-                },
-                Some("fastq")|Some("fq") => {
-                    let f = File::open(reverse_reads_file)?;
-                    let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader)
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()), rec))
-                        .collect()
-
-                },
-                _ => panic!("Invalid file type for reads!")
-            };
-
-            let all_reads: Vec<ReadPair> = reverse_fastq_records.into_iter()
-                .filter(|(read_id, _)| {
-                    forward_fastq_records.contains_key(&read_id)
-                })
-                .map(|(read_id, rev_rec)| {
-                    let fw_rec = forward_fastq_records.get(&read_id).unwrap();
-                    let read_pair = ReadPair{
-                            read_id: read_id,
-                            r1: fw_rec.clone(),
-                            r2: rev_rec,
-                    };
-                    read_pair
-                })
-                .collect();
-
-            let read_len = forward_fastq_records.values().map(|x| x.seq().len()).sum::<usize>() as f32/(forward_fastq_records.len() as f32);
-            let all_read_ids: HashSet<ReadID> = forward_fastq_records.into_keys().collect();
-
-            let log_str = format!("Timestamp: {}\nForward Reads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nOutput File: {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                forward_reads_file,
-                ref_file,
-                num_threads,
-                percent_mismatch,
-                outfile,
-            );
-
-            let num_reads = all_read_ids.len();
-
-            println!("{}", log_str);
-            println!("Num reads: {}", num_reads);
-            println!("Average read len: {:.3} bp", read_len);
-
-            let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
-
-            let fmidx: FmIndexFlat64<i64> = iofmidx.fmidx;
-
-            let _ref_ids = iofmidx.id_to_idx;
-            let ref_ids_rev = iofmidx.idx_to_id;
-            let refs = iofmidx.idx_to_seq;
+            let threads = *sub_m.get_one::<usize>("threads").expect("required");
 
             let now = Instant::now();
-
-            let (out_alignments, _all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch, LogProb(f64::NEG_INFINITY))?;
-
-            let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
-            let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
-            for (n, read_id) in out_alignments.iter().enumerate() {
-                read_ids.insert(*read_id.key(), ReadIdx(n));
-                read_ids_rev.insert(ReadIdx(n), read_id.key());
-            }
-
-            println!("Number of reads aligned: {} ({:.2}%)", out_alignments.len(), (out_alignments.len() as f64/num_reads as f64)*100_f64);
-
-            let pb = ProgressBar::new(out_alignments.len() as u64);
-            pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
-
-
-            for read_id in all_read_ids{
-                if !out_alignments.contains_key(&read_id){
-                    let outstr = format!("{}\t{}\t{}\n", 
-                        *read_id,
-                        "unclassified",
-                        "-"
-                    );
-                    match outpath.as_ref(){
-                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                        None => {print!("{}", outstr)},
-                    };
-                    continue;
-                }
-
-                let read_idx = *read_ids.get(&read_id).unwrap();
-
-                let read_aligns = out_alignments.get(&read_id).unwrap();
-                for (ref_idx,aligns) in read_aligns.iter(){
-
-                    let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
-
-                    for likelihood in aligns{
-                        let outstr = format!("{}\t{}\t{:.5e}\n", 
-                            ***read_ids_rev.get(&read_idx).unwrap(),
-                            *ref_id.clone(), 
-                            likelihood.exp(),
-                        );
-                        match outpath.as_ref(){
-                            Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                            None => {print!("{}", outstr)},
-                        };
-                    }
-
-                }
-
-            }
-
-            println!("{} reads ({:.3}%) could not be classified!", num_reads-out_alignments.len(), (((num_reads-out_alignments.len()) as f64)/num_reads as f64)*100_f64);
-            let elapsed_time = now.elapsed();
-            println!("Total runtime: {:.2?}", elapsed_time);
-
-            pb.finish_with_message("");
+            let (tsv, _) = run_alignment(ref_file, r1_file, r2_file, percent_mismatch, threads)?;
+            std::fs::write(outfile, tsv.as_bytes())?;
+            println!("Alignment written to {} ({:.2?})", outfile, now.elapsed());
         },
         Some(("query",  sub_m)) => {
             let ref_file = sub_m.get_one::<String>("source").expect("required").as_str();
-            let forward_reads_file = sub_m.get_one::<String>("r1").expect("required").as_str();
-            let reverse_reads_file = sub_m.get_one::<String>("r2").expect("required").as_str();
-            let num_iter = sub_m.get_one::<usize>("iter").expect("required");
-            let percent_mismatch = sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
+            let r1_file = sub_m.get_one::<String>("r1").expect("required").as_str();
+            let r2_file = sub_m.get_one::<String>("r2").expect("required").as_str();
+            let num_iter = *sub_m.get_one::<usize>("iter").expect("required");
+            let percent_mismatch = *sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
             let cutoff = *sub_m.get_one::<EMProb>("cutoff").expect("required");
-            let gamma = sub_m.get_one::<EMProb>("gamma").expect("required");
-            let lambda = sub_m.get_one::<EMProb>("lambda").expect("required");
+            let gamma = *sub_m.get_one::<EMProb>("gamma").expect("required");
+            let lambda = *sub_m.get_one::<EMProb>("lambda").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
-
-            let outpath = Some(Mutex::new(File::create(format!("{}.matches", outfile)).unwrap()));
-            let out_posteriors = Some(Mutex::new(File::create(format!("{}.posteriors", outfile)).unwrap()));
-            let out_props = Some(Mutex::new(File::create(format!("{}.props", outfile)).unwrap()));
-
-            let outstr = "ReadID\tRefID\tPosterior\n".to_string();
-            match outpath.as_ref(){
-                Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                None => {print!("{}", outstr)},
-            };
-
-
-            let num_threads = match sub_m.get_one::<usize>("threads").expect("required"){
-                0 => thread::available_parallelism()?.get(),
-                _ => *sub_m.get_one::<usize>("threads").expect("required"),
-            };
-            
-            rayon::ThreadPoolBuilder::new().num_threads(num_threads).build_global()?;
-
-            let forward_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(forward_reads_file){
-                Some("gz") => {
-                    let f = File::open(forward_reads_file)?;
-                    let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder))
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
-                        .collect()
-                },
-                Some("fastq")|Some("fq") => {
-                    let f = File::open(forward_reads_file)?;
-                    let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader)
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().strip_suffix("/1").unwrap_or(rec.id()).to_string()), rec))
-                        .collect()
-
-                },
-                _ => panic!("Invalid file type for reads!")
-            };
-
-            let reverse_fastq_records: HashMap<ReadID, fastq::Record> = match get_extension_from_filename(reverse_reads_file){
-                Some("gz") => {
-                    let f = File::open(reverse_reads_file)?;
-                    let decoder = GzDecoder::new(f);
-                    fastq::Reader::from_bufread(BufReader::new(decoder))
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().to_string()), rec))
-                        .collect()
-                },
-                Some("fastq")|Some("fq") => {
-                    let f = File::open(reverse_reads_file)?;
-                    let reader = BufReader::new(f);
-                    fastq::Reader::from_bufread(reader)
-                        .records()
-                        .filter_map(|x| x.ok())
-                        .map(|rec| (ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()), rec))
-                        .collect()
-
-                },
-                _ => panic!("Invalid file type for reads!")
-            };
-
-            let all_reads: Vec<ReadPair> = reverse_fastq_records.into_iter()
-                .filter(|(read_id, _)| {
-                    forward_fastq_records.contains_key(&read_id)
-                })
-                .map(|(read_id, rev_rec)| {
-                    let fw_rec = forward_fastq_records.get(&read_id).unwrap();
-                    let read_pair = ReadPair{
-                            read_id: read_id,
-                            r1: fw_rec.clone(),
-                            r2: rev_rec,
-                    };
-                    read_pair
-                })
-                .collect();
-
-            let read_len = forward_fastq_records.values().map(|x| x.seq().len()).sum::<usize>() as f32/(forward_fastq_records.len() as f32);
-            let all_read_ids: HashSet<ReadID> = forward_fastq_records.into_keys().collect();
-
-            let log_str = format!("Timestamp: {}\nReads File: {}\nReference Index: {}\nNum Threads: {}\nPercent Mismatch: {}\nCutoff likelihood: {:e} ({:.2})\nEM Iterations: {}\nOutput File: {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
-                forward_reads_file,
-                ref_file,
-                num_threads,
-                percent_mismatch,
-                cutoff,
-                cutoff.ln(),
-                num_iter,
-                outfile,
-            );
-
-            let num_reads = all_read_ids.len();
-
-            println!("{}", log_str);
-            println!("Num reads: {}", num_reads);
-            println!("Average read len: {:.3} bp", read_len);
-
-            let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
-
-            let fmidx: FmIndexFlat64<i64> = iofmidx.fmidx;
-
-            let _ref_ids = iofmidx.id_to_idx;
-            let ref_ids_rev = iofmidx.idx_to_id;
-            let refs = iofmidx.idx_to_seq;
+            let use_penalty = *sub_m.get_one::<bool>("no-penalty").unwrap();
+            let threads = *sub_m.get_one::<usize>("threads").expect("required");
 
             let now = Instant::now();
+            let (matches_tsv, posteriors_tsv, props_tsv, _, _) = run_query(
+                ref_file, r1_file, r2_file,
+                percent_mismatch, cutoff, num_iter, lambda, gamma, use_penalty, threads,
+            )?;
+            std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
+            std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())?;
+            std::fs::write(format!("{}.props", outfile), props_tsv.as_bytes())?;
+            println!("Query written to {}.{{matches,posteriors,props}} ({:.2?})", outfile, now.elapsed());
+        },
+        Some(("server", sub_m)) => {
+            let port = *sub_m.get_one::<u16>("port").unwrap();
+            let ip = sub_m.get_one::<String>("ip").unwrap();
+            let addr = format!("{}:{}", ip, port);
 
-            let (out_aligns, all_refs) = process_read_pairs(&fmidx, &refs, &all_reads, percent_mismatch, LogProb(cutoff.ln()))?;
+            let html = include_str!("templates/index.html")
+                .replace("{{CSS}}", include_str!("templates/styles.css"))
+                .replace("{{JS}}",  include_str!("templates/app.js"));
 
-            // let pb = ProgressBar::with_draw_target(Some(out_aligns.len() as u64), ProgressDrawTarget::stderr());
-            // pb.set_style(ProgressStyle::with_template("Filtering alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+            let server = Server::http(&addr)
+                .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", addr, e))?;
 
-            // let all_refs_filtered: DashSet<RefIdx> = DashSet::new();
-            // out_aligns.iter().for_each(|val| {
-            //     let aligns = val.value();
-            //     let mut alignment_dist = aligns.iter()
-            //         .map(|(ref_idx, hits)| (*ref_idx, hits.iter().map(|ll| ll.0 as EMProb).max_by(|a, b| a.total_cmp(&b)).unwrap()))
-            //         .collect_vec();
-            //     alignment_dist.sort_by(|a, b| a.1.total_cmp(&b.1));
-            //     alignment_dist.reverse();
+            println!("Premise web interface running at http://{}", addr);
+            println!("Press Ctrl+C to stop.");
 
-            //     let num_alignments = alignment_dist.len();
+            let mut sessions: HashMap<String, AlignSession> = HashMap::new();
+            let mut query_sessions: HashMap<String, AlignSession> = HashMap::new();
 
-            //     let read_alignment_max_loglikelihood = alignment_dist[0].1;
-                
-            //     let mut n = 0;
-            //     while n<num_alignments && alignment_dist[n].1>=cutoff.ln() && alignment_dist[n].1 - read_alignment_max_loglikelihood>= cutoff.ln(){
-            //         n+=1;
-            //     }
-            //     let usable_alignments = n;
+            for request in server.incoming_requests() {
+                let url = request.url().to_string();
+                let path = url.split('?').next().unwrap_or("/").to_string();
+                let method = request.method().clone();
 
-            //     let best_aligns: HashMap<RefIdx, VecDeque<LogProb>> = alignment_dist.iter()
-            //         .take(usable_alignments)
-            //         .map(|x| (x.0, VecDeque::from([LogProb(x.1)])))
-            //         .collect();
-            //     for ref_idx in best_aligns.keys(){
-            //         all_refs_filtered.insert(*ref_idx);
-            //     }
-            //     pb.inc(1);
-            // });
-
-            // pb.finish_with_message("");
-
-            // let out_alignments: ReadAlignments = out_aligns.into_iter()
-            //     .map(|(read_id, mut aligns)| {
-            //         aligns.retain(|&k, _| all_refs_filtered.contains(&k));
-            //         (read_id, aligns)
-            //     })
-            //     .collect();
-
-
-            // let mut em_ref_ids: HashMap<usize, RefIdx> = HashMap::new();
-            // for (n,ref_idx) in all_refs_filtered.into_iter().enumerate(){
-            //     em_ref_ids.insert(n, ref_idx);
-            // }
-            // let num_em_refs = em_ref_ids.len();
-
-
-            let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
-            let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
-            for (n, read_id) in out_aligns.iter().enumerate() {
-                read_ids.insert(*read_id.key(), ReadIdx(n));
-                read_ids_rev.insert(ReadIdx(n), *read_id.key());
-            }
-
-            println!("Number of reads aligned: {} ({:.2}%)", out_aligns.len(), (out_aligns.len() as f64/num_reads as f64)*100_f64);
-            println!("Number of potential sources: {}", all_refs.len());
-
-            let mut ll_array: SparseArray<EMProb> = SparseArray::default();
-
-            for val in out_aligns.iter(){
-                let read_id = val.key();
-                let alignments = val.value();
-                for (ref_idx, positions) in alignments{
-                    let read_idx = read_ids.get(read_id).unwrap();
-
-                    for score in positions.iter(){
-                        if score.exp().is_finite() && score.exp()!=0.0{
-                            ll_array.insert(*read_idx, *ref_idx, score.exp() as EMProb);
-                        }
+                match (method, path.as_str()) {
+                    (tiny_http::Method::Get, "/") => {
+                        let ct = Header::from_bytes(b"Content-Type", b"text/html; charset=utf-8").unwrap();
+                        let _ = request.respond(Response::from_string(&html).with_header(ct));
                     }
-                }
-            }
-
-
-            let (read_assignments, props, posteriors) = get_proportions_par_sparse_l1_reg(&ll_array, *num_iter, *lambda, *gamma);
-
-            // let (read_assignments, props, posteriors) = get_proportions_par_sparse_l1_reg(&ll_array, *num_iter, *lambda);
-
-            let pb = ProgressBar::new(read_assignments.len() as u64);
-            pb.set_style(ProgressStyle::with_template("Writing output: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
-
-
-            for (ref_idx,prop) in props{
-                if prop>0.0{
-                    let ref_id = ref_ids_rev.get(&ref_idx).unwrap();
-                    let outstr = format!("{}\t{:.5e}\n", 
-                        **ref_id,
-                        prop, 
-                    );
-
-                    match out_props.as_ref(){
-                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                        None => {print!("{}", outstr)},
-                    };
-                }
-            }
-
-            for read_id in all_read_ids.iter(){
-                let read_idx = read_ids.get(&read_id);
-                if !out_aligns.contains_key(&read_id) || !read_assignments.contains_key(read_idx.unwrap()){
-                    let outstr = format!("{}\t{}\t{}\n", 
-                        **read_id,
-                        "unclassified", 
-                        "-"
-                    );
-                    match out_posteriors.as_ref(){
-                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                        None => {print!("{}", outstr)},
-                    };
-                    continue;
-                }
-
-                let read_idx = *read_ids.get(read_id).unwrap();
-
-                let read_aligns = out_aligns.get(read_id).unwrap();
-                for (ref_idx,aligns) in read_aligns.value(){
-
-                    let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
-
-                    for _ in aligns{
-                        let outstr = format!("{}\t{}\t{:.5e}\n", 
-                            ***read_ids_rev.get(&read_idx).unwrap(),
-                            *ref_id.clone(), 
-                            posteriors.get(&(read_idx, *ref_idx)),
+                    (tiny_http::Method::Post, "/api/build") => {
+                        handle_api_build(request);
+                    }
+                    (tiny_http::Method::Post, "/api/align/upload") => {
+                        handle_align_upload(request, &mut sessions);
+                    }
+                    (tiny_http::Method::Post, "/api/align/run") => {
+                        handle_align_run(request, &sessions);
+                    }
+                    (tiny_http::Method::Post, "/api/query/upload") => {
+                        handle_align_upload(request, &mut query_sessions);
+                    }
+                    (tiny_http::Method::Post, "/api/query/run") => {
+                        handle_query_run(request, &query_sessions);
+                    }
+                    _ => {
+                        let _ = request.respond(
+                            Response::from_string("Not Found").with_status_code(StatusCode(404)),
                         );
-                        match out_posteriors.as_ref(){
-                            Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                            None => {print!("{}", outstr)},
-                        };
                     }
-
-                }
-
-            }
-
-            for read_id in all_read_ids.iter(){
-                let read_idx = read_ids.get(&read_id);
-                if !out_aligns.contains_key(&read_id) || read_idx.is_none() || !read_assignments.contains_key(read_idx.unwrap()){
-                    let outstr = format!("{}\t{}\t{:.5}\n", 
-                        **read_id,
-                        "unclassified",
-                        "-", 
-                    );
-                    match outpath.as_ref(){
-                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                        None => {print!("{}", outstr)},
-                    };
-                    continue;
-                }
-
-                let ref_idx = read_assignments.get(read_idx.unwrap()).unwrap();
-                let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
-                let read_id = read_ids_rev.get(read_idx.unwrap()).unwrap();
-
-                if !out_aligns.get(read_id).unwrap().contains_key(ref_idx){
-                    continue;
-                }
-
-                if out_aligns.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some() && ll_array.get(&(*read_idx.unwrap(), *ref_idx)).is_finite(){
-                    let outstr = format!("{}\t{}\t{:.5e}\n", 
-                        ***read_ids_rev.get(read_idx.unwrap()).unwrap(),
-                        *ref_id.clone(), 
-                        posteriors.get(&(*read_idx.unwrap(), *ref_idx)),
-                    );
-                    match outpath.as_ref(){
-                        Some(file) => {file.lock().unwrap().write_all(outstr.as_bytes()).unwrap();},
-                        None => {print!("{}", outstr)},
-                    };
                 }
             }
-
-            println!("{} reads ({:.3}%) could not be classified!", num_reads-out_aligns.len(), (((num_reads-out_aligns.len()) as f64)/num_reads as f64)*100_f64);
-            let elapsed_time = now.elapsed();
-            println!("Total runtime: {:.2?}", elapsed_time);
-
-            pb.finish_with_message("");
         },
         _ => {
             println!("No option selected! Refer help page (-h flag)");
         }
     }
-    
+
     Ok(())
 }

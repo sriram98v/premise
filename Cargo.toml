@@ -18,6 +18,7 @@ genedex = "0.2.2"
 savefile = "0.20.2"
 dashmap = "6.1.0"
 num = "0.4.3"
+tiny_http = "0.12"
 
 [profile.release]
 debug = true

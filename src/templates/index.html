@@ -1,0 +1,777 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Premise — ML Metagenomic Classifier</title>
+  <style>{{CSS}}</style>
+</head>
+<body>
+<div class="shell">
+
+  <header>
+    <h1>Premise</h1>
+    <p>Maximum Likelihood Metagenomic Classifier</p>
+    <button id="dark-toggle" class="dark-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+      <!-- moon (shown in light mode) -->
+      <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" width="17" height="17"
+           viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+      <!-- sun (shown in dark mode) -->
+      <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" width="17" height="17"
+           viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+           style="display:none">
+        <circle cx="12" cy="12" r="5"/>
+        <line x1="12" y1="1"  x2="12" y2="3"/>
+        <line x1="12" y1="21" x2="12" y2="23"/>
+        <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
+        <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+        <line x1="1"  y1="12" x2="3"  y2="12"/>
+        <line x1="21" y1="12" x2="23" y2="12"/>
+        <line x1="4.22" y1="19.78" x2="5.64"  y2="18.36"/>
+        <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- Tab navigation -->
+  <nav class="tab-bar" role="tablist">
+    <button class="tab-btn active" role="tab" data-tab="build"
+            aria-selected="true"  aria-controls="panel-build">Build</button>
+    <button class="tab-btn"        role="tab" data-tab="align"
+            aria-selected="false" aria-controls="panel-align">Align</button>
+    <button class="tab-btn"        role="tab" data-tab="query"
+            aria-selected="false" aria-controls="panel-query">Query</button>
+  </nav>
+
+  <main>
+
+    <!-- ================================================================ -->
+    <!-- BUILD TAB                                                         -->
+    <!-- ================================================================ -->
+    <section id="panel-build" class="tab-panel active" role="tabpanel">
+      <div class="card">
+        <h2>Build FM-Index</h2>
+        <p class="subtitle">
+          Upload a reference FASTA file to construct a searchable FM-index.
+        </p>
+
+        <div class="field">
+          <label for="build-fasta-input">
+            Reference file
+            <span class="hint">(.fasta only)</span>
+          </label>
+
+          <div class="dropzone" id="build-dropzone">
+            <input type="file" id="build-fasta-input" accept=".fasta"
+                   aria-label="Upload FASTA file" />
+            <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                 viewBox="0 0 24 24" fill="none"
+                 stroke="currentColor" stroke-width="1.5"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <p class="dropzone-label">
+              <strong>Choose file</strong> or drag and drop
+            </p>
+          </div>
+
+          <div class="file-chosen" id="build-file-chosen">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            <span class="file-name" id="build-file-name"></span>
+            <span class="file-size" id="build-file-size"></span>
+          </div>
+        </div>
+
+        <button class="btn btn-primary" id="build-btn" disabled>
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+               viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          Build Index
+        </button>
+
+        <div class="status-area">
+          <div class="status-box status-running" id="build-status-running">
+            <div class="spinner"></div>
+            <div class="status-text">
+              <p>Building FM-index…</p>
+              <p>This may take a moment for large reference files.</p>
+            </div>
+          </div>
+
+          <div class="status-box status-done" id="build-status-done">
+            <div class="status-text">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="display:inline;vertical-align:middle;margin-right:6px">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              Index built successfully.
+              <br/>
+              <span style="font-size:.8rem;color:var(--muted)" id="build-stats"></span>
+            </div>
+            <a class="btn btn-download" id="build-download-link" href="#" download>
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download <span class="result-filename" id="build-result-filename"></span>
+            </a>
+            <pre class="run-log" id="build-log" style="display:none"></pre>
+          </div>
+
+          <div class="status-box status-error" id="build-status-error">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                 style="flex-shrink:0;margin-top:1px">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <div class="status-text">
+              <p id="build-error-message">An error occurred.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <!-- ALIGN TAB                                                         -->
+    <!-- ================================================================ -->
+    <section id="panel-align" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <h2>Align Reads</h2>
+        <p class="subtitle">
+          Upload a pre-built FM-index, forward reads (R1), and reverse reads (R2).
+          The server runs the alignment and returns a TSV with columns:
+          ReadID / RefID / Probability.
+        </p>
+
+        <!-- Index file -->
+        <div class="field">
+          <label for="align-fmidx-input">
+            Reference index
+            <span class="hint">(.fmidx built with the Build tab)</span>
+          </label>
+          <div class="dropzone" id="align-index-dropzone">
+            <input type="file" id="align-fmidx-input" accept=".fmidx"
+                   aria-label="Upload .fmidx index file" />
+            <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <p class="dropzone-label"><strong>Choose file</strong> or drag and drop</p>
+          </div>
+          <div class="file-chosen" id="align-index-chosen">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            <span class="file-name" id="align-index-name"></span>
+            <span class="file-size" id="align-index-size"></span>
+          </div>
+        </div>
+
+        <!-- R1 + R2 reads side by side -->
+        <div class="input-row">
+          <div class="field" style="margin-bottom:0">
+            <label for="align-r1-input">
+              R1 — forward reads
+              <span class="hint">(.fastq / .fq / .fastq.gz)</span>
+            </label>
+            <div class="dropzone" id="align-r1-dropzone" style="padding:20px 14px">
+              <input type="file" id="align-r1-input" accept=".fastq,.fq,.gz"
+                     aria-label="Upload R1 FASTQ" />
+              <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="width:28px;height:28px;margin-bottom:8px">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p class="dropzone-label" style="font-size:.8rem">
+                <strong>Choose R1</strong> or drop
+              </p>
+            </div>
+            <div class="file-chosen" id="align-r1-chosen">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span class="file-name" id="align-r1-name"></span>
+              <span class="file-size" id="align-r1-size"></span>
+            </div>
+          </div>
+
+          <div class="field" style="margin-bottom:0">
+            <label for="align-r2-input">
+              R2 — reverse reads
+              <span class="hint">(.fastq / .fq / .fastq.gz)</span>
+            </label>
+            <div class="dropzone" id="align-r2-dropzone" style="padding:20px 14px">
+              <input type="file" id="align-r2-input" accept=".fastq,.fq,.gz"
+                     aria-label="Upload R2 FASTQ" />
+              <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="width:28px;height:28px;margin-bottom:8px">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p class="dropzone-label" style="font-size:.8rem">
+                <strong>Choose R2</strong> or drop
+              </p>
+            </div>
+            <div class="file-chosen" id="align-r2-chosen">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span class="file-name" id="align-r2-name"></span>
+              <span class="file-size" id="align-r2-size"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Percent mismatch + threads -->
+        <div class="input-row" style="margin-top:24px">
+          <div class="field" style="margin-bottom:0">
+            <label for="align-mismatch">
+              Percent mismatch
+              <span class="hint">(0 – 100)</span>
+            </label>
+            <input type="number" id="align-mismatch" class="text-input"
+                   value="5" min="0" max="100" step="0.1" />
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label for="align-threads">
+              Threads
+              <span class="hint">(0 = all available)</span>
+            </label>
+            <input type="number" id="align-threads" class="text-input"
+                   value="0" min="0" max="256" step="1" />
+          </div>
+        </div>
+
+        <button class="btn btn-primary" id="align-btn" disabled>
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+               viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          Run Alignment
+        </button>
+
+        <div class="status-area">
+          <div class="status-box status-running" id="align-status-running"
+               style="flex-direction:column;align-items:stretch">
+            <div style="display:flex;align-items:center;gap:12px">
+              <div class="spinner"></div>
+              <div class="status-text">
+                <p id="align-progress-label">Preparing…</p>
+              </div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="align-progress-bar"></div>
+            </div>
+          </div>
+
+          <div class="status-box status-done" id="align-status-done">
+            <div class="status-text">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="display:inline;vertical-align:middle;margin-right:6px">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              Alignment complete.
+              <br/>
+              <span style="font-size:.8rem;color:var(--muted)" id="align-stats"></span>
+            </div>
+            <a class="btn btn-download" id="align-download-link" href="#" download>
+              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              Download <span class="result-filename" id="align-result-filename"></span>
+            </a>
+            <pre class="run-log" id="align-log" style="display:none"></pre>
+          </div>
+
+          <!-- Result table (visible after alignment completes) -->
+          <div id="align-table-section" style="display:none;margin-top:20px">
+
+            <!-- Toolbar: filters + summary + rows-per-page -->
+            <div class="table-toolbar">
+
+              <!-- Filter row -->
+              <div class="filter-row">
+                <div class="filter-wrap">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
+                       viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  </svg>
+                  <input type="text" id="filter-read-id" class="filter-input"
+                         placeholder="Read ID regex…" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="filter-wrap">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
+                       viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  </svg>
+                  <input type="text" id="filter-ref-id" class="filter-input"
+                         placeholder="Ref ID regex…" autocomplete="off" spellcheck="false" />
+                </div>
+              </div>
+
+              <!-- Bottom bar: info + rows per page -->
+              <div class="toolbar-bottom">
+                <span class="table-info" id="align-table-info"></span>
+                <div class="rows-select-wrap">
+                  Rows per page
+                  <select class="rows-select" id="align-rows-per-page">
+                    <option value="25">25</option>
+                    <option value="50" selected>50</option>
+                    <option value="100">100</option>
+                    <option value="250">250</option>
+                    <option value="500">500</option>
+                  </select>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- Table -->
+            <div class="result-table-wrap">
+              <table class="result-table" id="align-table"></table>
+            </div>
+
+            <!-- Pagination -->
+            <div class="pagination" id="align-pagination"></div>
+
+          </div>
+
+          <div class="status-box status-error" id="align-status-error">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                 style="flex-shrink:0;margin-top:1px">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <div class="status-text">
+              <p id="align-error-message">An error occurred.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================================ -->
+    <!-- QUERY TAB                                                         -->
+    <!-- ================================================================ -->
+    <section id="panel-query" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <h2>Run Query</h2>
+        <p class="subtitle">
+          Upload a pre-built FM-index, forward reads (R1), and reverse reads (R2).
+          The server runs EM classification and returns assignments, posteriors, and abundance estimates.
+        </p>
+
+        <!-- Index file -->
+        <div class="field">
+          <label for="query-fmidx-input">
+            Reference index
+            <span class="hint">(.fmidx built with the Build tab)</span>
+          </label>
+          <div class="dropzone" id="query-index-dropzone">
+            <input type="file" id="query-fmidx-input" accept=".fmidx"
+                   aria-label="Upload .fmidx index file" />
+            <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+            <p class="dropzone-label"><strong>Choose file</strong> or drag and drop</p>
+          </div>
+          <div class="file-chosen" id="query-index-chosen">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            <span class="file-name" id="query-index-name"></span>
+            <span class="file-size" id="query-index-size"></span>
+          </div>
+        </div>
+
+        <!-- R1 + R2 reads side by side -->
+        <div class="input-row">
+          <div class="field" style="margin-bottom:0">
+            <label for="query-r1-input">
+              R1 — forward reads
+              <span class="hint">(.fastq / .fq / .fastq.gz)</span>
+            </label>
+            <div class="dropzone" id="query-r1-dropzone" style="padding:20px 14px">
+              <input type="file" id="query-r1-input" accept=".fastq,.fq,.gz"
+                     aria-label="Upload R1 FASTQ" />
+              <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="width:28px;height:28px;margin-bottom:8px">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p class="dropzone-label" style="font-size:.8rem">
+                <strong>Choose R1</strong> or drop
+              </p>
+            </div>
+            <div class="file-chosen" id="query-r1-chosen">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span class="file-name" id="query-r1-name"></span>
+              <span class="file-size" id="query-r1-size"></span>
+            </div>
+          </div>
+
+          <div class="field" style="margin-bottom:0">
+            <label for="query-r2-input">
+              R2 — reverse reads
+              <span class="hint">(.fastq / .fq / .fastq.gz)</span>
+            </label>
+            <div class="dropzone" id="query-r2-dropzone" style="padding:20px 14px">
+              <input type="file" id="query-r2-input" accept=".fastq,.fq,.gz"
+                     aria-label="Upload R2 FASTQ" />
+              <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="width:28px;height:28px;margin-bottom:8px">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+                <line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+              <p class="dropzone-label" style="font-size:.8rem">
+                <strong>Choose R2</strong> or drop
+              </p>
+            </div>
+            <div class="file-chosen" id="query-r2-chosen">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              <span class="file-name" id="query-r2-name"></span>
+              <span class="file-size" id="query-r2-size"></span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Parameters row 1: mismatch, cutoff -->
+        <div class="input-row" style="margin-top:24px">
+          <div class="field" style="margin-bottom:0">
+            <label for="query-mismatch">
+              Percent mismatch
+              <span class="hint">(0 – 100)</span>
+            </label>
+            <input type="number" id="query-mismatch" class="text-input"
+                   value="5" min="0" max="100" step="0.1" />
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label for="query-cutoff">
+              Cutoff
+              <span class="hint">(alignment likelihood)</span>
+            </label>
+            <input type="number" id="query-cutoff" class="text-input"
+                   value="0.0001" min="0" max="1" step="any" />
+          </div>
+        </div>
+
+        <!-- Parameters row 2: iterations, threads -->
+        <div class="input-row" style="margin-top:16px">
+          <div class="field" style="margin-bottom:0">
+            <label for="query-iter">
+              Iterations
+              <span class="hint">(EM iterations)</span>
+            </label>
+            <input type="number" id="query-iter" class="text-input"
+                   value="100" min="1" step="1" />
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label for="query-threads">
+              Threads
+              <span class="hint">(0 = all available)</span>
+            </label>
+            <input type="number" id="query-threads" class="text-input"
+                   value="0" min="0" step="1" />
+          </div>
+        </div>
+
+        <!-- Parameters row 3: rho (lambda), gamma -->
+        <div class="input-row" style="margin-top:16px">
+          <div class="field" style="margin-bottom:0">
+            <label for="query-rho">
+              Rho (λ)
+              <span class="hint">(penalty weight)</span>
+            </label>
+            <input type="number" id="query-rho" class="text-input"
+                   value="20" min="0" step="any" />
+          </div>
+          <div class="field" style="margin-bottom:0">
+            <label for="query-gamma">
+              Gamma
+              <span class="hint">(penalty weight)</span>
+            </label>
+            <input type="number" id="query-gamma" class="text-input"
+                   value="1e-20" min="0" step="any" />
+          </div>
+        </div>
+
+        <!-- No-penalty checkbox -->
+        <div class="checkbox-field">
+          <input type="checkbox" id="query-no-penalty" />
+          <label for="query-no-penalty">Disable penalty (no regularization)</label>
+        </div>
+
+        <button class="btn btn-primary" id="query-btn" disabled style="margin-top:24px">
+          <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+               viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="5 3 19 12 5 21 5 3"/>
+          </svg>
+          Run Query
+        </button>
+
+        <div class="status-area">
+          <!-- Running -->
+          <div class="status-box status-running" id="query-status-running"
+               style="flex-direction:column;align-items:stretch">
+            <div style="display:flex;align-items:center;gap:12px">
+              <div class="spinner"></div>
+              <div class="status-text">
+                <p id="query-progress-label">Preparing…</p>
+              </div>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="query-progress-bar"></div>
+            </div>
+          </div>
+
+          <!-- Done -->
+          <div class="status-box status-done" id="query-status-done">
+            <div class="status-text">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="display:inline;vertical-align:middle;margin-right:6px">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              Query complete.
+              <br/>
+              <span style="font-size:.8rem;color:var(--muted)" id="query-stats"></span>
+            </div>
+            <div class="download-group">
+              <a class="btn btn-download" id="query-dl-matches" href="#" download="query.matches">
+                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                .matches
+              </a>
+              <a class="btn btn-download" id="query-dl-posteriors" href="#" download="query.posteriors">
+                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                .posteriors
+              </a>
+              <a class="btn btn-download" id="query-dl-props" href="#" download="query.props">
+                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                .props
+              </a>
+            </div>
+            <pre class="run-log" id="query-log" style="display:none"></pre>
+          </div>
+
+          <!-- Error -->
+          <div class="status-box status-error" id="query-status-error">
+            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                 style="flex-shrink:0;margin-top:1px">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="12"/>
+              <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <div class="status-text">
+              <p id="query-error-message">An error occurred.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Results section: sub-tabs + table + pie -->
+        <div id="query-results-section" style="display:none;margin-top:28px">
+
+          <!-- Sub-tab nav -->
+          <div class="sub-tab-nav">
+            <button class="sub-tab-btn active" data-subtab="assignments">Assignments</button>
+            <button class="sub-tab-btn"        data-subtab="abundances">Abundances</button>
+            <button class="sub-tab-btn"        data-subtab="convergence">EM Convergence</button>
+          </div>
+
+          <!-- Assignments sub-tab -->
+          <div id="query-assignments-panel">
+            <div class="table-toolbar">
+              <div class="filter-row">
+                <div class="filter-wrap">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
+                       viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  </svg>
+                  <input type="text" id="query-filter-read-id" class="filter-input"
+                         placeholder="Read ID regex…" autocomplete="off" spellcheck="false" />
+                </div>
+                <div class="filter-wrap">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
+                       viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  </svg>
+                  <input type="text" id="query-filter-ref-id" class="filter-input"
+                         placeholder="Ref ID regex…" autocomplete="off" spellcheck="false" />
+                </div>
+              </div>
+              <div class="toolbar-bottom">
+                <span class="table-info" id="query-table-info"></span>
+                <div class="rows-select-wrap">
+                  Rows per page
+                  <select class="rows-select" id="query-rows-per-page">
+                    <option value="25">25</option>
+                    <option value="50" selected>50</option>
+                    <option value="100">100</option>
+                    <option value="250">250</option>
+                    <option value="500">500</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div class="result-table-wrap">
+              <table class="result-table" id="query-table"></table>
+            </div>
+            <div class="pagination" id="query-pagination"></div>
+          </div>
+
+          <!-- Abundances sub-tab -->
+          <div id="query-abundances-panel" style="display:none">
+            <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;padding:8px 0">
+              <div id="query-pie-wrap" style="position:relative;display:inline-block">
+                <svg id="query-pie" width="260" height="260"></svg>
+                <div id="pie-tooltip" class="pie-tooltip"></div>
+              </div>
+              <ul class="pie-legend" id="query-pie-legend"></ul>
+            </div>
+            <div style="margin-top:12px">
+              <button class="btn btn-download" onclick="downloadPiePng()">
+                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                Download PNG
+              </button>
+            </div>
+          </div>
+
+          <!-- EM Convergence sub-tab -->
+          <div id="query-convergence-panel" style="display:none">
+            <div id="convergence-chart-wrap" style="position:relative;display:inline-block;max-width:100%">
+              <svg id="query-convergence-chart"></svg>
+              <div id="convergence-tooltip" class="convergence-tooltip"></div>
+            </div>
+            <div style="margin-top:12px">
+              <button class="btn btn-download" onclick="downloadConvergencePng()">
+                <svg xmlns="http://www.w3.org/2000/svg" width="15" height="15"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/>
+                  <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                Download PNG
+              </button>
+            </div>
+          </div>
+
+        </div><!-- /#query-results-section -->
+
+      </div>
+    </section>
+
+  </main>
+</div><!-- /.shell -->
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script>{{JS}}</script>
+</body>
+</html>
