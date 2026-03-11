@@ -254,7 +254,7 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->Result<(MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
+fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool, tau: &EMProb)->Result<(MatchLikelihoods, HashMap<RefIdx, HashSet<MEMPos>>)>{
 
     let read_len = record.seq().len();
     let read_seq = match complement {
@@ -289,9 +289,9 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
             let ref_pos = mem.ref_start-mem.read_start;
             if ref_pos+read_len<ref_len{
                 let ref_match_seg = &ref_seq[ref_pos..ref_pos+read_len];
-                    let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, &ref_match_seg);
+                    let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, ref_match_seg);
 
-                    if match_log_prob.exp()!=0.0{
+                    if match_log_prob.exp()!=0.0 && match_log_prob>=LogProb(tau.ln()){
                         // update match score
                         match_likelihood.entry(ref_id)
                             .and_modify(|e| {
@@ -306,11 +306,12 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
     Ok((match_likelihood, softclipped))
 }
 
-fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>, 
-                    refs: &HashMap<RefIdx, Vec<u8>>, 
-                    read_pairs: &'a[ReadPair], 
+fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
+                    refs: &HashMap<RefIdx, Vec<u8>>,
+                    read_pairs: &'a[ReadPair],
                     percent_mismatch: &EMProb,
-                    cutoff: LogProb)-> Result<(ReadAlignments<'a>, DashSet<RefIdx>)>
+                    cutoff: LogProb,
+                    tau: &EMProb)-> Result<(ReadAlignments<'a>, DashSet<RefIdx>)>
 {
     let out_aligns: ReadAlignments = DashMap::new();
 
@@ -329,11 +330,11 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
 
             let mut match_likelihoods: HashMap<RefIdx, LogProb> = HashMap::new();
 
-            let (r1_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, false).unwrap();
-            let (r1_rc_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, true).unwrap();
-            
-            let (r2_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, false).unwrap();
-            let (r2_rc_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, true).unwrap();
+            let (r1_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, false, tau).unwrap();
+            let (r1_rc_match_likelihoods, _) = query_read(fmidx, refs, r1_rec, percent_mismatch, true, tau).unwrap();
+
+            let (r2_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, false, tau).unwrap();
+            let (r2_rc_match_likelihoods, _) = query_read(fmidx, refs, r2_rec, percent_mismatch, true, tau).unwrap();
 
             r1_match_likelihoods.keys().filter(|k| r2_rc_match_likelihoods.contains_key(k)).for_each(|x| {
                 let match_prob = half_log_prob + r1_match_likelihoods.get(x).unwrap() + r2_rc_match_likelihoods.get(x).unwrap();
@@ -505,6 +506,7 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->
         pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
 
         if data_loglikelihood_diff>0.0 && data_loglikelihood_diff.abs()<=1e-6{
+            props[num_iter] = props[i+1].clone();
             break;
         }
 
@@ -872,6 +874,7 @@ fn run_alignment(
     r1_file: &str,
     r2_file: &str,
     percent_mismatch: EMProb,
+    tau: EMProb,
     threads: usize,
 ) -> Result<(String, String)> {
     let num_threads = if threads == 0 {
@@ -901,15 +904,16 @@ fn run_alignment(
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
 
-    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}",
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nTau: {:e}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
                 num_threads,
                 percent_mismatch,
+                tau,
             );
     println!("{}", log_str);
 
     let (out_alignments, _) = process_read_pairs(
-        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY),
+        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY), &tau,
     )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
@@ -954,6 +958,7 @@ fn run_query(
     r2_file: &str,
     percent_mismatch: EMProb,
     cutoff: EMProb,
+    tau: EMProb,
     num_iter: usize,
     lambda: EMProb,
     gamma: EMProb,
@@ -986,18 +991,19 @@ fn run_query(
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
 
-    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nCutoff likelihood: {:e} ({:.2})\nEM Iterations: {}",
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nCutoff likelihood: {:e} ({:.2})\nTau: {:e}\nEM Iterations: {}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         num_threads,
         percent_mismatch,
         cutoff,
         cutoff.ln(),
+        tau,
         num_iter,
     );
     println!("{}", log_str);
 
     let (out_aligns, _all_refs) = process_read_pairs(
-        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(cutoff.ln()),
+        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(cutoff.ln()), &tau,
     )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
@@ -1157,6 +1163,7 @@ fn do_align_run(
     let qs = parse_qs(&url);
     let session_id = qs.get("session").ok_or_else(|| anyhow::anyhow!("Missing session"))?;
     let mismatch: EMProb = qs.get("mismatch").and_then(|s| s.parse().ok()).unwrap_or(5.0);
+    let tau: EMProb      = qs.get("tau").and_then(|s| s.parse().ok()).unwrap_or(1e-18);
     let threads: usize   = qs.get("threads").and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let session = sessions
@@ -1175,6 +1182,7 @@ fn do_align_run(
         r1_path.to_str().unwrap(),
         r2_path.to_str().unwrap(),
         mismatch,
+        tau,
         threads,
     )?;
     Ok(format!(
@@ -1222,6 +1230,7 @@ fn do_query_run(
     let session_id = qs.get("session").ok_or_else(|| anyhow::anyhow!("Missing session"))?;
     let mismatch: EMProb  = qs.get("mismatch").and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let cutoff: EMProb    = qs.get("cutoff").and_then(|s| s.parse().ok()).unwrap_or(1e-4);
+    let tau: EMProb       = qs.get("tau").and_then(|s| s.parse().ok()).unwrap_or(1e-18);
     let num_iter: usize   = qs.get("iter").and_then(|s| s.parse().ok()).unwrap_or(100);
     let lambda: EMProb    = qs.get("lambda").and_then(|s| s.parse().ok()).unwrap_or(20.0);
     let gamma: EMProb     = qs.get("gamma").and_then(|s| s.parse().ok()).unwrap_or(1e-20);
@@ -1244,7 +1253,7 @@ fn do_query_run(
         ref_path.to_str().unwrap(),
         r1_path.to_str().unwrap(),
         r2_path.to_str().unwrap(),
-        mismatch, cutoff, num_iter, lambda, gamma, use_penalty, threads,
+        mismatch, cutoff, tau, num_iter, lambda, gamma, use_penalty, threads,
     )?;
 
     let convergence_json = format!("[{}]",
@@ -1332,6 +1341,10 @@ fn main() -> Result<()>{
                     .default_value("out.aligns")
                     .value_parser(clap::value_parser!(String))
                     )
+                .arg(arg!(--tau <TAU>"Minimum match log-probability threshold")
+                    .default_value("1e-18")
+                    .value_parser(clap::value_parser!(EMProb))
+                    )
                 .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
@@ -1381,6 +1394,10 @@ fn main() -> Result<()>{
                     .required(false)
                     .num_args(0)
                     .action(ArgAction::SetFalse))
+                .arg(arg!(--tau <TAU>"Minimum match log-probability threshold")
+                    .default_value("1e-18")
+                    .value_parser(clap::value_parser!(EMProb))
+                    )
                 .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
@@ -1427,11 +1444,12 @@ fn main() -> Result<()>{
             let r1_file = sub_m.get_one::<String>("r1").expect("required").as_str();
             let r2_file = sub_m.get_one::<String>("r2").expect("required").as_str();
             let percent_mismatch = *sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
+            let tau = *sub_m.get_one::<EMProb>("tau").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
 
             let now = Instant::now();
-            let (tsv, _) = run_alignment(ref_file, r1_file, r2_file, percent_mismatch, threads)?;
+            let (tsv, _) = run_alignment(ref_file, r1_file, r2_file, percent_mismatch, tau, threads)?;
             std::fs::write(outfile, tsv.as_bytes())?;
             println!("Alignment written to {} ({:.2?})", outfile, now.elapsed());
         },
@@ -1442,6 +1460,7 @@ fn main() -> Result<()>{
             let num_iter = *sub_m.get_one::<usize>("iter").expect("required");
             let percent_mismatch = *sub_m.get_one::<EMProb>("percent_mismatch").expect("required");
             let cutoff = *sub_m.get_one::<EMProb>("cutoff").expect("required");
+            let tau = *sub_m.get_one::<EMProb>("tau").expect("required");
             let gamma = *sub_m.get_one::<EMProb>("gamma").expect("required");
             let lambda = *sub_m.get_one::<EMProb>("lambda").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
@@ -1451,7 +1470,7 @@ fn main() -> Result<()>{
             let now = Instant::now();
             let (matches_tsv, posteriors_tsv, props_tsv, _, _) = run_query(
                 ref_file, r1_file, r2_file,
-                percent_mismatch, cutoff, num_iter, lambda, gamma, use_penalty, threads,
+                percent_mismatch, cutoff, tau, num_iter, lambda, gamma, use_penalty, threads,
             )?;
             std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
             std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())?;

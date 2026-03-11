@@ -53,6 +53,11 @@ function escHtml(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function ncbiLink(refId) {
+  const url = 'https://www.ncbi.nlm.nih.gov/search/all/?term=' + encodeURIComponent(refId);
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">${escHtml(refId)}</a>`;
+}
+
 // ── Build tab ──────────────────────────────────────────────────────────────
 const buildBtn = document.getElementById('build-btn');
 
@@ -322,7 +327,7 @@ function renderTablePage() {
     const cells = row.split('\t');
     const isUnclassified = cells[1] === 'unclassified';
     html += `<tr${isUnclassified ? ' class="unclassified"' : ''}>`
-      + cells.map(c => `<td>${escHtml(c)}</td>`).join('') + '</tr>';
+      + cells.map((c, i) => `<td>${i === 1 && c !== 'unclassified' ? ncbiLink(c) : escHtml(c)}</td>`).join('') + '</tr>';
   }
   html += '</tbody>';
   document.getElementById('align-table').innerHTML = html;
@@ -574,7 +579,7 @@ function qRenderTablePage() {
     const cells = row.split('\t');
     const isUnclassified = cells[1] === 'unclassified';
     html += `<tr${isUnclassified ? ' class="unclassified"' : ''}>`
-      + cells.map(c => `<td>${escHtml(c)}</td>`).join('') + '</tr>';
+      + cells.map((c, i) => `<td>${i === 1 && c !== 'unclassified' ? ncbiLink(c) : escHtml(c)}</td>`).join('') + '</tr>';
   }
   html += '</tbody>';
   document.getElementById('query-table').innerHTML = html;
@@ -733,7 +738,7 @@ function renderQueryPie(tsv) {
     const li    = document.createElement('li');
     li.innerHTML =
       `<span class="pie-legend-dot" style="background:${color}"></span>` +
-      `<span>${escHtml(d.id)} — ${pct}%</span>`;
+      `<span>${ncbiLink(d.id)} — ${pct}%</span>`;
     legend.appendChild(li);
   });
 }
@@ -1030,11 +1035,12 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     const threads   = document.getElementById('query-threads').value   || '0';
     const rho       = document.getElementById('query-rho').value       || '20';
     const gamma     = document.getElementById('query-gamma').value     || '1e-20';
+    const tau       = document.getElementById('query-tau').value       || '1e-18';
     const noPenalty = document.getElementById('query-no-penalty').checked;
 
     const res = await fetch(
       `/api/query/run?session=${querySession}&mismatch=${mismatch}&cutoff=${cutoff}` +
-      `&iter=${iter}&threads=${threads}&lambda=${rho}&gamma=${gamma}&no_penalty=${noPenalty}`,
+      `&iter=${iter}&threads=${threads}&lambda=${rho}&gamma=${gamma}&tau=${tau}&no_penalty=${noPenalty}`,
       { method: 'POST' }
     );
     if (!res.ok) throw new Error(await res.text());
