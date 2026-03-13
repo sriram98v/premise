@@ -695,15 +695,19 @@ function qRenderTablePage() {
 }
 
 function qRenderPagination(pageCount) {
-  const pg  = _qPage;
-  const bar = document.getElementById('query-pagination');
-  if (pageCount <= 1) { bar.innerHTML = ''; return; }
+  const pg   = _qPage;
+  const bars = [
+    document.getElementById('query-pagination-top'),
+    document.getElementById('query-pagination'),
+  ].filter(Boolean);
+
+  if (pageCount <= 1) { bars.forEach(b => b.innerHTML = ''); return; }
 
   const pages = new Set([0, pageCount - 1]);
   for (let i = Math.max(0, pg - 2); i <= Math.min(pageCount - 1, pg + 2); i++) pages.add(i);
   const sorted = [...pages].sort((a, b) => a - b);
 
-  let html = `<button class="pg-btn" id="qpg-prev" ${pg === 0 ? 'disabled' : ''}
+  let html = `<button class="pg-btn" data-qpg-dir="prev" ${pg === 0 ? 'disabled' : ''}
                 title="Previous page">&#8249;</button>`;
   let prev = -1;
   for (const p of sorted) {
@@ -711,15 +715,17 @@ function qRenderPagination(pageCount) {
     html += `<button class="pg-btn${p === pg ? ' active' : ''}" data-qpage="${p}">${(p + 1).toLocaleString()}</button>`;
     prev = p;
   }
-  html += `<button class="pg-btn" id="qpg-next" ${pg === pageCount - 1 ? 'disabled' : ''}
+  html += `<button class="pg-btn" data-qpg-dir="next" ${pg === pageCount - 1 ? 'disabled' : ''}
              title="Next page">&#8250;</button>`;
 
-  bar.innerHTML = html;
-  bar.querySelector('#qpg-prev')?.addEventListener('click', () => { _qPage--; qRenderTablePage(); });
-  bar.querySelector('#qpg-next')?.addEventListener('click', () => { _qPage++; qRenderTablePage(); });
-  bar.querySelectorAll('[data-qpage]').forEach(btn =>
-    btn.addEventListener('click', () => { _qPage = parseInt(btn.dataset.qpage, 10); qRenderTablePage(); })
-  );
+  bars.forEach(bar => {
+    bar.innerHTML = html;
+    bar.querySelector('[data-qpg-dir="prev"]')?.addEventListener('click', () => { _qPage--; qRenderTablePage(); });
+    bar.querySelector('[data-qpg-dir="next"]')?.addEventListener('click', () => { _qPage++; qRenderTablePage(); });
+    bar.querySelectorAll('[data-qpage]').forEach(btn =>
+      btn.addEventListener('click', () => { _qPage = parseInt(btn.dataset.qpage, 10); qRenderTablePage(); })
+    );
+  });
 }
 
 // Filter + rows-per-page wiring
@@ -1105,6 +1111,7 @@ function downloadConvergencePng() {
 
 // ── Run Query ──────────────────────────────────────────────────────────────
 document.getElementById('query-btn').addEventListener('click', async () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
   setStatus('query', 'running');
   document.getElementById('query-results-section').style.display = 'none';
   document.getElementById('query-btn').disabled = true;
@@ -1174,6 +1181,8 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     }
 
     document.getElementById('query-results-section').style.display = '';
+    const ph = document.getElementById('query-results-placeholder');
+    if (ph) ph.style.display = 'none';
     // Reset to Assignments sub-tab
     document.querySelectorAll('.sub-tab-btn').forEach(b => b.classList.remove('active'));
     document.querySelector('.sub-tab-btn[data-subtab="assignments"]').classList.add('active');
