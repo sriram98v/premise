@@ -587,7 +587,7 @@ fn _penalty(props: &HashMap<RefIdx, EMProb>, omega: EMProb)->EMProb{
     props.values().map(|x| (1.0+(x/omega)).ln()).sum()
 }
 
-fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
+fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb, em_threshold: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -708,7 +708,7 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
 
         pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
 
-        if i>20 && data_loglikelihood_diff>0.0 && data_loglikelihood_diff<=1e-6{
+        if i>20 && data_loglikelihood_diff>0.0 && data_loglikelihood_diff<=em_threshold{
             props[num_iter] = props[i+1].clone();
             break;
         }
@@ -971,6 +971,7 @@ fn run_query(
     num_iter: usize,
     rho: EMProb,
     omega: EMProb,
+    em_threshold: EMProb,
     use_penalty: bool,
     threads: usize,
 ) -> Result<(String, String, String, Vec<EMProb>, String)> {
@@ -1000,7 +1001,7 @@ fn run_query(
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
 
-    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}",
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         num_threads,
         percent_mismatch,
@@ -1009,6 +1010,7 @@ fn run_query(
         eps_2,
         eps_2.ln(),
         num_iter,
+        em_threshold,
     );
     println!("{}", log_str);
 
@@ -1038,7 +1040,7 @@ fn run_query(
     }
 
     let (read_assignments, props, posteriors, em_data_likelihoods) = if use_penalty {
-        get_proportions_par_sparse_l1_reg(&ll_array, num_iter, rho, omega)
+        get_proportions_par_sparse_l1_reg(&ll_array, num_iter, rho, omega, em_threshold)
     } else {
         get_proportions_par_sparse(&ll_array, num_iter)
     };
@@ -1244,6 +1246,7 @@ fn do_query_run(
     let num_iter: usize   = qs.get("iter").and_then(|s| s.parse().ok()).unwrap_or(100);
     let rho: EMProb       = qs.get("rho").and_then(|s| s.parse().ok()).unwrap_or(20.0);
     let omega: EMProb     = qs.get("omega").and_then(|s| s.parse().ok()).unwrap_or(1e-20);
+    let em_threshold: EMProb = qs.get("em_threshold").and_then(|s| s.parse().ok()).unwrap_or(1e-6);
     let no_penalty: bool  = qs.get("no_penalty").map(|s| s == "true").unwrap_or(false);
     let use_penalty       = !no_penalty;
     let threads: usize    = qs.get("threads").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -1263,7 +1266,7 @@ fn do_query_run(
         ref_path.to_str().unwrap(),
         r1_path.to_str().unwrap(),
         r2_path.to_str().unwrap(),
-        mismatch, eps_1, eps_2, num_iter, rho, omega, use_penalty, threads,
+        mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads,
     )?;
 
     let convergence_json = format!("[{}]",
@@ -1408,6 +1411,10 @@ fn main() -> Result<()>{
                     .default_value("1e-18")
                     .value_parser(clap::value_parser!(EMProb))
                     )
+                .arg(arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold")
+                    .default_value("1e-6")
+                    .value_parser(clap::value_parser!(EMProb))
+                    )
                 .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
@@ -1475,12 +1482,13 @@ fn main() -> Result<()>{
             let rho = *sub_m.get_one::<EMProb>("rho").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
             let use_penalty = *sub_m.get_one::<bool>("no-penalty").unwrap();
+            let em_threshold = *sub_m.get_one::<EMProb>("em_threshold").expect("required");
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
 
             let now = Instant::now();
             let (matches_tsv, posteriors_tsv, props_tsv, _, _) = run_query(
                 ref_file, r1_file, r2_file,
-                percent_mismatch, eps_1, eps_2, num_iter, rho, omega, use_penalty, threads,
+                percent_mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads,
             )?;
             std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
             std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())?;
