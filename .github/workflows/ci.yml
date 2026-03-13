@@ -1,0 +1,107 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Build & test ────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: premise
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: premise
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: premise
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            artifact: premise.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        # Cross-compiled aarch64 binaries can't run on x86_64 runners
+        if: matrix.target != 'aarch64-apple-darwin'
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Rename binary for upload
+        shell: bash
+        run: |
+          SRC="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          DST="premise-${{ matrix.target }}${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}"
+          cp "$SRC" "$DST"
+          echo "ASSET=$DST" >> $GITHUB_ENV
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  # ── Create / update rolling "latest" release ────────────────────────────
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION-dev" >> $GITHUB_OUTPUT
+
+      - name: Create or update rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "PREMISE ${{ steps.version.outputs.version }} (latest build)"
+          body: |
+            Automated build from the latest commit on `main`.
+
+            **Commit:** ${{ github.sha }}
+            **Triggered by:** ${{ github.actor }}
+
+            Download the binary for your platform below.
+          prerelease: true
+          files: artifacts/*

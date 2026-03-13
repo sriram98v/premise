@@ -5,3 +5,8 @@
 *.treefile
 *.matches
 *.aligns
+.eval
+*.posteriors
+*.out
+*.txt
+*.props
