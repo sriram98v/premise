@@ -248,7 +248,7 @@
         </label>
         <label for="query-eps1">
           ε<sub>1</sub> <small>(minimum likelihood threshold)</small>
-          <input type="number" id="query-eps1" value="0.0001" min="0" max="1" step="any" />
+          <input type="text" id="query-eps1" value="1e-32" />
         </label>
       </div>
 
@@ -276,13 +276,16 @@
         </label>
       </div>
 
-      <!-- Parameters row 4: eps_2 -->
+      <!-- Parameters row 4: eps_2, em_threshold -->
       <div class="grid">
         <label for="query-eps2">
           ε<sub>2</sub> <small>(relative likelihood threshold)</small>
           <input type="text" id="query-eps2" value="1e-18" />
         </label>
-        <div></div>
+        <label for="query-em-threshold">
+          EM threshold <small>(convergence criterion)</small>
+          <input type="text" id="query-em-threshold" value="1e-6" />
+        </label>
       </div>
 
       <!-- No-penalty checkbox -->
@@ -337,6 +340,10 @@
             <a role="button" class="outline secondary" id="query-dl-props" href="#" download="query.props">
               <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               .props
+            </a>
+            <a role="button" class="outline secondary" id="query-dl-aligns" href="#" download="query.aligns">
+              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              .aligns
             </a>
           </div>
           <pre id="query-log" style="display:none"></pre>

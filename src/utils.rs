@@ -25,10 +25,16 @@ pub fn kmer_length(seq_len: usize, percent_mismatch: EMProb)->usize{
     seq_len/(num_mismatches+1)
 }
 
+/// Count the number of positions at which `read_seq` and `ref_seq` differ.
 pub fn num_mismatches(read_seq: &[u8], ref_seq: &[u8])->usize{
     read_seq.iter().zip(ref_seq.iter()).map(|(a,b)| (a!=b) as usize).sum()
 }
 
+/// Write alignment matches to a TSV file or stdout.
+///
+/// If `outpath` is `Some`, the results are written to that path (overwriting any existing file).
+/// If `outpath` is `None`, results are printed to stdout.
+/// Each row contains: Read_ID, Ref_ID, hit position, and log-likelihood.
 pub fn write_matches(outpath: Option<&String>, matches: &HashMap<String, Vec<(String, usize, f32)>>)->std::io::Result<()>
 {
     match outpath{
@@ -68,10 +74,18 @@ pub fn write_matches(outpath: Option<&String>, matches: &HashMap<String, Vec<(St
     Ok(())
 }
 
+/// Convert a Phred+33 quality byte to its linear-space base-call error probability.
+///
+/// Uses the standard formula: P(error) = 10^(-(Q - 33) / 10).
 pub fn error_prob(q: u8)->Prob{
     Prob(10_f64.powf(-((q-33) as f64/10_f64)))
 }
 
+/// Return the DNA complement of a sequence (A↔T, C↔G).
+///
+/// Non-ACGT characters are mapped to `'E'` to signal an unexpected base.
+/// Note: this does not reverse the sequence; for reverse-complement use
+/// [`bio::alphabets::dna::revcomp`] instead.
 pub fn complement(q_seq: Vec<char>)->Vec<char>{
     q_seq.iter()
         .map(|x|{
@@ -86,6 +100,7 @@ pub fn complement(q_seq: Vec<char>)->Vec<char>{
         .collect()
 }
 
+/// Extract the file extension from a filename, returning `None` if there is none.
 pub fn get_extension_from_filename(filename: &str) -> Option<&str> {
     Path::new(filename)
         .extension()

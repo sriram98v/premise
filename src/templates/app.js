@@ -270,11 +270,17 @@ async function uploadAlignFile(part, file, sessionId) {
   applyDark(localStorage.getItem('dark') === '1');
 
   btn.addEventListener('click', () => {
-    const next = !document.documentElement.classList.contains('dark');
+    const next = document.documentElement.getAttribute('data-theme') !== 'dark';
     localStorage.setItem('dark', next ? '1' : '0');
     applyDark(next);
   });
 })();
+
+// ── Re-render charts on theme change ───────────────────────────────────────
+new MutationObserver(() => {
+  if (_convergenceData.length) renderConvergenceChart(_convergenceData);
+  if (_lastPropsTsv) renderQueryPie(_lastPropsTsv);
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
 // ── Align table state ──────────────────────────────────────────────────────
 let _tsvHeaders  = [];
@@ -551,7 +557,8 @@ let _qPage    = 0;
 let _qSortCol = null;
 let _qSortDir = 'asc';
 let _qFilterRx = [null, null];
-let _qMatchesUrl = null, _qPosteriorsUrl = null, _qPropsUrl = null;
+let _qMatchesUrl = null, _qPosteriorsUrl = null, _qPropsUrl = null, _qAlignsUrl = null;
+let _lastPropsTsv = null;
 
 function qTPerPage() {
   return parseInt(document.getElementById('query-rows-per-page').value, 10) || 50;
@@ -763,8 +770,8 @@ function renderQueryPie(tsv) {
 
   // Resolve CSS vars for PNG-safe colours
   const cs    = getComputedStyle(document.documentElement);
-  const cSurf = cs.getPropertyValue('--surface').trim() || '#ffffff';
-  const cTxt  = cs.getPropertyValue('--text').trim()    || '#1a1d23';
+  const cSurf = cs.getPropertyValue('--pico-card-background-color').trim() || '#ffffff';
+  const cTxt  = cs.getPropertyValue('--pico-color').trim()                 || '#1a1d23';
 
   svgEl.setAttribute('width',   W);
   svgEl.setAttribute('height',  H);
@@ -900,11 +907,11 @@ function renderConvergenceChart(values) {
 
   // Resolve CSS vars to concrete colours for PNG export
   const cs    = getComputedStyle(document.documentElement);
-  const cAcc  = cs.getPropertyValue('--accent').trim()   || '#0d6e6e';
-  const cSurf = cs.getPropertyValue('--surface').trim()  || '#ffffff';
-  const cBord = cs.getPropertyValue('--border').trim()   || '#dde1e8';
-  const cMut  = cs.getPropertyValue('--muted').trim()    || '#6b7280';
-  const cTxt  = cs.getPropertyValue('--text').trim()     || '#1a1d23';
+  const cAcc  = cs.getPropertyValue('--pico-primary').trim()                  || '#0d6e6e';
+  const cSurf = cs.getPropertyValue('--pico-card-background-color').trim()    || '#ffffff';
+  const cBord = cs.getPropertyValue('--pico-form-element-border-color').trim()|| '#dde1e8';
+  const cMut  = cs.getPropertyValue('--pico-muted-color').trim()              || '#6b7280';
+  const cTxt  = cs.getPropertyValue('--pico-color').trim()                    || '#1a1d23';
 
   const n    = _convergenceData.length;
   const minV = d3.min(_convergenceData);
@@ -1115,17 +1122,19 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     animateQueryProgress('Running EM classification…', 20);
 
     const mismatch  = document.getElementById('query-mismatch').value  || '5';
-    const eps1      = document.getElementById('query-eps1').value      || '1e-4';
+    const eps1      = document.getElementById('query-eps1').value      || '1e-32';
     const iter      = document.getElementById('query-iter').value      || '100';
     const threads   = document.getElementById('query-threads').value   || '0';
     const rho       = document.getElementById('query-rho').value       || '20';
     const omega     = document.getElementById('query-omega').value     || '1e-20';
-    const eps2      = document.getElementById('query-eps2').value      || '1e-18';
-    const noPenalty = document.getElementById('query-no-penalty').checked;
+    const eps2        = document.getElementById('query-eps2').value          || '1e-18';
+    const emThreshold = document.getElementById('query-em-threshold').value  || '1e-6';
+    const noPenalty   = document.getElementById('query-no-penalty').checked;
 
     const res = await fetch(
       `/api/query/run?session=${querySession}&mismatch=${mismatch}&eps_1=${eps1}` +
-      `&iter=${iter}&threads=${threads}&rho=${rho}&omega=${omega}&eps_2=${eps2}&no_penalty=${noPenalty}`,
+      `&iter=${iter}&threads=${threads}&rho=${rho}&omega=${omega}&eps_2=${eps2}` +
+      `&em_threshold=${emThreshold}&no_penalty=${noPenalty}`,
       { method: 'POST' }
     );
     if (!res.ok) throw new Error(await res.text());
@@ -1138,19 +1147,23 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     if (_qMatchesUrl)    URL.revokeObjectURL(_qMatchesUrl);
     if (_qPosteriorsUrl) URL.revokeObjectURL(_qPosteriorsUrl);
     if (_qPropsUrl)      URL.revokeObjectURL(_qPropsUrl);
+    if (_qAlignsUrl)     URL.revokeObjectURL(_qAlignsUrl);
     _qMatchesUrl    = URL.createObjectURL(new Blob([data.matches],    { type: 'text/tab-separated-values' }));
     _qPosteriorsUrl = URL.createObjectURL(new Blob([data.posteriors], { type: 'text/tab-separated-values' }));
     _qPropsUrl      = URL.createObjectURL(new Blob([data.props],      { type: 'text/tab-separated-values' }));
+    _qAlignsUrl     = URL.createObjectURL(new Blob([data.aligns],     { type: 'text/tab-separated-values' }));
 
     document.getElementById('query-dl-matches').href    = _qMatchesUrl;
     document.getElementById('query-dl-posteriors').href = _qPosteriorsUrl;
     document.getElementById('query-dl-props').href      = _qPropsUrl;
+    document.getElementById('query-dl-aligns').href     = _qAlignsUrl;
 
     const rowCount = data.matches.trim().split('\n').length - 1;
     document.getElementById('query-stats').textContent =
       `${rowCount.toLocaleString()} assignment row${rowCount !== 1 ? 's' : ''}`;
 
     initQueryTable(data.matches);
+    _lastPropsTsv = data.props;
     renderQueryPie(data.props);
     renderConvergenceChart(data.convergence || []);
 
