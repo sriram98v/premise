@@ -1,7 +1,7 @@
 // ── Tab switching ──────────────────────────────────────────────────────────
-document.querySelectorAll('.tab-btn').forEach(btn => {
+document.querySelectorAll('.nav-tab').forEach(btn => {
   btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => {
+    document.querySelectorAll('.nav-tab').forEach(b => {
       b.classList.remove('active');
       b.setAttribute('aria-selected', 'false');
     });
@@ -26,11 +26,85 @@ function setStatus(tab, state /* 'running' | 'done' | 'error' | null */) {
   });
 }
 
-function setupDropzone(dropzoneId, inputId, chosenId, nameId, sizeId, onFile) {
+// ── File validation helpers ─────────────────────────────────────────────────
+function readFileHead(file, bytes) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = e => resolve(e.target.result);
+    reader.onerror = () => reject(new Error('Could not read file'));
+    reader.readAsText(file.slice(0, bytes));
+  });
+}
+
+function readFileBytesHead(file, bytes) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload  = e => resolve(new Uint8Array(e.target.result));
+    reader.onerror = () => reject(new Error('Could not read file'));
+    reader.readAsArrayBuffer(file.slice(0, bytes));
+  });
+}
+
+// Returns null if valid, or an error string if not.
+async function validateFile(file, type) {
+  const name = file.name.toLowerCase();
+
+  if (type === 'fasta') {
+    if (!name.endsWith('.fasta') && !name.endsWith('.fa'))
+      return 'Expected a .fasta or .fa file.';
+    const text = await readFileHead(file, 2048);
+    if (!text.trimStart().startsWith('>'))
+      return 'File does not look like a FASTA file (first non-whitespace character must be ">").';
+    return null;
+  }
+
+  if (type === 'fastq') {
+    const isGz = name.endsWith('.gz');
+    if (!name.endsWith('.fastq') && !name.endsWith('.fq') && !isGz)
+      return 'Expected a .fastq, .fq, or .fastq.gz file.';
+    if (isGz) {
+      const bytes = await readFileBytesHead(file, 2);
+      if (bytes[0] !== 0x1f || bytes[1] !== 0x8b)
+        return 'File has a .gz extension but does not appear to be a valid gzip file.';
+    } else {
+      const text = await readFileHead(file, 2048);
+      if (!text.trimStart().startsWith('@'))
+        return 'File does not look like a FASTQ file (first non-whitespace character must be "@").';
+    }
+    return null;
+  }
+
+  if (type === 'fmidx') {
+    if (!name.endsWith('.fmidx'))
+      return 'Expected a .fmidx index file (build one with the Build tab).';
+    return null;
+  }
+
+  return null;
+}
+
+function setupDropzone(dropzoneId, inputId, chosenId, nameId, sizeId, onFile, errorId, validate) {
   const dz    = document.getElementById(dropzoneId);
   const input = document.getElementById(inputId);
 
-  function showFile(file) {
+  function setError(msg) {
+    if (!errorId) return;
+    const el = document.getElementById(errorId);
+    if (!el) return;
+    el.textContent = msg || '';
+    el.classList.toggle('visible', !!msg);
+  }
+
+  async function showFile(file) {
+    setError(null);
+    if (validate) {
+      const err = await validate(file);
+      if (err) {
+        setError(err);
+        document.getElementById(chosenId).classList.remove('visible');
+        return;
+      }
+    }
     document.getElementById(nameId).textContent = file.name;
     document.getElementById(sizeId).textContent = fmtSize(file.size);
     document.getElementById(chosenId).classList.add('visible');
@@ -64,7 +138,8 @@ const buildBtn = document.getElementById('build-btn');
 setupDropzone(
   'build-dropzone', 'build-fasta-input',
   'build-file-chosen', 'build-file-name', 'build-file-size',
-  () => { buildBtn.disabled = false; }
+  () => { buildBtn.disabled = false; },
+  'build-fasta-error', f => validateFile(f, 'fasta')
 );
 
 buildBtn.addEventListener('click', async () => {
@@ -119,20 +194,25 @@ const alignFiles = { index: null, r1: null, r2: null };
 let   alignSession = null;
 
 function checkAlignReady() {
-  alignBtn.disabled = !(alignFiles.index && alignFiles.r1 && alignFiles.r2);
+  if (alignBtn) alignBtn.disabled = !(alignFiles.index && alignFiles.r1 && alignFiles.r2);
 }
 
+if (alignBtn) {
 setupDropzone('align-index-dropzone', 'align-fmidx-input',
   'align-index-chosen', 'align-index-name', 'align-index-size',
-  f => { alignFiles.index = f; checkAlignReady(); });
+  f => { alignFiles.index = f; checkAlignReady(); },
+  'align-index-error', f => validateFile(f, 'fmidx'));
 
 setupDropzone('align-r1-dropzone', 'align-r1-input',
   'align-r1-chosen', 'align-r1-name', 'align-r1-size',
-  f => { alignFiles.r1 = f; checkAlignReady(); });
+  f => { alignFiles.r1 = f; checkAlignReady(); },
+  'align-r1-error', f => validateFile(f, 'fastq'));
 
 setupDropzone('align-r2-dropzone', 'align-r2-input',
   'align-r2-chosen', 'align-r2-name', 'align-r2-size',
-  f => { alignFiles.r2 = f; checkAlignReady(); });
+  f => { alignFiles.r2 = f; checkAlignReady(); },
+  'align-r2-error', f => validateFile(f, 'fastq'));
+} // end if (alignBtn)
 
 // Progress bar helpers
 let _pRaf = null, _pStart = null, _pFrom = 0;
@@ -182,7 +262,7 @@ async function uploadAlignFile(part, file, sessionId) {
   const sun  = document.getElementById('icon-sun');
 
   function applyDark(on) {
-    document.documentElement.classList.toggle('dark', on);
+    document.documentElement.setAttribute('data-theme', on ? 'dark' : 'light');
     moon.style.display = on ? 'none' : '';
     sun.style.display  = on ? ''     : 'none';
   }
@@ -391,10 +471,12 @@ function onFilterInput() {
   }, 250);  // debounce 250 ms
 }
 
-document.getElementById('filter-read-id').addEventListener('input', onFilterInput);
-document.getElementById('filter-ref-id').addEventListener('input', onFilterInput);
-document.getElementById('align-rows-per-page')
-  .addEventListener('change', () => { _tPage = 0; renderTablePage(); });
+if (alignBtn) {
+  document.getElementById('filter-read-id').addEventListener('input', onFilterInput);
+  document.getElementById('filter-ref-id').addEventListener('input', onFilterInput);
+  document.getElementById('align-rows-per-page')
+    .addEventListener('change', () => { _tPage = 0; renderTablePage(); });
+}
 
 // ── Query tab ──────────────────────────────────────────────────────────────
 const queryFiles   = { index: null, r1: null, r2: null };
@@ -407,15 +489,18 @@ function checkQueryReady() {
 
 setupDropzone('query-index-dropzone', 'query-fmidx-input',
   'query-index-chosen', 'query-index-name', 'query-index-size',
-  f => { queryFiles.index = f; checkQueryReady(); });
+  f => { queryFiles.index = f; checkQueryReady(); },
+  'query-index-error', f => validateFile(f, 'fmidx'));
 
 setupDropzone('query-r1-dropzone', 'query-r1-input',
   'query-r1-chosen', 'query-r1-name', 'query-r1-size',
-  f => { queryFiles.r1 = f; checkQueryReady(); });
+  f => { queryFiles.r1 = f; checkQueryReady(); },
+  'query-r1-error', f => validateFile(f, 'fastq'));
 
 setupDropzone('query-r2-dropzone', 'query-r2-input',
   'query-r2-chosen', 'query-r2-name', 'query-r2-size',
-  f => { queryFiles.r2 = f; checkQueryReady(); });
+  f => { queryFiles.r2 = f; checkQueryReady(); },
+  'query-r2-error', f => validateFile(f, 'fastq'));
 
 // Query progress helpers
 let _qRaf = null;
@@ -1030,17 +1115,17 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     animateQueryProgress('Running EM classification…', 20);
 
     const mismatch  = document.getElementById('query-mismatch').value  || '5';
-    const cutoff    = document.getElementById('query-cutoff').value    || '1e-4';
+    const eps1      = document.getElementById('query-eps1').value      || '1e-4';
     const iter      = document.getElementById('query-iter').value      || '100';
     const threads   = document.getElementById('query-threads').value   || '0';
     const rho       = document.getElementById('query-rho').value       || '20';
-    const gamma     = document.getElementById('query-gamma').value     || '1e-20';
-    const tau       = document.getElementById('query-tau').value       || '1e-18';
+    const omega     = document.getElementById('query-omega').value     || '1e-20';
+    const eps2      = document.getElementById('query-eps2').value      || '1e-18';
     const noPenalty = document.getElementById('query-no-penalty').checked;
 
     const res = await fetch(
-      `/api/query/run?session=${querySession}&mismatch=${mismatch}&cutoff=${cutoff}` +
-      `&iter=${iter}&threads=${threads}&lambda=${rho}&gamma=${gamma}&tau=${tau}&no_penalty=${noPenalty}`,
+      `/api/query/run?session=${querySession}&mismatch=${mismatch}&eps_1=${eps1}` +
+      `&iter=${iter}&threads=${threads}&rho=${rho}&omega=${omega}&eps_2=${eps2}&no_penalty=${noPenalty}`,
       { method: 'POST' }
     );
     if (!res.ok) throw new Error(await res.text());
@@ -1093,7 +1178,7 @@ document.getElementById('query-btn').addEventListener('click', async () => {
   }
 });
 
-alignBtn.addEventListener('click', async () => {
+if (alignBtn) alignBtn.addEventListener('click', async () => {
   setStatus('align', 'running');
   document.getElementById('align-table-section').style.display = 'none';
   alignBtn.disabled = true;
