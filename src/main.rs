@@ -30,6 +30,10 @@ use tiny_http::{Server, Response, Header, StatusCode};
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 use std::cmp;
 
+/// Newtype wrapper around a raw read identifier string.
+///
+/// Used as a map key throughout the alignment and EM pipeline. `Deref`s to
+/// `String` for convenient string operations.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile, PartialOrd, Ord)]
 pub struct ReadID(String);
 
@@ -41,6 +45,10 @@ impl std::ops::Deref for ReadID {
 }
 
 
+/// Newtype wrapper around a raw reference sequence identifier string.
+///
+/// Stored in the FM-index alongside sequence data and used to label output rows.
+/// `Deref`s to `String` for convenient string operations.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
 pub struct RefID(String);
 
@@ -51,6 +59,10 @@ impl std::ops::Deref for RefID {
     }
 }
 
+/// Dense integer index assigned to each read for use as a `SparseArray` row key.
+///
+/// Indices are assigned in iteration order when reads are loaded and are stable
+/// for the lifetime of a single run. `Deref`s to `usize`.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Copy, Savefile)]
 pub struct ReadIdx(usize);
 
@@ -62,6 +74,10 @@ impl std::ops::Deref for ReadIdx {
 }
 
 
+/// Dense integer index assigned to each reference sequence for use as a `SparseArray` column key.
+///
+/// Indices correspond to the order in which sequences appear in the FASTA file
+/// and are stored in the serialized FM-index. `Deref`s to `usize`.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Copy, Savefile)]
 pub struct RefIdx(usize);
 
@@ -72,6 +88,11 @@ impl std::ops::Deref for RefIdx {
     }
 }
 
+/// Serializable container for a built FM-index and its associated metadata.
+///
+/// Bundles the raw [`FmIndexFlat64`] with bidirectional index↔ID mappings and
+/// the original reference sequences, so that a single `.fmidx` file contains
+/// everything needed for alignment without re-reading the FASTA.
 #[derive(Savefile)]
 pub struct IOFMIndex{
     fmidx: FmIndexFlat64<i64>,
@@ -80,36 +101,87 @@ pub struct IOFMIndex{
     idx_to_seq: HashMap<RefIdx, Vec<u8>>
 }
 
+/// Floating-point type used for all EM probabilities and log-probabilities in linear space.
+///
+/// Values in alignment likelihood maps are stored as raw `f64`; the [`bio::stats::LogProb`]
+/// newtype is used at boundaries where log-space arithmetic is required.
 type EMProb = f64;
 
-/// type to store all alignments of a read to references
-// type Alignments = HashMap<RefIdx, LogProb>;
-/// type to store the best alignments of reads to references
-type MatchLikelihoods = HashMap<RefIdx, HashMap<usize, LogProb>>;
-/// type to store all alignments of all reads to references
-type ReadAlignments<'a> = DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<LogProb>>>;
+/// Per-read alignment likelihoods: maps each reference index to a map of
+/// alignment start positions → log-probability of the read originating from
+/// that position on that reference.
+pub struct MatchLikelihoods(HashMap<RefIdx, HashMap<usize, LogProb>>);
 
+impl MatchLikelihoods {
+    /// Create an empty `MatchLikelihoods` map.
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl std::ops::Deref for MatchLikelihoods {
+    type Target = HashMap<RefIdx, HashMap<usize, LogProb>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl std::ops::DerefMut for MatchLikelihoods {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+/// Collection of alignment likelihoods for all reads in a dataset.
+///
+/// Maps each read ID (borrowed from the input slice) to its per-reference
+/// likelihood deques. The inner [`DashMap`] allows concurrent writes during
+/// parallel alignment.
+pub struct ReadAlignments<'a>(DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<LogProb>>>);
+
+impl<'a> ReadAlignments<'a> {
+    /// Create an empty `ReadAlignments` map.
+    pub fn new() -> Self {
+        Self(DashMap::new())
+    }
+}
+
+impl<'a> std::ops::Deref for ReadAlignments<'a> {
+    type Target = DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<LogProb>>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+
+impl<'a> std::ops::DerefMut for ReadAlignments<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
+/// Half-open interval describing where a single MEM seed aligns on both the read and a reference.
+///
+/// All positions are 0-based and half-open (`start` inclusive, `end` exclusive).
+/// Multiple `MEMPos` values for the same read–reference pair are merged into
+/// longer alignments by [`merge_kmer_matches`].
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Savefile)]
 pub struct MEMPos{
     pub ref_start: usize,
     pub ref_end: usize,
-    pub read_start: usize, 
+    pub read_start: usize,
     pub read_end: usize,
 }
 
 impl MEMPos{
+    /// Returns `true` if `kmer` starts at or after this MEM on both the read and reference,
+    /// indicating the two seeds could belong to the same collinear chain.
     fn is_consecutive(&self, kmer: &MEMPos)->bool{
         if kmer.read_start>=self.read_start && kmer.ref_start>=self.ref_start{
             return true;
         }
         false
     }
+    /// Returns `true` if `kmer` overlaps this MEM with the same offset on both axes,
+    /// meaning the two seeds represent the same underlying alignment and can be merged.
     fn is_overlapping(&self, kmer: &MEMPos)->bool{
         if kmer.read_start-self.read_start == kmer.ref_start-self.ref_start && kmer.read_end-self.read_end == kmer.ref_end-self.ref_end{
             return true;
         }
         false
     }
+    /// Extend this MEM to span the union of its coordinates and those of `kmer`.
     fn merge(&mut self, kmer: &MEMPos){
         self.read_start = cmp::min(kmer.read_start, self.read_start);
         self.read_end = cmp::max(kmer.read_end, self.read_end);
@@ -118,6 +190,10 @@ impl MEMPos{
     }
 }
 
+/// A matched pair of forward (R1) and reverse (R2) FASTQ records sharing a common read ID.
+///
+/// Created by joining the R1 and R2 FASTQ files on read ID before alignment,
+/// and passed as a slice to [`process_read_pairs`].
 pub struct ReadPair{
     read_id: ReadID,
     r1: fastq::Record,
@@ -133,12 +209,14 @@ pub struct SparseArray<T: Float + Zero + Copy + Send + Sync + Debug>{
 }
 
 impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T>{
+    /// Insert a likelihood value for the (read, reference) pair, updating both index maps.
     fn insert(&mut self, read_idx: ReadIdx, ref_idx: RefIdx, val: T){
         self.values.insert((read_idx, ref_idx), val);
         self.read_idxs_ref_map.entry(read_idx).or_default().insert(ref_idx);
         self.ref_idxs_read_map.entry(ref_idx).or_default().insert(read_idx);
     }
 
+    /// Return the stored value for a (read, reference) pair, or zero if absent.
     fn get(&self, index: &(ReadIdx, RefIdx)) -> T {
         if self.values.contains_key(index){
             *self.values.get(index).unwrap()
@@ -148,14 +226,17 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T>{
         }
     }
 
+    /// Return the set of all read indices that have at least one stored entry.
     fn get_read_idxs(&self)->HashSet<ReadIdx>{
         self.read_idxs_ref_map.iter().map(|x| *x.key()).collect()
     }
 
+    /// Return the set of all reference indices that have at least one stored entry.
     fn get_ref_idxs(&self)->HashSet<RefIdx>{
         self.ref_idxs_read_map.iter().map(|x| *x.key()).collect()
     }
 
+    /// Return all (reference index, value) pairs stored for a given read.
     fn get_all_read_hits_idx(&self, read_idx: &ReadIdx)->Vec<(RefIdx, T)>{
         let ref_idxs: &HashSet<RefIdx> = &self.read_idxs_ref_map.get(read_idx).unwrap();
         let mut out: Vec<(RefIdx, T)> = Vec::with_capacity(ref_idxs.len());
@@ -168,6 +249,7 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T>{
         out
     }
 
+    /// Return all stored values for a given reference (one per read that aligns to it).
     fn get_all_ref_hits(&self, ref_idx: &RefIdx)->Vec<T>{
         let read_idxs: &HashSet<ReadIdx> = &self.ref_idxs_read_map.get(ref_idx).unwrap();
         let mut out: Vec<T> = Vec::with_capacity(read_idxs.len());
@@ -181,11 +263,17 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T>{
         out
     }
 
+    /// Return the total number of distinct reads with stored entries.
     fn num_reads(&self)->usize{
         self.get_read_idxs().len()
     }
 }
 
+/// Merge overlapping or consecutive MEM seeds into a single, extended MEM.
+///
+/// Iterates the sorted deque and attempts to absorb each seed into a running
+/// MEM if it is both consecutive and overlapping with it; otherwise starts a
+/// new running MEM.
 fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
     let mut out_vec = Vec::with_capacity(kmer_matches.len());
     out_vec.push(kmer_matches[0]);
@@ -267,7 +355,7 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
         false => record.qual().to_vec(),
     };
 
-    let mut match_likelihood: MatchLikelihoods = HashMap::new();
+    let mut match_likelihood = MatchLikelihoods::new();
 
     let (_other_matches, mems) = clean_kmer_matches(fmidx, refs, record, percent_mismatch, complement);
     
@@ -304,6 +392,11 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
     Ok(match_likelihood)
 }
 
+/// Compute the combined log-probability for a read pair aligning to the same reference.
+///
+/// Sums the linear-space product of each (R1, R2_rc) alignment position pair where
+/// the R2 reverse-complement ends after the R1 start position (i.e. the pair is
+/// in a valid FR orientation), then returns the result in log space.
 fn merge_read_pairs(forward: &HashMap<usize, LogProb>, reverse: &HashMap<usize, LogProb>, read_len: usize) -> LogProb{
     let mut match_likelihood: EMProb = 0.0;
     for (r1_start, r1_log_prob) in forward.iter(){
@@ -317,6 +410,13 @@ fn merge_read_pairs(forward: &HashMap<usize, LogProb>, reverse: &HashMap<usize, 
     LogProb(match_likelihood.ln())
 }
 
+/// Align all read pairs against the FM-index in parallel and collect per-read likelihoods.
+///
+/// For each `ReadPair`, both orientations (FR and RF) are queried via [`query_read`].
+/// Alignment likelihoods that fall below the absolute threshold `eps_1` or are more
+/// than `eps_2` log-units below the best alignment for that read are discarded.
+/// Returns a map of read ID → per-reference likelihood deques, and the set of all
+/// references that received at least one alignment.
 fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
                     refs: &HashMap<RefIdx, Vec<u8>>,
                     read_pairs: &'a[ReadPair],
@@ -324,7 +424,7 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
                     eps_1: LogProb,
                     eps_2: LogProb)-> Result<(ReadAlignments<'a>, DashSet<RefIdx>)>
 {
-    let out_aligns: ReadAlignments = DashMap::new();
+    let out_aligns = ReadAlignments::new();
 
     let pb = ProgressBar::with_draw_target(Some(read_pairs.len() as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
@@ -392,6 +492,13 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
     Ok((out_aligns, all_ref_ids))
 }
 
+/// Run the unpenalized EM algorithm to estimate reference proportions.
+///
+/// Initializes proportions by plurality vote, then iterates the E- and M-steps
+/// for up to `num_iter` rounds, stopping early when the change in data
+/// log-likelihood drops below 1e-6. Returns the per-read MAP assignments,
+/// the filtered proportion map, the final posterior weight matrix, and the
+/// data log-likelihood at each iteration.
 fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
@@ -535,11 +642,19 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->
     (results, props[num_iter].iter().filter(|(_,v)| **v*(num_reads as EMProb)>1.0).map(|(k,v)|(*k,*v)).collect(), w, data_likelihoods)
 }
 
+/// M-step update for a single reference proportion under the L1-regularized objective.
+///
+/// Computes the closed-form solution for π_j given the current Lagrange multiplier
+/// `lambda`, the expected count `ej`, penalty weight `rho`, and floor `omega`.
 fn _update_pi(rho: EMProb, omega: EMProb, ej: EMProb, lambda: EMProb)-> EMProb{
     let phi = _compute_phi(lambda, omega, rho, ej);
     (-phi + (phi*phi - 4.0*lambda*ej*omega).sqrt())/(2.0*lambda)
 }
 
+/// Find the Lagrange multiplier λ that enforces the simplex constraint Σπ_j = 1.
+///
+/// Uses Newton-Raphson starting from `lambda_init`, iterating for up to
+/// `iterations` steps or until the constraint function equals zero.
 fn _update_lambda(rho: EMProb, omega: EMProb, ejs: &HashMap<RefIdx, EMProb>, lambda_init: EMProb, iterations: usize)-> EMProb{
     let mut lambda = lambda_init;
     for _ in 0..iterations{
@@ -553,6 +668,9 @@ fn _update_lambda(rho: EMProb, omega: EMProb, ejs: &HashMap<RefIdx, EMProb>, lam
     lambda
 }
 
+/// Evaluate the constraint function f(λ) = Σ_j π_j(λ) − 1 used by Newton-Raphson.
+///
+/// A root of this function gives the λ for which the estimated proportions sum to one.
 fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, EMProb>)-> EMProb{
     ejs.keys()
         .map(|ref_idx| {
@@ -562,6 +680,7 @@ fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, 
         }).sum::<EMProb>() - 2.0*lambda
 }
 
+/// Evaluate the derivative f′(λ) = Σ_j ∂π_j/∂λ used by Newton-Raphson.
 fn _compute_deriv_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, EMProb>)-> EMProb{
     ejs.keys()
         .map(|ref_idx| {
@@ -571,22 +690,33 @@ fn _compute_deriv_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<Re
         }).sum::<EMProb>() - 2.0
 }
 
+/// Compute the auxiliary scalar φ = λω + ρ − e_j used in the closed-form π update.
 fn _compute_phi(lambda: EMProb, omega: EMProb, rho: EMProb, ej: EMProb)-> EMProb{
     return lambda*omega+rho-ej
 }
 
+/// Return the L1 norm (sum of absolute values) of a proportion map.
 fn _l1_norm(props: &HashMap<RefIdx, EMProb>)->EMProb{
     props.values().sum()
 }
 
+/// Return the squared L2 norm (sum of squares) of a proportion map.
 fn _l2_norm_sq(props: &HashMap<RefIdx, EMProb>)->EMProb{
     props.values().map(|x| x*x).sum()
 }
 
+/// Compute the log-barrier penalty Σ_j ln(1 + π_j / ω) for a proportion map.
 fn _penalty(props: &HashMap<RefIdx, EMProb>, omega: EMProb)->EMProb{
     props.values().map(|x| (1.0+(x/omega)).ln()).sum()
 }
 
+/// Run the L1-penalized EM algorithm to estimate reference proportions.
+///
+/// Identical in structure to [`get_proportions_par_sparse`] but applies a
+/// sparsity-inducing penalty with weight `rho` and floor `omega`. The Lagrange
+/// multiplier enforcing the simplex constraint is solved via Newton-Raphson at
+/// each M-step. Convergence is declared when the improvement in data
+/// log-likelihood is positive but ≤ `em_threshold` (after a 20-iteration burn-in).
 fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb, em_threshold: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
@@ -731,6 +861,12 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
 
 
 
+/// Build a serialized FM-index from raw FASTA bytes.
+///
+/// Parses all records from `fasta_data`, constructs a [`FmIndexFlat64`] over the
+/// concatenated sequences using an IUPAC-tolerant DNA alphabet, serializes the
+/// index together with its ID↔index mappings into a byte vector, and returns
+/// that vector alongside a human-readable log string.
 fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     let cursor = Cursor::new(fasta_data);
     let reader = BufReader::new(cursor);
@@ -779,6 +915,11 @@ fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     Ok((bytes, log_str))
 }
 
+/// HTTP handler for `POST /api/build`.
+///
+/// Reads the raw FASTA body from the request, delegates to [`build_index_from_bytes`],
+/// and responds with the serialized `.fmidx` binary. The log string is included in
+/// the `X-Premise-Log` response header (newlines replaced by ` | `).
 fn handle_api_build(mut request: tiny_http::Request) {
     let result: Result<(Vec<u8>, String)> = (|| {
         let mut body = Vec::new();
@@ -809,17 +950,28 @@ fn handle_api_build(mut request: tiny_http::Request) {
 
 // ─── Align helpers ────────────────────────────────────────────────────────────
 
+/// Server-side state for a single upload/run session.
+///
+/// When the GUI uploads files it receives a session ID; subsequent requests use
+/// that ID to locate the temporary directory containing the index and reads.
+/// `r1_ext` and `r2_ext` record the file extensions of the uploaded reads so
+/// that the correct filenames can be reconstructed at run time.
 struct AlignSession {
     dir: std::path::PathBuf,
     r1_ext: Option<String>,
     r2_ext: Option<String>,
 }
 
+/// Generate a unique session ID based on the current system time in nanoseconds.
 fn new_session_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     format!("{:x}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
 }
 
+/// Parse the query-string portion of a URL into a key→value map.
+///
+/// Splits on `?`, then on `&`, then on the first `=` of each pair.
+/// Missing values default to an empty string.
 fn parse_qs(url: &str) -> HashMap<String, String> {
     url.split('?')
         .nth(1)
@@ -834,6 +986,10 @@ fn parse_qs(url: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Load forward (R1) reads from a FASTQ or gzipped FASTQ file into a read-ID map.
+///
+/// Strips a trailing `/1` suffix from read IDs (common in paired-end naming
+/// conventions) so that R1 and R2 IDs can be matched by bare read name.
 fn load_fastq_forward(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
     match get_extension_from_filename(path) {
         Some("gz") => {
@@ -856,6 +1012,9 @@ fn load_fastq_forward(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
     }
 }
 
+/// Load reverse (R2) reads from a FASTQ or gzipped FASTQ file into a read-ID map.
+///
+/// Strips a trailing `/2` suffix from read IDs so that IDs match those in the R1 map.
 fn load_fastq_reverse(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
     match get_extension_from_filename(path) {
         Some("gz") => {
@@ -878,6 +1037,13 @@ fn load_fastq_reverse(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
     }
 }
 
+/// Run pairwise alignment of reads against the reference index and return a TSV.
+///
+/// Loads the FM-index from `ref_file` and paired reads from `r1_file`/`r2_file`,
+/// then calls [`process_read_pairs`] with no absolute likelihood cutoff (ε₁ = −∞)
+/// and a relative log-probability cutoff of `eps_2`. Returns a TSV string of
+/// (ReadID, RefID, Probability) rows — unaligned reads appear as "unclassified" —
+/// and a log string summarising run parameters.
 fn run_alignment(
     ref_file: &str,
     r1_file: &str,
@@ -961,6 +1127,20 @@ fn run_alignment(
     Ok((out, log_str))
 }
 
+/// Full PREMISE query pipeline: align reads then run EM classification.
+///
+/// Loads the FM-index and reads, aligns all pairs via [`process_read_pairs`]
+/// using the absolute cutoff `eps_1` and relative cutoff `eps_2`, then runs
+/// either the penalized (`rho`, `omega`) or unpenalized EM for up to `num_iter`
+/// iterations with convergence criterion `em_threshold`.
+///
+/// Returns six values:
+/// - `matches_tsv`: per-read MAP assignment table (TSV)
+/// - `posteriors_tsv`: full posterior probability matrix (TSV)
+/// - `props_tsv`: estimated reference abundance proportions (TSV)
+/// - `aligns_tsv`: raw per-read alignment likelihoods (TSV, same format as `run_alignment`)
+/// - `em_data_likelihoods`: data log-likelihood at each EM iteration
+/// - `log_str`: human-readable summary of run parameters
 fn run_query(
     ref_file: &str,
     r1_file: &str,
@@ -974,7 +1154,7 @@ fn run_query(
     em_threshold: EMProb,
     use_penalty: bool,
     threads: usize,
-) -> Result<(String, String, String, Vec<EMProb>, String)> {
+) -> Result<(String, String, String, String, Vec<EMProb>, String)> {
     let num_threads = if threads == 0 {
         thread::available_parallelism()?.get()
     } else {
@@ -1111,9 +1291,38 @@ fn run_query(
         }
     }
 
-    Ok((matches_tsv, posteriors_tsv, props_tsv, em_data_likelihoods, log_str))
+    // Build aligns TSV — same format as run_alignment output
+    let mut aligns_tsv = String::from("ReadID\tRefID\tProbability\n");
+    for read_id in all_read_ids.iter() {
+        if !out_aligns.contains_key(read_id) {
+            aligns_tsv.push_str(&format!("{}\tunclassified\t-\n", **read_id));
+            continue;
+        }
+        let read_idx = *read_ids.get(read_id).unwrap();
+        let read_aligns = out_aligns.get(read_id).unwrap();
+        for (ref_idx, aligns) in read_aligns.iter() {
+            let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+            for likelihood in aligns {
+                aligns_tsv.push_str(&format!(
+                    "{}\t{}\t{:.5e}\n",
+                    ***read_ids_rev.get(&read_idx).unwrap(),
+                    *ref_id,
+                    likelihood.exp(),
+                ));
+            }
+        }
+    }
+
+    Ok((matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, em_data_likelihoods, log_str))
 }
 
+/// Handle a file-upload request for the alignment workflow.
+///
+/// The `part` query parameter selects which file is being uploaded:
+/// `"index"` → FM-index, `"r1"` → forward reads, `"r2"` → reverse reads.
+/// A new session directory is created when `session=new` (or the parameter is
+/// absent); subsequent parts reuse the existing session. Returns a JSON object
+/// with the session ID.
 fn do_align_upload(
     request: &mut tiny_http::Request,
     sessions: &mut HashMap<String, AlignSession>,
@@ -1153,6 +1362,8 @@ fn do_align_upload(
     Ok(format!(r#"{{"session":"{}","ok":true}}"#, session_id))
 }
 
+/// HTTP handler for `POST /api/align/upload`. Delegates to [`do_align_upload`]
+/// and responds with JSON or a 500 error.
 fn handle_align_upload(mut request: tiny_http::Request, sessions: &mut HashMap<String, AlignSession>) {
     match do_align_upload(&mut request, sessions) {
         Ok(json) => {
@@ -1167,6 +1378,11 @@ fn handle_align_upload(mut request: tiny_http::Request, sessions: &mut HashMap<S
     }
 }
 
+/// Parse query parameters and run pairwise alignment for an uploaded session.
+///
+/// Reads `mismatch`, `eps_2`, and `threads` from the URL query string, resolves
+/// the session's uploaded file paths, calls [`run_alignment`], and returns the
+/// result as a JSON object with `tsv` and `log` fields.
 fn do_align_run(
     request: &tiny_http::Request,
     sessions: &HashMap<String, AlignSession>,
@@ -1204,6 +1420,8 @@ fn do_align_run(
     ))
 }
 
+/// HTTP handler for `POST /api/align/run`. Delegates to [`do_align_run`]
+/// and responds with JSON or a 500 error.
 fn handle_align_run(request: tiny_http::Request, sessions: &HashMap<String, AlignSession>) {
     match do_align_run(&request, sessions) {
         Ok(json) => {
@@ -1218,6 +1436,10 @@ fn handle_align_run(request: tiny_http::Request, sessions: &HashMap<String, Alig
     }
 }
 
+/// Escape a string for embedding inside a JSON double-quoted value.
+///
+/// Replaces `"`, `\`, newline, carriage return, and tab with their JSON escape
+/// sequences. Other characters are passed through unchanged.
 fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1233,6 +1455,13 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+/// Parse query parameters and run the full PREMISE classification pipeline for an uploaded session.
+///
+/// Reads all EM parameters (`mismatch`, `eps_1`, `eps_2`, `iter`, `rho`, `omega`,
+/// `em_threshold`, `no_penalty`, `threads`) from the URL query string, resolves
+/// session file paths, calls [`run_query`], and returns a JSON object containing
+/// `matches`, `posteriors`, `props`, `convergence` (array of per-iteration data
+/// log-likelihoods), and `log` fields.
 fn do_query_run(
     request: &tiny_http::Request,
     sessions: &HashMap<String, AlignSession>,
@@ -1241,7 +1470,7 @@ fn do_query_run(
     let qs = parse_qs(&url);
     let session_id = qs.get("session").ok_or_else(|| anyhow::anyhow!("Missing session"))?;
     let mismatch: EMProb  = qs.get("mismatch").and_then(|s| s.parse().ok()).unwrap_or(5.0);
-    let eps_1: EMProb     = qs.get("eps_1").and_then(|s| s.parse().ok()).unwrap_or(1e-4);
+    let eps_1: EMProb     = qs.get("eps_1").and_then(|s| s.parse().ok()).unwrap_or(1e-32);
     let eps_2: EMProb     = qs.get("eps_2").and_then(|s| s.parse().ok()).unwrap_or(1e-18);
     let num_iter: usize   = qs.get("iter").and_then(|s| s.parse().ok()).unwrap_or(100);
     let rho: EMProb       = qs.get("rho").and_then(|s| s.parse().ok()).unwrap_or(20.0);
@@ -1262,7 +1491,7 @@ fn do_query_run(
     let r1_path  = session.dir.join(format!("r1.{}", r1_ext));
     let r2_path  = session.dir.join(format!("r2.{}", r2_ext));
 
-    let (matches_tsv, posteriors_tsv, props_tsv, em_likelihoods, log_str) = run_query(
+    let (matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, em_likelihoods, log_str) = run_query(
         ref_path.to_str().unwrap(),
         r1_path.to_str().unwrap(),
         r2_path.to_str().unwrap(),
@@ -1277,15 +1506,18 @@ fn do_query_run(
     );
 
     Ok(format!(
-        r#"{{"ok":true,"matches":"{}","posteriors":"{}","props":"{}","convergence":{},"log":"{}"}}"#,
+        r#"{{"ok":true,"matches":"{}","posteriors":"{}","props":"{}","aligns":"{}","convergence":{},"log":"{}"}}"#,
         json_escape(&matches_tsv),
         json_escape(&posteriors_tsv),
         json_escape(&props_tsv),
+        json_escape(&aligns_tsv),
         convergence_json,
         json_escape(&log_str),
     ))
 }
 
+/// HTTP handler for `POST /api/query/run`. Delegates to [`do_query_run`]
+/// and responds with JSON or a 500 error.
 fn handle_query_run(request: tiny_http::Request, sessions: &HashMap<String, AlignSession>) {
     match do_query_run(&request, sessions) {
         Ok(json) => {
@@ -1374,7 +1606,7 @@ fn main() -> Result<()>{
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(--eps_1 <EPS_1>"Cutoff likelihood for dropping alignments")
-                    .default_value("1e-4")
+                    .default_value("1e-32")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
@@ -1486,14 +1718,15 @@ fn main() -> Result<()>{
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
 
             let now = Instant::now();
-            let (matches_tsv, posteriors_tsv, props_tsv, _, _) = run_query(
+            let (matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, _, _) = run_query(
                 ref_file, r1_file, r2_file,
                 percent_mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads,
             )?;
             std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
             std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())?;
             std::fs::write(format!("{}.props", outfile), props_tsv.as_bytes())?;
-            println!("Query written to {}.{{matches,posteriors,props}} ({:.2?})", outfile, now.elapsed());
+            std::fs::write(format!("{}.aligns", outfile), aligns_tsv.as_bytes())?;
+            println!("Query written to {}.{{matches,posteriors,props,aligns}} ({:.2?})", outfile, now.elapsed());
         },
         Some(("server", sub_m)) => {
             let port = *sub_m.get_one::<u16>("port").unwrap();
