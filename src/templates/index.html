@@ -9,42 +9,57 @@
 </head>
 <body>
 
-<header class="container-fluid">
-  <nav>
-    <ul>
-      <li><strong>Premise</strong> <small>ML Metagenomic Classifier</small></li>
-    </ul>
-    <ul>
-      <li><a href="javascript:void(0)" class="nav-tab active" data-tab="build">Build</a></li>
-      <li><a href="javascript:void(0)" class="nav-tab" data-tab="query">Query</a></li>
-      <li>
-        <button id="dark-toggle" class="outline contrast icon-btn" aria-label="Toggle dark mode">
-          <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" width="16" height="16"
-               viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-          </svg>
-          <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" width="16" height="16"
-               viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
-               style="display:none">
-            <circle cx="12" cy="12" r="5"/>
-            <line x1="12" y1="1"  x2="12" y2="3"/>
-            <line x1="12" y1="21" x2="12" y2="23"/>
-            <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
-            <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
-            <line x1="1"  y1="12" x2="3"  y2="12"/>
-            <line x1="21" y1="12" x2="23" y2="12"/>
-            <line x1="4.22" y1="19.78" x2="5.64"  y2="18.36"/>
-            <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-          </svg>
-        </button>
-      </li>
-    </ul>
+<header>
+  <nav class="nav-bar">
+    <span class="nav-brand"><strong>PREMISE</strong><sup class="nav-version">v0.1</sup></span>
+    <span class="nav-sep"></span>
+    <div class="nav-tabs">
+      <a href="javascript:void(0)" class="nav-tab active" data-tab="build">Build</a>
+      <a href="javascript:void(0)" class="nav-tab" data-tab="query">Query</a>
+    </div>
+    <div class="nav-actions">
+      <a href="https://github.com/sriram98v/premise" target="_blank" rel="noopener"
+         class="outline contrast icon-btn" aria-label="GitHub repository">
+        <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"
+             viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.166 6.839 9.489.5.092.682-.217.682-.482
+                   0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.342-3.369-1.342-.454-1.155-1.11-1.462-1.11-1.462
+                   -.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.832
+                   .092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943
+                   0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647
+                   0 0 .84-.269 2.75 1.025A9.578 9.578 0 0 1 12 6.836a9.59 9.59 0 0 1 2.504.337
+                   c1.909-1.294 2.747-1.025 2.747-1.025.546 1.377.203 2.394.1 2.647
+                   .64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935
+                   .359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743
+                   0 .267.18.579.688.481C19.138 20.163 22 16.418 22 12c0-5.523-4.477-10-10-10z"/>
+        </svg>
+      </a>
+      <button id="dark-toggle" class="outline contrast icon-btn" aria-label="Toggle dark mode">
+        <svg id="icon-moon" xmlns="http://www.w3.org/2000/svg" width="32" height="32"
+             viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+        <svg id="icon-sun" xmlns="http://www.w3.org/2000/svg" width="32" height="32"
+             viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+             style="display:none">
+          <circle cx="12" cy="12" r="5"/>
+          <line x1="12" y1="1"  x2="12" y2="3"/>
+          <line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22"  x2="5.64" y2="5.64"/>
+          <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1"  y1="12" x2="3"  y2="12"/>
+          <line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64"  y2="18.36"/>
+          <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+    </div>
   </nav>
 </header>
 
-<main class="container">
+<main class="container-fluid main-content">
 
   <!-- ================================================================ -->
   <!-- BUILD PANEL                                                       -->
@@ -145,49 +160,23 @@
   <!-- QUERY PANEL                                                       -->
   <!-- ================================================================ -->
   <section id="panel-query" class="tab-panel" role="tabpanel">
-    <article>
+    <article class="query-article">
       <header><h2>Run Query</h2></header>
 
-      <p>Upload a pre-built FM-index, forward reads (R1), and reverse reads (R2).
-         The server runs EM classification and returns assignments, posteriors, and abundance estimates.</p>
+      <div class="query-layout">
 
-      <!-- Index file -->
-      <label for="query-fmidx-input">
-        Reference index <small>(.fmidx built with the Build tab)</small>
-      </label>
-      <div class="dropzone" id="query-index-dropzone">
-        <input type="file" id="query-fmidx-input" accept=".fmidx"
-               aria-label="Upload .fmidx index file" />
-        <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
-             viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-          <polyline points="17 8 12 3 7 8"/>
-          <line x1="12" y1="3" x2="12" y2="15"/>
-        </svg>
-        <p class="dropzone-label"><strong>Choose file</strong> or drag and drop</p>
-      </div>
-      <div class="file-chosen" id="query-index-chosen">
-        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
-             viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-          <polyline points="14 2 14 8 20 8"/>
-        </svg>
-        <span class="file-name" id="query-index-name"></span>
-        <span class="file-size" id="query-index-size"></span>
-      </div>
-      <p class="file-error" id="query-index-error"></p>
+        <!-- ── LEFT COLUMN: submission form ─────────────────────────── -->
+        <div class="query-form-col">
+          <p style="margin-top:0">Upload a pre-built FM-index, forward reads (R1), and reverse reads (R2).
+             The server runs EM classification and returns assignments, posteriors, and abundance estimates.</p>
 
-      <!-- R1 + R2 reads -->
-      <div class="grid" style="margin-top:1rem">
-        <div>
-          <label for="query-r1-input">
-            R1 — forward reads <small>(.fastq / .fq / .fastq.gz)</small>
+          <!-- Index file -->
+          <label for="query-fmidx-input">
+            Reference index <small>(.fmidx built with the Build tab)</small>
           </label>
-          <div class="dropzone dropzone-sm" id="query-r1-dropzone">
-            <input type="file" id="query-r1-input" accept=".fastq,.fq,.gz"
-                   aria-label="Upload R1 FASTQ" />
+          <div class="dropzone" id="query-index-dropzone">
+            <input type="file" id="query-fmidx-input" accept=".fmidx"
+                   aria-label="Upload .fmidx index file" />
             <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
                  viewBox="0 0 24 24" fill="none" stroke="currentColor"
                  stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -195,258 +184,311 @@
               <polyline points="17 8 12 3 7 8"/>
               <line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
-            <p class="dropzone-label"><strong>Choose R1</strong> or drop</p>
+            <p class="dropzone-label"><strong>Choose file</strong> or drag and drop</p>
           </div>
-          <div class="file-chosen" id="query-r1-chosen">
+          <div class="file-chosen" id="query-index-chosen">
             <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
                  viewBox="0 0 24 24" fill="none" stroke="currentColor"
                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
               <polyline points="14 2 14 8 20 8"/>
             </svg>
-            <span class="file-name" id="query-r1-name"></span>
-            <span class="file-size" id="query-r1-size"></span>
+            <span class="file-name" id="query-index-name"></span>
+            <span class="file-size" id="query-index-size"></span>
           </div>
-          <p class="file-error" id="query-r1-error"></p>
-        </div>
+          <p class="file-error" id="query-index-error"></p>
 
-        <div>
-          <label for="query-r2-input">
-            R2 — reverse reads <small>(.fastq / .fq / .fastq.gz)</small>
-          </label>
-          <div class="dropzone dropzone-sm" id="query-r2-dropzone">
-            <input type="file" id="query-r2-input" accept=".fastq,.fq,.gz"
-                   aria-label="Upload R2 FASTQ" />
-            <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
-                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="17 8 12 3 7 8"/>
-              <line x1="12" y1="3" x2="12" y2="15"/>
-            </svg>
-            <p class="dropzone-label"><strong>Choose R2</strong> or drop</p>
-          </div>
-          <div class="file-chosen" id="query-r2-chosen">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
-                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-              <polyline points="14 2 14 8 20 8"/>
-            </svg>
-            <span class="file-name" id="query-r2-name"></span>
-            <span class="file-size" id="query-r2-size"></span>
-          </div>
-          <p class="file-error" id="query-r2-error"></p>
-        </div>
-      </div>
-
-      <!-- Parameters row 1: mismatch, eps_1 -->
-      <div class="grid" style="margin-top:1rem">
-        <label for="query-mismatch">
-          Percent mismatch <small>(0–100)</small>
-          <input type="number" id="query-mismatch" value="5" min="0" max="100" step="0.1" />
-        </label>
-        <label for="query-eps1">
-          ε<sub>1</sub> <small>(minimum likelihood threshold)</small>
-          <input type="text" id="query-eps1" value="1e-32" />
-        </label>
-      </div>
-
-      <!-- Parameters row 2: iterations, threads -->
-      <div class="grid">
-        <label for="query-iter">
-          Iterations <small>(EM iterations)</small>
-          <input type="number" id="query-iter" value="100" min="1" step="1" />
-        </label>
-        <label for="query-threads">
-          Threads <small>(0 = all available)</small>
-          <input type="number" id="query-threads" value="0" min="0" step="1" />
-        </label>
-      </div>
-
-      <!-- Parameters row 3: rho, omega -->
-      <div class="grid">
-        <label for="query-rho">
-          ρ <small>(penalty weight)</small>
-          <input type="number" id="query-rho" value="20" min="0" step="any" />
-        </label>
-        <label for="query-omega">
-          ω <small>(penalty weight)</small>
-          <input type="number" id="query-omega" value="1e-20" min="0" step="any" />
-        </label>
-      </div>
-
-      <!-- Parameters row 4: eps_2, em_threshold -->
-      <div class="grid">
-        <label for="query-eps2">
-          ε<sub>2</sub> <small>(relative likelihood threshold)</small>
-          <input type="text" id="query-eps2" value="1e-18" />
-        </label>
-        <label for="query-em-threshold">
-          EM threshold <small>(convergence criterion)</small>
-          <input type="text" id="query-em-threshold" value="1e-6" />
-        </label>
-      </div>
-
-      <!-- No-penalty checkbox -->
-      <label style="margin-top:0.5rem">
-        <input type="checkbox" id="query-no-penalty" />
-        Disable penalty (no regularization)
-      </label>
-
-      <button id="query-btn" disabled style="margin-top:1rem">
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
-             viewBox="0 0 24 24" fill="none" stroke="currentColor"
-             stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-          <polygon points="5 3 19 12 5 21 5 3"/>
-        </svg>
-        Run Query
-      </button>
-
-      <div class="status-area">
-        <!-- Running -->
-        <div class="status-box status-running" id="query-status-running">
-          <div>
-            <div style="display:flex;align-items:center;gap:12px;margin-bottom:0.5rem">
-              <div class="spinner"></div>
-              <span id="query-progress-label">Preparing…</span>
-            </div>
-            <progress id="query-progress-bar" value="0" max="100"></progress>
-          </div>
-        </div>
-
-        <!-- Done -->
-        <div class="status-box status-done" id="query-status-done">
-          <p style="margin:0">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
-                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
-                 style="display:inline;vertical-align:middle;margin-right:6px">
-              <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-              <polyline points="22 4 12 14.01 9 11.01"/>
-            </svg>
-            Query complete.
-          </p>
-          <small id="query-stats"></small>
-          <div class="download-group">
-            <a role="button" class="outline secondary" id="query-dl-matches" href="#" download="query.matches">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              .matches
-            </a>
-            <a role="button" class="outline secondary" id="query-dl-posteriors" href="#" download="query.posteriors">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              .posteriors
-            </a>
-            <a role="button" class="outline secondary" id="query-dl-props" href="#" download="query.props">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              .props
-            </a>
-            <a role="button" class="outline secondary" id="query-dl-aligns" href="#" download="query.aligns">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              .aligns
-            </a>
-          </div>
-          <pre id="query-log" style="display:none"></pre>
-        </div>
-
-        <!-- Error -->
-        <div class="status-box status-error" id="query-status-error">
-          <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
-               viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10"/>
-            <line x1="12" y1="8" x2="12" y2="12"/>
-            <line x1="12" y1="16" x2="12.01" y2="16"/>
-          </svg>
-          <p id="query-error-message" style="margin:0">An error occurred.</p>
-        </div>
-      </div>
-
-      <!-- Results section -->
-      <div id="query-results-section" style="display:none;margin-top:1.5rem">
-
-        <!-- Sub-tab nav -->
-        <div class="sub-tab-nav">
-          <button class="sub-tab-btn active" data-subtab="assignments">Assignments</button>
-          <button class="sub-tab-btn" data-subtab="abundances">Abundances</button>
-          <button class="sub-tab-btn" data-subtab="convergence">EM Convergence</button>
-        </div>
-
-        <!-- Assignments sub-tab -->
-        <div id="query-assignments-panel">
-          <div class="table-toolbar">
-            <div class="filter-row">
-              <div class="filter-wrap">
-                <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
-                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                </svg>
-                <input type="text" id="query-filter-read-id" class="filter-input"
-                       placeholder="Read ID regex…" autocomplete="off" spellcheck="false" />
-              </div>
-              <div class="filter-wrap">
-                <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
-                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                     stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                  <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                </svg>
-                <input type="text" id="query-filter-ref-id" class="filter-input"
-                       placeholder="Ref ID regex…" autocomplete="off" spellcheck="false" />
-              </div>
-            </div>
-            <div class="toolbar-bottom">
-              <span class="table-info" id="query-table-info"></span>
-              <label style="display:flex;align-items:center;gap:0.5rem;margin:0;font-size:.85rem">
-                Rows per page
-                <select id="query-rows-per-page" style="width:auto;margin:0">
-                  <option value="25">25</option>
-                  <option value="50" selected>50</option>
-                  <option value="100">100</option>
-                  <option value="250">250</option>
-                  <option value="500">500</option>
-                </select>
+          <!-- R1 + R2 reads -->
+          <div class="grid" style="margin-top:1rem">
+            <div>
+              <label for="query-r1-input">
+                R1 — forward <small>(.fastq / .gz)</small>
               </label>
+              <div class="dropzone dropzone-sm" id="query-r1-dropzone">
+                <input type="file" id="query-r1-input" accept=".fastq,.fq,.gz"
+                       aria-label="Upload R1 FASTQ" />
+                <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <p class="dropzone-label"><strong>Choose R1</strong> or drop</p>
+              </div>
+              <div class="file-chosen" id="query-r1-chosen">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span class="file-name" id="query-r1-name"></span>
+                <span class="file-size" id="query-r1-size"></span>
+              </div>
+              <p class="file-error" id="query-r1-error"></p>
+            </div>
+
+            <div>
+              <label for="query-r2-input">
+                R2 — reverse <small>(.fastq / .gz)</small>
+              </label>
+              <div class="dropzone dropzone-sm" id="query-r2-dropzone">
+                <input type="file" id="query-r2-input" accept=".fastq,.fq,.gz"
+                       aria-label="Upload R2 FASTQ" />
+                <svg class="dropzone-icon" xmlns="http://www.w3.org/2000/svg"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <p class="dropzone-label"><strong>Choose R2</strong> or drop</p>
+              </div>
+              <div class="file-chosen" id="query-r2-chosen">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                     viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                     stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                  <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                <span class="file-name" id="query-r2-name"></span>
+                <span class="file-size" id="query-r2-size"></span>
+              </div>
+              <p class="file-error" id="query-r2-error"></p>
             </div>
           </div>
-          <div class="result-table-wrap">
-            <table id="query-table"></table>
-          </div>
-          <div class="pagination" id="query-pagination"></div>
-        </div>
 
-        <!-- Abundances sub-tab -->
-        <div id="query-abundances-panel" style="display:none">
-          <div style="display:flex;gap:2rem;align-items:flex-start;flex-wrap:wrap;padding:0.5rem 0">
-            <div id="query-pie-wrap" style="position:relative;display:inline-block">
-              <svg id="query-pie" width="260" height="260"></svg>
-              <div id="pie-tooltip" class="pie-tooltip"></div>
+          <!-- Parameters row 1: mismatch, eps_1 -->
+          <div class="grid" style="margin-top:1rem">
+            <label for="query-mismatch">
+              Percent mismatch <small>(0–100)</small>
+              <input type="number" id="query-mismatch" value="5" min="0" max="100" step="0.1" />
+            </label>
+            <label for="query-eps1">
+              ε<sub>1</sub> <small>(min. likelihood)</small>
+              <input type="text" id="query-eps1" value="1e-32" />
+            </label>
+          </div>
+
+          <!-- Parameters row 2: iterations, threads -->
+          <div class="grid">
+            <label for="query-iter">
+              Iterations <small>(EM)</small>
+              <input type="number" id="query-iter" value="100" min="1" step="1" />
+            </label>
+            <label for="query-threads">
+              Threads <small>(0 = all)</small>
+              <input type="number" id="query-threads" value="0" min="0" step="1" />
+            </label>
+          </div>
+
+          <!-- Parameters row 3: rho, omega -->
+          <div class="grid">
+            <label for="query-rho">
+              ρ <small>(penalty weight)</small>
+              <input type="number" id="query-rho" value="20" min="0" step="any" />
+            </label>
+            <label for="query-omega">
+              ω <small>(penalty weight)</small>
+              <input type="number" id="query-omega" value="1e-20" min="0" step="any" />
+            </label>
+          </div>
+
+          <!-- Parameters row 4: eps_2, em_threshold -->
+          <div class="grid">
+            <label for="query-eps2">
+              ε<sub>2</sub> <small>(rel. likelihood)</small>
+              <input type="text" id="query-eps2" value="1e-18" />
+            </label>
+            <label for="query-em-threshold">
+              EM threshold <small>(convergence)</small>
+              <input type="text" id="query-em-threshold" value="1e-6" />
+            </label>
+          </div>
+
+          <!-- No-penalty checkbox -->
+          <label style="margin-top:0.5rem">
+            <input type="checkbox" id="query-no-penalty" />
+            Disable penalty (no regularization)
+          </label>
+
+          <button id="query-btn" disabled style="margin-top:1rem;width:100%">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="5 3 19 12 5 21 5 3"/>
+            </svg>
+            Run Query
+          </button>
+
+          <div class="status-area">
+            <!-- Error -->
+            <div class="status-box status-error" id="query-status-error">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              <p id="query-error-message" style="margin:0">An error occurred.</p>
             </div>
-            <ul class="pie-legend" id="query-pie-legend"></ul>
           </div>
-          <div style="margin-top:0.75rem">
-            <button class="outline secondary" onclick="downloadPiePng()">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Download PNG
-            </button>
-          </div>
-        </div>
+        </div><!-- /.query-form-col -->
 
-        <!-- EM Convergence sub-tab -->
-        <div id="query-convergence-panel" style="display:none">
-          <div id="convergence-chart-wrap" style="position:relative;display:inline-block;max-width:100%">
-            <svg id="query-convergence-chart"></svg>
-            <div id="convergence-tooltip" class="convergence-tooltip"></div>
-          </div>
-          <div style="margin-top:0.75rem">
-            <button class="outline secondary" onclick="downloadConvergencePng()">
-              <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Download PNG
-            </button>
-          </div>
-        </div>
+        <!-- ── RIGHT COLUMN: results ──────────────────────────────────── -->
+        <div class="query-results-col">
 
-      </div><!-- /#query-results-section -->
+          <!-- Running status -->
+          <div class="status-box status-running" id="query-status-running">
+            <div>
+              <div style="display:flex;align-items:center;gap:12px;margin-bottom:0.5rem">
+                <div class="spinner"></div>
+                <span id="query-progress-label">Preparing…</span>
+              </div>
+              <progress id="query-progress-bar" value="0" max="100"></progress>
+            </div>
+          </div>
+
+          <!-- Done status -->
+          <div class="status-box status-done" id="query-status-done">
+            <p style="margin:0">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                   viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"
+                   style="display:inline;vertical-align:middle;margin-right:6px">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                <polyline points="22 4 12 14.01 9 11.01"/>
+              </svg>
+              Query complete.
+            </p>
+            <small id="query-stats"></small>
+            <div class="download-group">
+              <a role="button" class="outline secondary" id="query-dl-matches" href="#" download="query.matches">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                .matches
+              </a>
+              <a role="button" class="outline secondary" id="query-dl-posteriors" href="#" download="query.posteriors">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                .posteriors
+              </a>
+              <a role="button" class="outline secondary" id="query-dl-props" href="#" download="query.props">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                .props
+              </a>
+              <a role="button" class="outline secondary" id="query-dl-aligns" href="#" download="query.aligns">
+                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                .aligns
+              </a>
+            </div>
+            <pre id="query-log" style="display:none"></pre>
+          </div>
+
+          <!-- Empty state placeholder -->
+          <div id="query-results-placeholder" class="results-placeholder">
+            <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"
+                 viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="1" stroke-linecap="round" stroke-linejoin="round"
+                 style="color:var(--pico-muted-color);margin-bottom:1rem">
+              <rect x="3" y="3" width="18" height="18" rx="2"/>
+              <line x1="3" y1="9" x2="21" y2="9"/>
+              <line x1="9" y1="21" x2="9" y2="9"/>
+            </svg>
+            <p style="margin:0;color:var(--pico-muted-color);font-size:0.9rem">
+              Results will appear here after running a query.
+            </p>
+          </div>
+
+          <!-- Results section (shown after query completes) -->
+          <div id="query-results-section" style="display:none">
+
+            <!-- Sub-tab nav -->
+            <div class="sub-tab-nav">
+              <button class="sub-tab-btn active" data-subtab="assignments">Assignments</button>
+              <button class="sub-tab-btn" data-subtab="abundances">Abundances</button>
+              <button class="sub-tab-btn" data-subtab="convergence">EM Convergence</button>
+            </div>
+
+            <!-- Assignments sub-tab -->
+            <div id="query-assignments-panel">
+              <div class="pagination" id="query-pagination-top"></div>
+              <div class="table-toolbar">
+                <div class="filter-row">
+                  <div class="filter-wrap">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
+                         viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <input type="text" id="query-filter-read-id" class="filter-input"
+                           placeholder="Read ID regex…" autocomplete="off" spellcheck="false" />
+                  </div>
+                  <div class="filter-wrap">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="13" height="13"
+                         viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                         stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                      <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <input type="text" id="query-filter-ref-id" class="filter-input"
+                           placeholder="Ref ID regex…" autocomplete="off" spellcheck="false" />
+                  </div>
+                </div>
+                <div class="toolbar-bottom">
+                  <span class="table-info" id="query-table-info"></span>
+                  <label style="display:flex;align-items:center;gap:0.5rem;margin:0;font-size:.85rem">
+                    Rows per page
+                    <select id="query-rows-per-page" style="width:auto;margin:0">
+                      <option value="25">25</option>
+                      <option value="50" selected>50</option>
+                      <option value="100">100</option>
+                      <option value="250">250</option>
+                      <option value="500">500</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+              <div class="result-table-wrap">
+                <table id="query-table"></table>
+              </div>
+              <div class="pagination" id="query-pagination"></div>
+            </div>
+
+            <!-- Abundances sub-tab -->
+            <div id="query-abundances-panel" style="display:none">
+              <div style="display:flex;gap:2rem;align-items:flex-start;flex-wrap:wrap;padding:0.5rem 0">
+                <div id="query-pie-wrap" style="position:relative;display:inline-block">
+                  <svg id="query-pie" width="260" height="260"></svg>
+                  <div id="pie-tooltip" class="pie-tooltip"></div>
+                </div>
+                <ul class="pie-legend" id="query-pie-legend"></ul>
+              </div>
+              <div style="margin-top:0.75rem">
+                <button class="outline secondary" onclick="downloadPiePng()">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  Download PNG
+                </button>
+              </div>
+            </div>
+
+            <!-- EM Convergence sub-tab -->
+            <div id="query-convergence-panel" style="display:none">
+              <div id="convergence-chart-wrap" style="position:relative;display:inline-block;max-width:100%">
+                <svg id="query-convergence-chart"></svg>
+                <div id="convergence-tooltip" class="convergence-tooltip"></div>
+              </div>
+              <div style="margin-top:0.75rem">
+                <button class="outline secondary" onclick="downloadConvergencePng()">
+                  <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                  Download PNG
+                </button>
+              </div>
+            </div>
+
+          </div><!-- /#query-results-section -->
+        </div><!-- /.query-results-col -->
+
+      </div><!-- /.query-layout -->
 
     </article>
   </section>

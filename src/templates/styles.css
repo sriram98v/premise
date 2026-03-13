@@ -5,24 +5,141 @@
   --mono: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace;
 }
 
+/* ── Nav bar ──────────────────────────────────────────────────────────── */
+header {
+  border-bottom: 1px solid var(--pico-form-element-border-color);
+  margin-bottom: 0;
+}
+
+nav.nav-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.55rem 1.25rem;
+  position: relative;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.2rem;
+  letter-spacing: 0.04em;
+  font-size: 1.05rem;
+}
+
+.nav-version {
+  font-size: 0.6rem;
+  color: var(--pico-muted-color);
+  font-weight: 400;
+  letter-spacing: 0;
+  vertical-align: super;
+  margin-left: 1px;
+}
+
+.nav-sep {
+  width: 1px;
+  height: 1.1em;
+  background: var(--pico-form-element-border-color);
+  flex-shrink: 0;
+}
+
+.nav-tabs {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: auto;
+}
+
 /* ── Nav-tab active state ─────────────────────────────────────────────── */
-nav a.nav-tab {
+a.nav-tab {
   text-decoration: none;
-  padding: 0.25rem 0.5rem;
+  padding: 0.25rem 0.6rem;
   border-bottom: 2px solid transparent;
   color: var(--pico-muted-color);
   transition: color 0.15s, border-color 0.15s;
 }
 
-nav a.nav-tab:hover {
+a.nav-tab:hover {
   color: var(--pico-primary);
   border-bottom-color: var(--pico-primary);
 }
 
-nav a.nav-tab.active {
+a.nav-tab.active {
   color: var(--pico-primary);
   border-bottom-color: var(--pico-primary);
   font-weight: 600;
+}
+
+/* ── Main content width ───────────────────────────────────────────────── */
+.main-content {
+  padding-inline: 0;
+}
+
+/* ── Query panel full-width override ─────────────────────────────────── */
+#panel-query {
+  width: 100%;
+}
+
+.query-article {
+  margin: 0;
+  border-radius: 0;
+  padding: 1.5rem 3rem;
+  max-width: none;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.query-layout {
+  display: grid;
+  grid-template-columns: 3fr 6fr;
+  gap: clamp(1.5rem, 3%, 2.5rem);
+  align-items: start;
+}
+
+.query-form-col {
+  /* left column — sticky so form stays in view while scrolling results */
+  position: sticky;
+  top: 1rem;
+}
+
+.query-results-col {
+  min-width: 0; /* prevent grid blowout with wide tables */
+}
+
+/* Results placeholder empty state */
+.results-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 4rem 2rem;
+  border: 2px dashed var(--pico-form-element-border-color);
+  border-radius: var(--pico-border-radius);
+  text-align: center;
+}
+
+/* Collapse to single column on narrow screens */
+@media (max-width: 900px) {
+  .query-article {
+    padding: 1rem;
+  }
+
+  .query-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .query-form-col {
+    position: static;
+  }
 }
 
 /* ── Tab panels show/hide ─────────────────────────────────────────────── */
@@ -362,6 +479,17 @@ nav a.nav-tab.active {
   border-top: none;
   border-radius: 0 0 var(--pico-border-radius) var(--pico-border-radius);
   flex-wrap: wrap;
+}
+
+/* Top pagination sits above the toolbar */
+#query-pagination-top {
+  border-top: 1px solid var(--pico-form-element-border-color);
+  border-bottom: none;
+  border-radius: var(--pico-border-radius) var(--pico-border-radius) 0 0;
+}
+
+#query-pagination-top:empty {
+  display: none;
 }
 
 .pg-btn {
