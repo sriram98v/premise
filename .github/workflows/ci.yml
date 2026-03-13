@@ -19,12 +19,6 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: premise
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: premise
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: premise
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: premise.exe
@@ -51,8 +45,6 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Run tests
-        # Cross-compiled aarch64 binaries can't run on x86_64 runners
-        if: matrix.target != 'aarch64-apple-darwin'
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Rename binary for upload
