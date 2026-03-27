@@ -24,8 +24,10 @@ use genedex::{FmIndexConfig, alphabet, FmIndexFlat64};
 use flate2::read::GzDecoder;
 use chrono::Local;
 use savefile::prelude::*;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tiny_http::{Server, Response, Header, StatusCode};
 use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 use std::cmp;
@@ -128,12 +130,54 @@ impl std::ops::DerefMut for MatchLikelihoods {
     fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReadAlignment{
+    full_match_ll: LogProb,
+    best_match_ll: LogProb,
+    pos: (usize, usize),
+    complement: bool,
+}
+
+impl ReadAlignment{
+    pub fn increment_full_match_ll(&mut self, match_prob: LogProb){
+        self.full_match_ll = LogProb::from(Prob(self.full_match_ll.exp() + match_prob.exp()));
+    }
+
+    pub fn update_best_match_ll(&mut self, match_ll: LogProb){
+        self.best_match_ll = match_ll;
+    }
+
+    pub fn update_pos(&mut self, pos: (usize, usize)){
+        self.pos = pos;
+    }
+
+    pub fn update_compl(&mut self, compl: bool){
+        self.complement = compl;
+    }
+
+    pub fn get_full_match_ll(&self)->LogProb{
+        self.full_match_ll
+    }
+
+    pub fn get_best_match_ll(&self)->LogProb{
+        self.best_match_ll
+    }
+
+    pub fn get_pos(&self)->(usize, usize){
+        self.pos
+    }
+
+    pub fn get_compl(&self)->bool{
+        self.complement
+    }
+}
+
 /// Collection of alignment likelihoods for all reads in a dataset.
 ///
 /// Maps each read ID (borrowed from the input slice) to its per-reference
 /// likelihood deques. The inner [`DashMap`] allows concurrent writes during
 /// parallel alignment.
-pub struct ReadAlignments<'a>(DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<LogProb>>>);
+pub struct ReadAlignments<'a>(DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<ReadAlignment>>>);
 
 impl<'a> ReadAlignments<'a> {
     /// Create an empty `ReadAlignments` map.
@@ -143,7 +187,7 @@ impl<'a> ReadAlignments<'a> {
 }
 
 impl<'a> std::ops::Deref for ReadAlignments<'a> {
-    type Target = DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<LogProb>>>;
+    type Target = DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<ReadAlignment>>>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
@@ -397,17 +441,24 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
 /// Sums the linear-space product of each (R1, R2_rc) alignment position pair where
 /// the R2 reverse-complement ends after the R1 start position (i.e. the pair is
 /// in a valid FR orientation), then returns the result in log space.
-fn merge_read_pairs(forward: &HashMap<usize, LogProb>, reverse: &HashMap<usize, LogProb>, read_len: usize) -> LogProb{
+fn merge_read_pairs(forward: &HashMap<usize, LogProb>, reverse: &HashMap<usize, LogProb>, read_len: usize) -> (LogProb, LogProb, (usize, usize)){
     let mut match_likelihood: EMProb = 0.0;
+    let mut best_alignment_likelihood: LogProb = LogProb(f64::NEG_INFINITY);
+    let mut best_alignment_positions: (usize, usize) = (0,0);
     for (r1_start, r1_log_prob) in forward.iter(){
         for (r2_rc_start, r2_log_prob) in reverse.iter(){
             let r2_rc_end = r2_rc_start + read_len;
             if r2_rc_end>*r1_start{
-                match_likelihood += (r1_log_prob+r2_log_prob).exp();
+                let align_ll = r1_log_prob+r2_log_prob;
+                if align_ll>best_alignment_likelihood{
+                    best_alignment_likelihood = align_ll;
+                    best_alignment_positions = (*r1_start, *r2_rc_start)
+                }
+                match_likelihood += (align_ll).exp();
             }
         }
     }
-    LogProb(match_likelihood.ln())
+    (LogProb(match_likelihood.ln()), best_alignment_likelihood, best_alignment_positions)
 }
 
 /// Align all read pairs against the FM-index in parallel and collect per-read likelihoods.
@@ -422,12 +473,18 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
                     read_pairs: &'a[ReadPair],
                     percent_mismatch: &EMProb,
                     eps_1: LogProb,
-                    eps_2: LogProb)-> Result<(ReadAlignments<'a>, DashSet<RefIdx>)>
+                    eps_2: LogProb,
+                    progress: Option<Arc<QueryProgress>>)-> Result<(ReadAlignments<'a>, DashSet<RefIdx>)>
 {
     let out_aligns = ReadAlignments::new();
 
     let pb = ProgressBar::with_draw_target(Some(read_pairs.len() as u64), ProgressDrawTarget::stderr());
     pb.set_style(ProgressStyle::with_template("Finding pairwise alignments: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta})").unwrap());
+
+    if let Some(ref p) = progress {
+        p.phase.store(1, Ordering::Relaxed);
+        p.reads_total.store(read_pairs.len() as u64, Ordering::Relaxed);
+    }
 
     let all_ref_ids: DashSet<RefIdx> = DashSet::new();
 
@@ -442,7 +499,7 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
             let r1_len = r1_rec.len();
             let r2_len = r2_rec.len();
 
-            let mut match_likelihoods: HashMap<RefIdx, LogProb> = HashMap::new();
+            let mut match_likelihoods: HashMap<RefIdx, ReadAlignment> = HashMap::new();
 
             let r1_match_likelihoods = query_read(fmidx, refs, r1_rec, percent_mismatch, false).unwrap();
             let r1_rc_match_likelihoods = query_read(fmidx, refs, r1_rec, percent_mismatch, true).unwrap();
@@ -450,23 +507,53 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
             let r2_match_likelihoods = query_read(fmidx, refs, r2_rec, percent_mismatch, false).unwrap();
             let r2_rc_match_likelihoods = query_read(fmidx, refs, r2_rec, percent_mismatch, true).unwrap();
 
-
             r1_match_likelihoods.keys().filter(|k| r2_rc_match_likelihoods.contains_key(k)).for_each(|x| {
-                let match_prob = half_log_prob + merge_read_pairs(r1_match_likelihoods.get(x).unwrap(), r2_rc_match_likelihoods.get(x).unwrap(), r2_len);
-                match_likelihoods.insert(*x, match_prob);
+                let (match_likelihood, best_align_ll, best_align_pos) = merge_read_pairs(r1_match_likelihoods.get(x).unwrap(), r2_rc_match_likelihoods.get(x).unwrap(), r2_len);
+                let match_prob = half_log_prob + match_likelihood;
+                let algn = ReadAlignment{
+                    full_match_ll: match_prob,
+                    best_match_ll: best_align_ll,
+                    pos: best_align_pos,
+                    complement: false,
+                };
+                match_likelihoods.insert(*x, algn);
             });
             
             r1_rc_match_likelihoods.keys().filter(|k| r2_match_likelihoods.contains_key(k)).for_each(|x| {
-                let match_prob = half_log_prob + merge_read_pairs(r2_match_likelihoods.get(x).unwrap(), r1_rc_match_likelihoods.get(x).unwrap(), r1_len);
-                match_likelihoods.entry(*x).and_modify(|v| *v = LogProb::from(Prob(v.exp() + match_prob.exp()))).or_insert(match_prob);
+                let (match_likelihood, best_align_ll, best_align_pos) = merge_read_pairs(r2_match_likelihoods.get(x).unwrap(), r1_rc_match_likelihoods.get(x).unwrap(), r1_len);
+                let match_prob = half_log_prob + match_likelihood;
+                match match_likelihoods.contains_key(x){
+                    true => {
+                        match_likelihoods.entry(*x).and_modify(|v| {
+                            v.increment_full_match_ll(match_prob);
+                            if best_align_ll>v.get_best_match_ll(){
+                                v.update_best_match_ll(best_align_ll);
+                                v.update_pos(best_align_pos);
+                                v.update_compl(true);
+                            }
+                        });
+                    },
+                    _ => {
+                        let algn = ReadAlignment{
+                            full_match_ll: match_prob,
+                            best_match_ll: best_align_ll,
+                            pos: best_align_pos,
+                            complement: false,
+                        };
+                        match_likelihoods.insert(*x, algn);
+                    },
+                };
             });
 
             let all_keys = match_likelihoods.keys().cloned().collect_vec();
             
             if match_likelihoods.len()>=1{
-                let max_likelihood = match_likelihoods.values().max_by(|a, b| a.total_cmp(&b)).unwrap().clone();
+                let max_likelihood = match_likelihoods.values()
+                    .max_by(|a, b| a.get_full_match_ll().total_cmp(&b.get_full_match_ll()))
+                    .unwrap()
+                    .clone().get_best_match_ll();
                 for k in all_keys.iter(){
-                    if *match_likelihoods.get(k).unwrap()<eps_1 || match_likelihoods.get(k).unwrap()-max_likelihood<=eps_2{
+                    if match_likelihoods.get(k).unwrap().get_full_match_ll()<eps_1 || match_likelihoods.get(k).unwrap().get_full_match_ll()-max_likelihood<=eps_2{
                         match_likelihoods.remove(k);
                     }
                 }
@@ -485,10 +572,13 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
 
                 });
             pb.inc(1);
+            if let Some(ref p) = progress {
+                p.reads_done.fetch_add(1, Ordering::Relaxed);
+            }
         });
 
     pb.finish_with_message("");
-    
+
     Ok((out_aligns, all_ref_ids))
 }
 
@@ -499,7 +589,7 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
 /// log-likelihood drops below 1e-6. Returns the per-read MAP assignments,
 /// the filtered proportion map, the final posterior weight matrix, and the
 /// data log-likelihood at each iteration.
-fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
+fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize, progress: Option<Arc<QueryProgress>>)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -626,8 +716,10 @@ fn get_proportions_par_sparse(ll_array: &SparseArray<EMProb>, num_iter: usize)->
             break;
         }
 
-
         pb.inc(1);
+        if let Some(ref p) = progress {
+            p.em_iter_done.store((i + 1) as u64, Ordering::Relaxed);
+        }
 
     }
     pb.finish_with_message(format!("Final data LL: {prev_data_loglikelihood}"));
@@ -717,7 +809,7 @@ fn _penalty(props: &HashMap<RefIdx, EMProb>, omega: EMProb)->EMProb{
 /// multiplier enforcing the simplex constraint is solved via Newton-Raphson at
 /// each M-step. Convergence is declared when the improvement in data
 /// log-likelihood is positive but ≤ `em_threshold` (after a 20-iteration burn-in).
-fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb, em_threshold: EMProb)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
+fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: usize, rho: EMProb, omega: EMProb, em_threshold: EMProb, progress: Option<Arc<QueryProgress>>)->(HashMap<ReadIdx, RefIdx>, HashMap<RefIdx, EMProb>, SparseArray<EMProb>, Vec<EMProb>){
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -739,6 +831,12 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
 
     for (ref_idx, count) in initial_props.into_iter(){
         props[0].insert(ref_idx, (count as EMProb)/(total as EMProb));
+    }
+
+    if let Some(ref p) = progress {
+        p.phase.store(2, Ordering::Relaxed);
+        p.em_iter_total.store(num_iter as u64, Ordering::Relaxed);
+        p.em_iter_done.store(0, Ordering::Relaxed);
     }
 
     let pb = ProgressBar::with_draw_target(Some(num_iter as u64), ProgressDrawTarget::stderr());
@@ -843,8 +941,10 @@ fn get_proportions_par_sparse_l1_reg(ll_array: &SparseArray<EMProb>, num_iter: u
             break;
         }
 
-
         pb.inc(1);
+        if let Some(ref p) = progress {
+            p.em_iter_done.store((i + 1) as u64, Ordering::Relaxed);
+        }
 
     }
     pb.finish_with_message(format!("Final data LL: {prev_data_loglikelihood}"));
@@ -954,6 +1054,53 @@ fn handle_api_build(mut request: tiny_http::Request) {
 ///
 /// When the GUI uploads files it receives a session ID; subsequent requests use
 /// that ID to locate the temporary directory containing the index and reads.
+/// Real-time progress counters for a running web query, exposed via `/api/query/progress`.
+///
+/// All fields use `AtomicU64` so rayon worker threads can update them without
+/// any mutex contention. Phase encoding: 0 = idle, 1 = aligning, 2 = EM, 3 = done.
+pub struct QueryProgress {
+    pub phase:          AtomicU64,
+    pub reads_done:     AtomicU64,
+    pub reads_total:    AtomicU64,
+    pub em_iter_done:   AtomicU64,
+    pub em_iter_total:  AtomicU64,
+    pub started_ms:     u64,
+}
+
+impl QueryProgress {
+    pub fn new() -> Self {
+        let started_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        Self {
+            phase:         AtomicU64::new(0),
+            reads_done:    AtomicU64::new(0),
+            reads_total:   AtomicU64::new(0),
+            em_iter_done:  AtomicU64::new(0),
+            em_iter_total: AtomicU64::new(0),
+            started_ms,
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let elapsed_ms = now_ms.saturating_sub(self.started_ms);
+        format!(
+            r#"{{"phase":{},"reads_done":{},"reads_total":{},"em_iter_done":{},"em_iter_total":{},"elapsed_ms":{}}}"#,
+            self.phase.load(Ordering::Relaxed),
+            self.reads_done.load(Ordering::Relaxed),
+            self.reads_total.load(Ordering::Relaxed),
+            self.em_iter_done.load(Ordering::Relaxed),
+            self.em_iter_total.load(Ordering::Relaxed),
+            elapsed_ms,
+        )
+    }
+}
+
 /// `r1_ext` and `r2_ext` record the file extensions of the uploaded reads so
 /// that the correct filenames can be reconstructed at run time.
 struct AlignSession {
@@ -1088,7 +1235,7 @@ fn run_alignment(
     println!("{}", log_str);
 
     let (out_alignments, _) = process_read_pairs(
-        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY), LogProb(eps_2.ln()),
+        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY), LogProb(eps_2.ln()), None,
     )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
@@ -1099,10 +1246,10 @@ fn run_alignment(
     }
 
 
-    let mut out = String::from("ReadID\tRefID\tProbability\n");
+    let mut out = String::from("ReadID\tRefID\tProbability\tForward Positions\tReverse Position\n");
     for read_id in &all_read_ids {
         if !out_alignments.contains_key(read_id) {
-            out.push_str(&format!("{}\tunclassified\t-\n", **read_id));
+            out.push_str(&format!("{}\tunclassified\t-\t-\t-\n", **read_id));
             continue;
         }
         let read_idx = *read_ids.get(read_id).unwrap();
@@ -1111,10 +1258,12 @@ fn run_alignment(
             let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
             for likelihood in aligns {
                 out.push_str(&format!(
-                    "{}\t{}\t{:.5e}\n",
+                    "{}\t{}\t{:.5e}\t{}\t{}\n",
                     ***read_ids_rev.get(&read_idx).unwrap(),
                     *ref_id,
-                    likelihood.exp(),
+                    likelihood.get_full_match_ll().exp(),
+                    likelihood.get_pos().0,
+                    likelihood.get_pos().1,
                 ));
             }
         }
@@ -1154,6 +1303,7 @@ fn run_query(
     em_threshold: EMProb,
     use_penalty: bool,
     threads: usize,
+    progress: Option<Arc<QueryProgress>>,
 ) -> Result<(String, String, String, String, Vec<EMProb>, String)> {
     let num_threads = if threads == 0 {
         thread::available_parallelism()?.get()
@@ -1195,7 +1345,7 @@ fn run_query(
     println!("{}", log_str);
 
     let (out_aligns, _all_refs) = process_read_pairs(
-        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(eps_1.ln()), LogProb(eps_2.ln()),
+        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(eps_1.ln()), LogProb(eps_2.ln()), progress.clone(),
     )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
@@ -1212,17 +1362,17 @@ fn run_query(
         for (ref_idx, positions) in alignments {
             let read_idx = read_ids.get(read_id).unwrap();
             for score in positions.iter() {
-                if score.exp().is_finite() && score.exp() != 0.0 {
-                    ll_array.insert(*read_idx, *ref_idx, score.exp() as EMProb);
+                if score.get_full_match_ll().exp().is_finite() && score.get_full_match_ll().exp() != 0.0 {
+                    ll_array.insert(*read_idx, *ref_idx, score.get_full_match_ll().exp() as EMProb);
                 }
             }
         }
     }
 
     let (read_assignments, props, posteriors, em_data_likelihoods) = if use_penalty {
-        get_proportions_par_sparse_l1_reg(&ll_array, num_iter, rho, omega, em_threshold)
+        get_proportions_par_sparse_l1_reg(&ll_array, num_iter, rho, omega, em_threshold, progress.clone())
     } else {
-        get_proportions_par_sparse(&ll_array, num_iter)
+        get_proportions_par_sparse(&ll_array, num_iter, progress.clone())
     };
 
     // Build props TSV (no header — just ref_id \t proportion)
@@ -1261,14 +1411,14 @@ fn run_query(
     }
 
     // Build matches TSV
-    let mut matches_tsv = String::from("ReadID\tRefID\tPosterior\n");
+    let mut matches_tsv = String::from("ReadID\tRefID\tPosterior\tForward Position\tReverse Position\n");
     for read_id in all_read_ids.iter() {
         let read_idx = read_ids.get(&read_id);
         if !out_aligns.contains_key(read_id)
             || read_idx.is_none()
             || !read_assignments.contains_key(read_idx.unwrap())
         {
-            matches_tsv.push_str(&format!("{}\tunclassified\t-\n", **read_id));
+            matches_tsv.push_str(&format!("{}\tunclassified\t-\t-\t-\n", **read_id));
             continue;
         }
         let ref_idx = read_assignments.get(read_idx.unwrap()).unwrap();
@@ -1279,14 +1429,18 @@ fn run_query(
             continue;
         }
 
+        let alignment = out_aligns.get(read_id).unwrap().get(ref_idx).unwrap()[0];
+
         if out_aligns.get(read_id).unwrap().get(ref_idx).unwrap().front().is_some()
             && ll_array.get(&(*read_idx.unwrap(), *ref_idx)).is_finite()
         {
             matches_tsv.push_str(&format!(
-                "{}\t{}\t{:.5e}\n",
+                "{}\t{}\t{:.5e}\t{}\t{}\n",
                 ***read_ids_rev.get(read_idx.unwrap()).unwrap(),
                 *ref_id.clone(),
                 posteriors.get(&(*read_idx.unwrap(), *ref_idx)),
+                alignment.get_pos().0,
+                alignment.get_pos().1,
             ));
         }
     }
@@ -1307,7 +1461,7 @@ fn run_query(
                     "{}\t{}\t{:.5e}\n",
                     ***read_ids_rev.get(&read_idx).unwrap(),
                     *ref_id,
-                    likelihood.exp(),
+                    likelihood.get_full_match_ll().exp(),
                 ));
             }
         }
@@ -1462,13 +1616,48 @@ fn json_escape(s: &str) -> String {
 /// session file paths, calls [`run_query`], and returns a JSON object containing
 /// `matches`, `posteriors`, `props`, `convergence` (array of per-iteration data
 /// log-likelihoods), and `log` fields.
-fn do_query_run(
-    request: &tiny_http::Request,
-    sessions: &HashMap<String, AlignSession>,
-) -> Result<String> {
+/// HTTP handler for `GET /api/query/progress`. Returns the current progress JSON
+/// for a running query session, or a zeroed state if the session is not found.
+fn handle_query_progress(
+    request: tiny_http::Request,
+    progress_map: &Arc<Mutex<HashMap<String, Arc<QueryProgress>>>>,
+) {
     let url = request.url().to_string();
     let qs = parse_qs(&url);
-    let session_id = qs.get("session").ok_or_else(|| anyhow::anyhow!("Missing session"))?;
+    let json = match qs.get("session") {
+        Some(sid) => {
+            let map = progress_map.lock().unwrap();
+            match map.get(sid) {
+                Some(p) => p.to_json(),
+                None => r#"{"phase":0,"reads_done":0,"reads_total":0,"em_iter_done":0,"em_iter_total":0,"elapsed_ms":0}"#.to_string(),
+            }
+        }
+        None => r#"{"phase":0,"reads_done":0,"reads_total":0,"em_iter_done":0,"em_iter_total":0,"elapsed_ms":0}"#.to_string(),
+    };
+    let ct = Header::from_bytes(b"Content-Type", b"application/json").unwrap();
+    let cors = Header::from_bytes(b"Access-Control-Allow-Origin", b"*").unwrap();
+    let _ = request.respond(Response::from_string(json).with_header(ct).with_header(cors));
+}
+
+/// HTTP handler for `POST /api/query/run`. Parses parameters, registers a progress
+/// entry, then runs the full query in a background thread so the server can serve
+/// concurrent `/api/query/progress` polls while the query executes.
+fn handle_query_run(
+    request: tiny_http::Request,
+    sessions: &HashMap<String, AlignSession>,
+    progress_map: Arc<Mutex<HashMap<String, Arc<QueryProgress>>>>,
+) {
+    let url = request.url().to_string();
+    let qs = parse_qs(&url);
+
+    let session_id = match qs.get("session") {
+        Some(s) => s.clone(),
+        None => {
+            let _ = request.respond(Response::from_string("Missing session").with_status_code(StatusCode(400)));
+            return;
+        }
+    };
+
     let mismatch: EMProb  = qs.get("mismatch").and_then(|s| s.parse().ok()).unwrap_or(5.0);
     let eps_1: EMProb     = qs.get("eps_1").and_then(|s| s.parse().ok()).unwrap_or(1e-32);
     let eps_2: EMProb     = qs.get("eps_2").and_then(|s| s.parse().ok()).unwrap_or(1e-18);
@@ -1480,56 +1669,59 @@ fn do_query_run(
     let use_penalty       = !no_penalty;
     let threads: usize    = qs.get("threads").and_then(|s| s.parse().ok()).unwrap_or(0);
 
-    let session = sessions
-        .get(session_id)
-        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
-
-    let r1_ext = session.r1_ext.as_deref().unwrap_or("fastq");
-    let r2_ext = session.r2_ext.as_deref().unwrap_or("fastq");
-
-    let ref_path = session.dir.join("index.fmidx");
-    let r1_path  = session.dir.join(format!("r1.{}", r1_ext));
-    let r2_path  = session.dir.join(format!("r2.{}", r2_ext));
-
-    let (matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, em_likelihoods, log_str) = run_query(
-        ref_path.to_str().unwrap(),
-        r1_path.to_str().unwrap(),
-        r2_path.to_str().unwrap(),
-        mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads,
-    )?;
-
-    let convergence_json = format!("[{}]",
-        em_likelihoods.iter()
-            .map(|v| if v.is_finite() { format!("{:.10e}", v) } else { "null".to_string() })
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-
-    Ok(format!(
-        r#"{{"ok":true,"matches":"{}","posteriors":"{}","props":"{}","aligns":"{}","convergence":{},"log":"{}"}}"#,
-        json_escape(&matches_tsv),
-        json_escape(&posteriors_tsv),
-        json_escape(&props_tsv),
-        json_escape(&aligns_tsv),
-        convergence_json,
-        json_escape(&log_str),
-    ))
-}
-
-/// HTTP handler for `POST /api/query/run`. Delegates to [`do_query_run`]
-/// and responds with JSON or a 500 error.
-fn handle_query_run(request: tiny_http::Request, sessions: &HashMap<String, AlignSession>) {
-    match do_query_run(&request, sessions) {
-        Ok(json) => {
-            let ct = Header::from_bytes(b"Content-Type", b"application/json").unwrap();
-            let _ = request.respond(Response::from_string(json).with_header(ct));
+    let session = match sessions.get(&session_id) {
+        Some(s) => s,
+        None => {
+            let _ = request.respond(Response::from_string(format!("Session not found: {}", session_id)).with_status_code(StatusCode(404)));
+            return;
         }
-        Err(e) => {
-            let _ = request.respond(
-                Response::from_string(e.to_string()).with_status_code(StatusCode(500)),
-            );
-        }
-    }
+    };
+
+    let r1_ext = session.r1_ext.as_deref().unwrap_or("fastq").to_string();
+    let r2_ext = session.r2_ext.as_deref().unwrap_or("fastq").to_string();
+    let ref_path = session.dir.join("index.fmidx").to_str().unwrap().to_string();
+    let r1_path  = session.dir.join(format!("r1.{}", r1_ext)).to_str().unwrap().to_string();
+    let r2_path  = session.dir.join(format!("r2.{}", r2_ext)).to_str().unwrap().to_string();
+
+    // Register fresh progress entry for this session
+    let progress = Arc::new(QueryProgress::new());
+    progress_map.lock().unwrap().insert(session_id.clone(), progress.clone());
+
+    // Run query in background thread; main server loop can serve progress polls
+    thread::spawn(move || {
+        let result = run_query(
+            &ref_path, &r1_path, &r2_path,
+            mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads,
+            Some(progress.clone()),
+        );
+
+        let json = match result {
+            Ok((matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, em_likelihoods, log_str)) => {
+                progress.phase.store(3, Ordering::Relaxed);
+                let convergence_json = format!("[{}]",
+                    em_likelihoods.iter()
+                        .map(|v| if v.is_finite() { format!("{:.10e}", v) } else { "null".to_string() })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                format!(
+                    r#"{{"ok":true,"matches":"{}","posteriors":"{}","props":"{}","aligns":"{}","convergence":{},"log":"{}"}}"#,
+                    json_escape(&matches_tsv),
+                    json_escape(&posteriors_tsv),
+                    json_escape(&props_tsv),
+                    json_escape(&aligns_tsv),
+                    convergence_json,
+                    json_escape(&log_str),
+                )
+            }
+            Err(e) => {
+                format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(&e.to_string()))
+            }
+        };
+
+        let ct = Header::from_bytes(b"Content-Type", b"application/json").unwrap();
+        let _ = request.respond(Response::from_string(json).with_header(ct));
+    });
 }
 
 fn main() -> Result<()>{
@@ -1720,7 +1912,7 @@ fn main() -> Result<()>{
             let now = Instant::now();
             let (matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, _, _) = run_query(
                 ref_file, r1_file, r2_file,
-                percent_mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads,
+                percent_mismatch, eps_1, eps_2, num_iter, rho, omega, em_threshold, use_penalty, threads, None,
             )?;
             std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
             std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())?;
@@ -1745,6 +1937,7 @@ fn main() -> Result<()>{
 
             let mut sessions: HashMap<String, AlignSession> = HashMap::new();
             let mut query_sessions: HashMap<String, AlignSession> = HashMap::new();
+            let progress_map: Arc<Mutex<HashMap<String, Arc<QueryProgress>>>> = Arc::new(Mutex::new(HashMap::new()));
 
             for request in server.incoming_requests() {
                 let url = request.url().to_string();
@@ -1769,7 +1962,10 @@ fn main() -> Result<()>{
                         handle_align_upload(request, &mut query_sessions);
                     }
                     (tiny_http::Method::Post, "/api/query/run") => {
-                        handle_query_run(request, &query_sessions);
+                        handle_query_run(request, &query_sessions, progress_map.clone());
+                    }
+                    (tiny_http::Method::Get, "/api/query/progress") => {
+                        handle_query_progress(request, &progress_map);
                     }
                     _ => {
                         let _ = request.respond(

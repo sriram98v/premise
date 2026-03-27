@@ -241,7 +241,7 @@ a.nav-tab.active {
 .status-running {
   background: var(--pico-primary-background);
   border: 1px solid var(--pico-primary-border);
-  color: var(--pico-primary);
+  color: var(--pico-color);
 }
 
 .status-done {
@@ -540,8 +540,8 @@ a.nav-tab.active {
 .checkbox-field label { margin-bottom: 0; font-weight: 400; }
 
 /* ── Pie chart & legend ────────────────────────────────────────────────── */
-#query-pie-wrap { position: relative; display: inline-block; }
-#query-pie { overflow: visible; display: block; }
+#query-pie-wrap { position: relative; display: block; width: 100%; }
+#query-pie { overflow: visible; display: block; width: 100%; height: auto; }
 
 .pie-legend {
   list-style: none;

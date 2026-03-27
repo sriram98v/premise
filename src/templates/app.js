@@ -509,43 +509,111 @@ setupDropzone('query-r2-dropzone', 'query-r2-input',
   'query-r2-error', f => validateFile(f, 'fastq'));
 
 // Query progress helpers
-let _qRaf = null;
-
 function setQueryProgress(pct, label) {
-  if (_qRaf) { cancelAnimationFrame(_qRaf); _qRaf = null; }
   const bar = document.getElementById('query-progress-bar');
   const lbl = document.getElementById('query-progress-label');
   if (bar) bar.style.width = pct + '%';
   if (lbl && label) lbl.textContent = label;
 }
 
-function animateQueryProgress(label, fromPct, targetPct = 92, halfTimeSec = 18) {
-  if (_qRaf) { cancelAnimationFrame(_qRaf); _qRaf = null; }
-  const bar   = document.getElementById('query-progress-bar');
-  const lbl   = document.getElementById('query-progress-label');
-  if (lbl && label) lbl.textContent = label;
-  const start = Date.now();
-  const range = targetPct - fromPct;
-  function tick() {
-    const t = (Date.now() - start) / 1000;
-    const p = fromPct + range * (1 - Math.exp(-t / halfTimeSec));
-    if (bar) bar.style.width = p.toFixed(1) + '%';
-    _qRaf = requestAnimationFrame(tick);
-  }
-  _qRaf = requestAnimationFrame(tick);
+function fmtEta(secs) {
+  if (secs == null || !isFinite(secs) || secs < 0) return '';
+  if (secs < 60) return `ETA ${Math.round(secs)}s`;
+  return `ETA ${Math.round(secs / 60)}m`;
 }
 
-// Upload a file to /api/query/upload
-async function uploadQueryFile(part, file, sessionId) {
-  const ext  = file.name.includes('.') ? file.name.split('.').pop() : 'fastq';
-  const sess = sessionId || 'new';
-  const res  = await fetch(
-    `/api/query/upload?part=${part}&session=${sess}&ext=${encodeURIComponent(ext)}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: file }
-  );
-  if (!res.ok) throw new Error(`Upload failed (${part}): ${await res.text()}`);
-  const data = await res.json();
-  return data.session;
+function fmtSpeed(bps) {
+  if (bps < 1024) return `${bps.toFixed(0)} B/s`;
+  if (bps < 1048576) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / 1048576).toFixed(1)} MB/s`;
+}
+
+// Upload a file to /api/query/upload with real upload-progress events
+function uploadQueryFileXHR(part, file, sessionId, pctStart, pctEnd) {
+  return new Promise((resolve, reject) => {
+    const ext  = file.name.includes('.') ? file.name.split('.').pop() : 'fastq';
+    const sess = sessionId || 'new';
+    const xhr  = new XMLHttpRequest();
+    xhr.open('POST', `/api/query/upload?part=${part}&session=${encodeURIComponent(sess)}&ext=${encodeURIComponent(ext)}`);
+    xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+    let lastLoaded = 0, lastTime = Date.now();
+
+    xhr.upload.onprogress = (e) => {
+      if (!e.lengthComputable) return;
+      const now   = Date.now();
+      const dt    = Math.max((now - lastTime) / 1000, 0.001);
+      const speed = (e.loaded - lastLoaded) / dt;
+      lastLoaded  = e.loaded;
+      lastTime    = now;
+      const frac  = e.loaded / e.total;
+      const pct   = pctStart + frac * (pctEnd - pctStart);
+      const remaining = e.total - e.loaded;
+      const eta   = speed > 0 ? remaining / speed : null;
+      const parts = [
+        `${fmtSize(e.loaded)} / ${fmtSize(e.total)}`,
+        `${fmtSpeed(speed)}`,
+      ];
+      if (eta != null) parts.push(fmtEta(eta));
+      setQueryProgress(pct, `Uploading ${part === 'index' ? 'index' : part.toUpperCase() + ' reads'}: ${parts.join(' · ')}`);
+    };
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        const data = JSON.parse(xhr.responseText);
+        setQueryProgress(pctEnd, `Uploaded ${part === 'index' ? 'index' : part.toUpperCase() + ' reads'}`);
+        resolve(data.session);
+      } else {
+        reject(new Error(`Upload failed (${part}): ${xhr.responseText}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error(`Upload failed (${part}): network error`));
+    xhr.send(file);
+  });
+}
+
+// Poll /api/query/progress until phase 3 (done)
+let _qPollTimer = null;
+
+function stopQueryPoll() {
+  if (_qPollTimer) { clearTimeout(_qPollTimer); _qPollTimer = null; }
+}
+
+function startQueryPoll(sessionId, onDone) {
+  stopQueryPoll();
+  function poll() {
+    fetch(`/api/query/progress?session=${encodeURIComponent(sessionId)}`)
+      .then(r => r.json())
+      .then(p => {
+        if (p.phase === 3) { onDone(); return; }
+        if (p.phase === 1) {
+          const done = p.reads_done, total = p.reads_total;
+          const pct  = 30 + (total > 0 ? (done / total) * 45 : 0);
+          let label  = 'Aligning reads…';
+          if (total > 0) {
+            const elapsed = p.elapsed_ms / 1000;
+            const rate    = elapsed > 0 ? done / elapsed : 0;
+            const eta     = rate > 0 && done < total ? (total - done) / rate : null;
+            label = `Aligning reads: ${done.toLocaleString()} / ${total.toLocaleString()}${eta != null ? ' · ' + fmtEta(eta) : ''}`;
+          }
+          setQueryProgress(pct, label);
+        } else if (p.phase === 2) {
+          const done = p.em_iter_done, total = p.em_iter_total;
+          const pct  = 75 + (total > 0 ? (done / total) * 20 : 0);
+          let label  = 'Running EM…';
+          if (total > 0) {
+            const elapsed = p.elapsed_ms / 1000;
+            const rate    = elapsed > 0 ? done / elapsed : 0;
+            const eta     = rate > 0 && done < total ? (total - done) / rate : null;
+            label = `EM iteration: ${done} / ${total}${eta != null ? ' · ' + fmtEta(eta) : ''}`;
+          }
+          setQueryProgress(pct, label);
+        }
+        _qPollTimer = setTimeout(poll, 400);
+      })
+      .catch(() => { _qPollTimer = setTimeout(poll, 1000); });
+  }
+  poll();
 }
 
 // ── Query table state ───────────────────────────────────────────────────────
@@ -772,7 +840,9 @@ function renderQueryPie(tsv) {
   data.forEach(d => { d.proportion /= total; });
   data.sort((a, b) => b.proportion - a.proportion);
 
-  const W = 260, H = 260, R = 110;
+  const W = wrap.clientWidth || 260;
+  const H = W;
+  const R = W / 2 * 0.85;
 
   // Resolve CSS vars for PNG-safe colours
   const cs    = getComputedStyle(document.documentElement);
@@ -792,7 +862,7 @@ function renderQueryPie(tsv) {
 
   const pie  = d3.pie().value(d => d.proportion).sort(null);
   const arc  = d3.arc().innerRadius(0).outerRadius(R);
-  const arcH = d3.arc().innerRadius(0).outerRadius(R + 8); // hover expand
+  const arcH = d3.arc().innerRadius(0).outerRadius(R + R * 0.06); // hover expand
 
   // Tooltip div
   const tip = document.getElementById('pie-tooltip');
@@ -1118,15 +1188,11 @@ document.getElementById('query-btn').addEventListener('click', async () => {
 
   try {
     setQueryProgress(0, 'Uploading index…');
-    querySession = await uploadQueryFile('index', queryFiles.index, 'new');
+    querySession = await uploadQueryFileXHR('index', queryFiles.index, 'new', 0, 10);
+    querySession = await uploadQueryFileXHR('r1',    queryFiles.r1,    querySession, 10, 20);
+    querySession = await uploadQueryFileXHR('r2',    queryFiles.r2,    querySession, 20, 30);
 
-    setQueryProgress(10, 'Uploading R1 reads…');
-    querySession = await uploadQueryFile('r1', queryFiles.r1, querySession);
-
-    setQueryProgress(20, 'Uploading R2 reads…');
-    querySession = await uploadQueryFile('r2', queryFiles.r2, querySession);
-
-    animateQueryProgress('Running EM classification…', 20);
+    setQueryProgress(30, 'Starting query…');
 
     const mismatch  = document.getElementById('query-mismatch').value  || '5';
     const eps1      = document.getElementById('query-eps1').value      || '1e-32';
@@ -1138,16 +1204,20 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     const emThreshold = document.getElementById('query-em-threshold').value  || '1e-6';
     const noPenalty   = document.getElementById('query-no-penalty').checked;
 
+    // Start polling progress in the background while the query runs
+    startQueryPoll(querySession, () => {});
+
     const res = await fetch(
       `/api/query/run?session=${querySession}&mismatch=${mismatch}&eps_1=${eps1}` +
       `&iter=${iter}&threads=${threads}&rho=${rho}&omega=${omega}&eps_2=${eps2}` +
       `&em_threshold=${emThreshold}&no_penalty=${noPenalty}`,
       { method: 'POST' }
     );
+    stopQueryPoll();
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Query failed');
 
-    if (_qRaf) { cancelAnimationFrame(_qRaf); _qRaf = null; }
     setQueryProgress(100, 'Done!');
 
     // Blob URLs
@@ -1195,8 +1265,8 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     document.getElementById('query-error-message').textContent = err.message;
     setStatus('query', 'error');
   } finally {
+    stopQueryPoll();
     document.getElementById('query-btn').disabled = false;
-    if (_qRaf) { cancelAnimationFrame(_qRaf); _qRaf = null; }
   }
 });
 
