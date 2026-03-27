@@ -347,7 +347,9 @@
                 <div class="spinner"></div>
                 <span id="query-progress-label">Preparing…</span>
               </div>
-              <progress id="query-progress-bar" value="0" max="100"></progress>
+              <div class="progress-track">
+                <div class="progress-fill" id="query-progress-bar"></div>
+              </div>
             </div>
           </div>
 
@@ -456,13 +458,12 @@
 
             <!-- Abundances sub-tab -->
             <div id="query-abundances-panel" style="display:none">
-              <div style="display:flex;gap:2rem;align-items:flex-start;flex-wrap:wrap;padding:0.5rem 0">
-                <div id="query-pie-wrap" style="position:relative;display:inline-block">
-                  <svg id="query-pie" width="260" height="260"></svg>
-                  <div id="pie-tooltip" class="pie-tooltip"></div>
-                </div>
-                <ul class="pie-legend" id="query-pie-legend"></ul>
+              <div id="query-pie-wrap">
+                <svg id="query-pie"></svg>
+                <div id="pie-tooltip" class="pie-tooltip"></div>
               </div>
+              <ul class="pie-legend" id="query-pie-legend" style="margin-top:1rem"></ul>
+              <div>
               <div style="margin-top:0.75rem">
                 <button class="outline secondary" onclick="downloadPiePng()">
                   <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
