@@ -315,17 +315,23 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T>{
 
 /// Merge overlapping or consecutive MEM seeds into a single, extended MEM.
 ///
-/// Iterates the sorted deque and attempts to absorb each seed into a running
+/// Iterates the deque and attempts to absorb each seed into an existing running
 /// MEM if it is both consecutive and overlapping with it; otherwise starts a
-/// new running MEM.
+/// new MEM for that seed.  This ensures seeds at distinct alignment offsets
+/// each produce their own MEM rather than being silently dropped.
 fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
-    let mut out_vec = Vec::with_capacity(kmer_matches.len());
-    out_vec.push(kmer_matches[0]);
+    let mut out_vec: Vec<MEMPos> = Vec::with_capacity(kmer_matches.len());
     for kmer_match in kmer_matches{
-        for running_mem in out_vec.iter_mut(){
+        let merged = out_vec.iter_mut().any(|running_mem| {
             if running_mem.is_consecutive(kmer_match) && running_mem.is_overlapping(kmer_match){
-                    running_mem.merge(kmer_match);
+                running_mem.merge(kmer_match);
+                true
+            } else {
+                false
             }
+        });
+        if !merged {
+            out_vec.push(*kmer_match);
         }
     }
 
@@ -342,17 +348,22 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
     };
     let kmer_size = kmer_length(read_seq.len(), *percent_mismatch);
 
-    fmidx.locate_many(
-        read_seq.windows(kmer_size).filter(|kmer| {
-                let read_alphabet = Alphabet::new(*kmer);
-                let dna_alphabet = alphabets::dna::alphabet();
-
-                read_alphabet.intersection(&dna_alphabet)==read_alphabet
-            })
-        )
-        .zip(record.seq().windows(kmer_size))
+    // Enumerate before filter so kmer_start_read reflects the actual position in the read,
+    // not the count of non-N kmers seen so far.
+    let valid_kmers: Vec<(usize, Vec<u8>)> = read_seq
+        .windows(kmer_size)
         .enumerate()
-        .for_each(|(kmer_start_read, (hits, _read_kmer))| {
+        .filter(|(_, kmer)| {
+            let read_alphabet = Alphabet::new(*kmer);
+            let dna_alphabet = alphabets::dna::alphabet();
+            read_alphabet.intersection(&dna_alphabet) == read_alphabet
+        })
+        .map(|(i, kmer)| (i, kmer.to_vec()))
+        .collect();
+
+    fmidx.locate_many(valid_kmers.iter().map(|(_, kmer)| kmer.as_slice()))
+        .zip(valid_kmers.iter())
+        .for_each(|(hits, (kmer_start_read, _kmer))| {
 
             hits.into_iter()
                 .for_each(|ref_entry| {
@@ -363,13 +374,13 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
                     mems.entry(seq_idx)
                         .or_default()
                         .push_back(
-                                MEMPos { ref_start: ref_start_pos_kmer, 
+                                MEMPos { ref_start: ref_start_pos_kmer,
                                     ref_end: ref_start_pos_kmer+kmer_size,
-                                    read_start: kmer_start_read, 
+                                    read_start: *kmer_start_read,
                                     read_end: kmer_start_read+kmer_size }
                         );
 
-                    if ref_start_pos_kmer>=kmer_start_read{
+                    if ref_start_pos_kmer>=*kmer_start_read{
                         // start position of alignment in reference for read
                         let align_start = ref_start_pos_kmer-kmer_start_read;
                         match_positions.entry(seq_idx).and_modify(|align_pos| {align_pos.insert(align_start);}).or_default().insert(align_start);
@@ -1981,4 +1992,195 @@ fn main() -> Result<()>{
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // Single-line version of the fixture ref_A sequence (185 bp).
+    const TEST_FASTA: &[u8] =
+        b">ref_A\nAGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCGATCGATCGAATCGATCGATCGAATCGATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAAT\n";
+
+    // ─── helpers ────────────────────────────────────────────────────────────────
+
+    fn build_test_index(fasta: &[u8]) -> IOFMIndex {
+        let (bytes, _) =
+            build_index_from_bytes(fasta).expect("build_index_from_bytes failed in test");
+        savefile::load_from_mem(&bytes, 0).expect("load_from_mem failed in test")
+    }
+
+    fn make_record(id: &str, seq: &[u8]) -> fastq::Record {
+        fastq::Record::with_attrs(id, None, seq, &vec![b'I'; seq.len()])
+    }
+
+    // ─── kmer_length sanity ──────────────────────────────────────────────────────
+
+    /// For a 50 bp read at 5 % mismatch: kmer_size = 50 / (2+1) = 16.
+    #[test]
+    fn kmer_size_for_50bp_at_5pct_is_16() {
+        assert_eq!(kmer_length(50, 5.0), 16);
+    }
+
+    // ─── Regression: no N characters ────────────────────────────────────────────
+
+    /// Baseline: exact-prefix read must produce at least one MEM at offset 0
+    /// (ref_start == read_start), which is the correct alignment position.
+    /// Additional MEMs at other offsets may also be present when the reference
+    /// is repetitive; that is now expected after the merge_kmer_matches fix.
+    #[test]
+    fn clean_kmer_matches_no_n_all_mems_have_zero_offset() {
+        let iofmidx = build_test_index(TEST_FASTA);
+        let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
+        let (_, mems) =
+            clean_kmer_matches(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false);
+
+        assert!(mems.contains_key(&RefIdx(0)), "expected alignment to ref_A");
+        assert!(
+            mems[&RefIdx(0)].iter().any(|m| m.ref_start == m.read_start),
+            "expected at least one MEM with ref_start == read_start (offset 0); \
+             got MEMs: {:?}",
+            mems[&RefIdx(0)]
+                .iter()
+                .map(|m| (m.ref_start, m.read_start))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ─── Bug tests: N-kmer filtering shifts enumerate() positions ────────────────
+
+    /// BUG: N at position 15, kmer_size=16.
+    ///
+    /// All kmers at positions 0-15 contain N and are filtered.  The first valid
+    /// kmer is at actual read position 16, but enumerate() (applied after filter)
+    /// assigns it index 0 → MEMPos.read_start = 0 → ref_pos = 16 - 0 = 16 (wrong).
+    ///
+    /// Correct behaviour: alignment at ref position 0.
+    /// Bug behaviour:     alignment at ref position 16, or read unaligned because
+    ///                    matching probability at that wrong position ≈ 0.
+    #[test]
+    fn query_read_n_at_15_produces_alignment_at_position_0() {
+        let iofmidx = build_test_index(TEST_FASTA);
+        // N replaces 'T' at position 15 of ref_A[0..50]
+        let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
+        let hits =
+            query_read(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false)
+                .expect("query_read failed");
+
+        let positions = hits.get(&RefIdx(0)).unwrap_or_else(|| {
+            panic!(
+                "no alignments to ref_A — N-filtering bug likely caused alignment \
+                 probability at the wrong position to underflow to 0"
+            )
+        });
+
+        assert!(
+            positions.contains_key(&0),
+            "expected alignment at ref position 0 (read = ref_A[0..50] with N at pos 15);\n\
+             got positions: {:?}\n\
+             BUG: enumerate() after filter indexed first valid kmer (actual pos 16) as 0, \
+             placing ref_pos at 16 instead of 0.",
+            positions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// BUG: N at position 25, kmer_size=16.
+    ///
+    /// Kmers at positions 10-25 are filtered.  Valid kmers before N (0-9) get
+    /// correct enumerate indices 0-9.  Valid kmers after N (26-34) get indices
+    /// 10-18 instead of 26-34, so ref_pos = 26 - 10 = 16 (wrong; correct is 0).
+    #[test]
+    fn query_read_n_at_25_produces_alignment_at_position_0() {
+        let iofmidx = build_test_index(TEST_FASTA);
+        // N replaces 'T' at position 25 of ref_A[0..50]
+        let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGANCGAATCGAATCGATCGATCGATCG");
+        let hits =
+            query_read(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false)
+                .expect("query_read failed");
+
+        let positions = hits
+            .get(&RefIdx(0))
+            .expect("expected at least one alignment to ref_A");
+
+        assert!(
+            positions.contains_key(&0),
+            "expected alignment at ref position 0; got positions: {:?}\n\
+             BUG: post-N kmers (26-34) got enumerate indices 10-18, producing a \
+             spurious hit at position 16 with no correct hit at position 0.",
+            positions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Debug helper — run with `cargo test debug_mem -- --nocapture` to see values.
+    ///
+    /// With bug:  offset = ref_start − read_start = 16.
+    /// After fix: offset = 0.
+    #[test]
+    fn debug_mem_positions_n_at_15() {
+        let iofmidx = build_test_index(TEST_FASTA);
+        let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
+        let (_, mems) =
+            clean_kmer_matches(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false);
+
+        if let Some(mem_list) = mems.get(&RefIdx(0)) {
+            for (i, mem) in mem_list.iter().enumerate() {
+                eprintln!(
+                    "[debug_mem] MEM[{}]: ref_start={} ref_end={} \
+                     read_start={} read_end={} offset(ref-read)={}",
+                    i, mem.ref_start, mem.ref_end,
+                    mem.read_start, mem.read_end,
+                    mem.ref_start as isize - mem.read_start as isize,
+                );
+            }
+        } else {
+            eprintln!("[debug_mem] No MEMs found for ref_A — alignment completely lost.");
+        }
+
+        let mems_for_ref = mems.get(&RefIdx(0)).expect("expected MEMs for ref_A");
+        assert!(
+            mems_for_ref.iter().any(|m| m.ref_start == m.read_start),
+            "BUG: no MEM with zero offset found.\n\
+             Expected at least one (ref_start == read_start) for a prefix read.\n\
+             Actual (ref_start, read_start) pairs: {:?}",
+            mems_for_ref
+                .iter()
+                .map(|m| (m.ref_start, m.read_start))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // ─── Complement path ─────────────────────────────────────────────────────────
+
+    /// BUG: the same enumerate() shift affects complement=true.
+    ///
+    /// read_seq = revcomp(record.seq()).  N at record position 34 → N at position
+    /// 50-1-34 = 15 of read_seq, triggering the same kmer-filtering shift.
+    #[test]
+    fn query_read_complement_n_at_record_pos_34_produces_alignment_at_zero() {
+        let iofmidx = build_test_index(TEST_FASTA);
+        let ref_a_prefix: &[u8] = b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG";
+        let rc = bio::alphabets::dna::revcomp(ref_a_prefix);
+        // N at record pos 34 → pos 15 of revcomp(record), triggering the bug.
+        let mut seq_with_n = rc.clone();
+        seq_with_n[34] = b'N';
+
+        let record = make_record("r_rc", &seq_with_n);
+        let hits =
+            query_read(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, true)
+                .expect("query_read (complement) failed");
+
+        let positions = hits.get(&RefIdx(0)).unwrap_or_else(|| {
+            panic!(
+                "no alignments to ref_A via complement path — N-filtering bug may have \
+                 caused alignment probability at the wrong position to underflow"
+            )
+        });
+
+        assert!(
+            positions.contains_key(&0),
+            "expected alignment at ref position 0 via complement path; \
+             got positions: {:?}\n\
+             BUG: same enumerate() shift applies in the complement path.",
+            positions.keys().collect::<Vec<_>>()
+        );
+    }
 }
