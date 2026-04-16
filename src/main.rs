@@ -20,23 +20,22 @@ use bio::io::fastq;
 use indicatif::ProgressStyle;
 use rayon::prelude::*;
 use anyhow::Result;
-use genedex::{FmIndexConfig, alphabet, FmIndexFlat64};
+use webgpu_fmidx::{FmIndex as WgpuFmIndex, FmIndexConfig as WgpuFmIndexConfig, DnaSequence};
+use webgpu_fmidx::alphabet::encode_char as wgpu_encode_char;
 use flate2::read::GzDecoder;
 use chrono::Local;
-use savefile::prelude::*;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tiny_http::{Server, Response, Header, StatusCode};
-use genedex::text_with_rank_support::{FlatTextWithRankSupport, Block64};
 use std::cmp;
 
 /// Newtype wrapper around a raw read identifier string.
 ///
 /// Used as a map key throughout the alignment and EM pipeline. `Deref`s to
 /// `String` for convenient string operations.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile, PartialOrd, Ord)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReadID(String);
 
 impl std::ops::Deref for ReadID {
@@ -51,7 +50,7 @@ impl std::ops::Deref for ReadID {
 ///
 /// Stored in the FM-index alongside sequence data and used to label output rows.
 /// `Deref`s to `String` for convenient string operations.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Savefile)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct RefID(String);
 
 impl std::ops::Deref for RefID {
@@ -65,7 +64,7 @@ impl std::ops::Deref for RefID {
 ///
 /// Indices are assigned in iteration order when reads are loaded and are stable
 /// for the lifetime of a single run. `Deref`s to `usize`.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Copy, Savefile)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Copy)]
 pub struct ReadIdx(usize);
 
 impl std::ops::Deref for ReadIdx {
@@ -80,7 +79,7 @@ impl std::ops::Deref for ReadIdx {
 ///
 /// Indices correspond to the order in which sequences appear in the FASTA file
 /// and are stored in the serialized FM-index. `Deref`s to `usize`.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Copy, Savefile)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Copy)]
 pub struct RefIdx(usize);
 
 impl std::ops::Deref for RefIdx {
@@ -92,15 +91,66 @@ impl std::ops::Deref for RefIdx {
 
 /// Serializable container for a built FM-index and its associated metadata.
 ///
-/// Bundles the raw [`FmIndexFlat64`] with bidirectional index↔ID mappings and
+/// Bundles the raw [`WgpuFmIndex`] with bidirectional index↔ID mappings and
 /// the original reference sequences, so that a single `.fmidx` file contains
 /// everything needed for alignment without re-reading the FASTA.
-#[derive(Savefile)]
-pub struct IOFMIndex{
-    fmidx: FmIndexFlat64<i64>,
+pub struct IOFMIndex {
+    fmidx: WgpuFmIndex,
     idx_to_id: HashMap<RefIdx, RefID>,
     id_to_idx: HashMap<RefID, RefIdx>,
-    idx_to_seq: HashMap<RefIdx, Vec<u8>>
+    idx_to_seq: HashMap<RefIdx, Vec<u8>>,
+    header_to_idx: HashMap<String, RefIdx>,
+}
+
+impl IOFMIndex {
+    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        let fmidx_bytes = self.fmidx.to_bytes()
+            .map_err(|e| anyhow::anyhow!("FmIndex serialize error: {}", e))?;
+        let idx_to_id: Vec<(usize, String)> = self.idx_to_id.iter()
+            .map(|(k, v)| (**k, v.0.clone()))
+            .collect();
+        let idx_to_seq: Vec<(usize, Vec<u8>)> = self.idx_to_seq.iter()
+            .map(|(k, v)| (**k, v.clone()))
+            .collect();
+        let fmidx_len = fmidx_bytes.len() as u64;
+        let mut out = Vec::new();
+        out.extend_from_slice(&fmidx_len.to_le_bytes());
+        out.extend_from_slice(&fmidx_bytes);
+        let rest = bincode::serialize(&(idx_to_id, idx_to_seq))
+            .map_err(|e| anyhow::anyhow!("bincode serialize error: {}", e))?;
+        out.extend_from_slice(&rest);
+        Ok(out)
+    }
+
+    fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
+        if data.len() < 8 {
+            return Err(anyhow::anyhow!("IOFMIndex data truncated"));
+        }
+        let fmidx_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
+        if data.len() < 8 + fmidx_len {
+            return Err(anyhow::anyhow!("IOFMIndex fmidx bytes truncated"));
+        }
+        let fmidx_bytes = &data[8..8 + fmidx_len];
+        let rest = &data[8 + fmidx_len..];
+        let fmidx = WgpuFmIndex::from_bytes(fmidx_bytes)
+            .map_err(|e| anyhow::anyhow!("FmIndex deserialize error: {}", e))?;
+        let (idx_to_id_vec, idx_to_seq_vec): (Vec<(usize, String)>, Vec<(usize, Vec<u8>)>) =
+            bincode::deserialize(rest)
+            .map_err(|e| anyhow::anyhow!("bincode deserialize error: {}", e))?;
+        let idx_to_id: HashMap<RefIdx, RefID> = idx_to_id_vec.into_iter()
+            .map(|(k, v)| (RefIdx(k), RefID(v)))
+            .collect();
+        let id_to_idx: HashMap<RefID, RefIdx> = idx_to_id.iter()
+            .map(|(k, v)| (v.clone(), *k))
+            .collect();
+        let idx_to_seq: HashMap<RefIdx, Vec<u8>> = idx_to_seq_vec.into_iter()
+            .map(|(k, v)| (RefIdx(k), v))
+            .collect();
+        let header_to_idx: HashMap<String, RefIdx> = idx_to_id.iter()
+            .map(|(k, v)| (v.0.clone(), *k))
+            .collect();
+        Ok(Self { fmidx, idx_to_id, id_to_idx, idx_to_seq, header_to_idx })
+    }
 }
 
 /// Floating-point type used for all EM probabilities and log-probabilities in linear space.
@@ -200,7 +250,7 @@ impl<'a> std::ops::DerefMut for ReadAlignments<'a> {
 /// All positions are 0-based and half-open (`start` inclusive, `end` exclusive).
 /// Multiple `MEMPos` values for the same read–reference pair are merged into
 /// longer alignments by [`merge_kmer_matches`].
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Savefile)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct MEMPos{
     pub ref_start: usize,
     pub ref_end: usize,
@@ -339,7 +389,7 @@ fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>)->Vec<MEMPos>{
 }
 
 /// Filters the matches found for different kmers and removes repeated alignments.
-fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
+fn clean_kmer_matches(fmidx: &WgpuFmIndex, header_to_ref: &HashMap<String, RefIdx>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->(HashMap<RefIdx, HashSet<usize>>, HashMap<RefIdx, Vec<MEMPos>>){
     let mut match_positions: HashMap<RefIdx, HashSet<usize>> = HashMap::new();
     let mut mems: HashMap<RefIdx, VecDeque<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a reference
     let read_seq = match complement {
@@ -361,34 +411,37 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
         .map(|(i, kmer)| (i, kmer.to_vec()))
         .collect();
 
-    fmidx.locate_many(valid_kmers.iter().map(|(_, kmer)| kmer.as_slice()))
-        .zip(valid_kmers.iter())
-        .for_each(|(hits, (kmer_start_read, _kmer))| {
+    for (kmer_start_read, kmer) in &valid_kmers {
+        let encoded: Vec<u8> = kmer.iter()
+            .filter_map(|&b| wgpu_encode_char(b as char))
+            .collect();
+        if encoded.len() != kmer.len() {
+            continue;
+        }
+        for (header, pos) in fmidx.locate(&encoded) {
+            let seq_idx = match header_to_ref.get(&header) {
+                Some(&idx) => idx,
+                None => continue,
+            };
+            let ref_start_pos_kmer = pos as usize;
+            let _seq = refs.get(&seq_idx).unwrap();
 
-            hits.into_iter()
-                .for_each(|ref_entry| {
-                    let seq_idx: RefIdx = RefIdx(ref_entry.text_id);
-                    let _seq = refs.get(&seq_idx).unwrap();
-                    let ref_start_pos_kmer = ref_entry.position;
+            mems.entry(seq_idx)
+                .or_default()
+                .push_back(MEMPos {
+                    ref_start: ref_start_pos_kmer,
+                    ref_end: ref_start_pos_kmer + kmer_size,
+                    read_start: *kmer_start_read,
+                    read_end: kmer_start_read + kmer_size,
+                });
 
-                    mems.entry(seq_idx)
-                        .or_default()
-                        .push_back(
-                                MEMPos { ref_start: ref_start_pos_kmer,
-                                    ref_end: ref_start_pos_kmer+kmer_size,
-                                    read_start: *kmer_start_read,
-                                    read_end: kmer_start_read+kmer_size }
-                        );
-
-                    if ref_start_pos_kmer>=*kmer_start_read{
-                        // start position of alignment in reference for read
-                        let align_start = ref_start_pos_kmer-kmer_start_read;
-                        match_positions.entry(seq_idx).and_modify(|align_pos| {align_pos.insert(align_start);}).or_default().insert(align_start);
-                    }
-
-
-                })
-        });
+            if ref_start_pos_kmer >= *kmer_start_read {
+                // start position of alignment in reference for read
+                let align_start = ref_start_pos_kmer - kmer_start_read;
+                match_positions.entry(seq_idx).and_modify(|align_pos| { align_pos.insert(align_start); }).or_default().insert(align_start);
+            }
+        }
+    }
     
     let merged_mems: HashMap<RefIdx, Vec<MEMPos>> = mems.into_iter().map(|(k, v)| (k, merge_kmer_matches(&v))).collect();
 
@@ -398,7 +451,7 @@ fn clean_kmer_matches(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)). 
-fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->Result<MatchLikelihoods>{
+fn query_read(fmidx: &WgpuFmIndex, header_to_ref: &HashMap<String, RefIdx>, refs: &HashMap<RefIdx, Vec<u8>>, record: &fastq::Record, percent_mismatch: &EMProb, complement: bool)->Result<MatchLikelihoods>{
 
     let read_len = record.seq().len();
     let read_seq = match complement {
@@ -412,7 +465,7 @@ fn query_read(fmidx: &FmIndexFlat64<i64>, refs: &HashMap<RefIdx, Vec<u8>>, recor
 
     let mut match_likelihood = MatchLikelihoods::new();
 
-    let (_other_matches, mems) = clean_kmer_matches(fmidx, refs, record, percent_mismatch, complement);
+    let (_other_matches, mems) = clean_kmer_matches(fmidx, header_to_ref, refs, record, percent_mismatch, complement);
     
     mems.into_iter().for_each(|hit| {
         let ref_id = hit.0;
@@ -479,7 +532,8 @@ fn merge_read_pairs(forward: &HashMap<usize, LogProb>, reverse: &HashMap<usize, 
 /// than `eps_2` log-units below the best alignment for that read are discarded.
 /// Returns a map of read ID → per-reference likelihood deques, and the set of all
 /// references that received at least one alignment.
-fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
+fn process_read_pairs<'a>(fmidx: &WgpuFmIndex,
+                    header_to_ref: &HashMap<String, RefIdx>,
                     refs: &HashMap<RefIdx, Vec<u8>>,
                     read_pairs: &'a[ReadPair],
                     percent_mismatch: &EMProb,
@@ -512,11 +566,11 @@ fn process_read_pairs<'a>(fmidx: &FmIndexFlat64<i64>,
 
             let mut match_likelihoods: HashMap<RefIdx, ReadAlignment> = HashMap::new();
 
-            let r1_match_likelihoods = query_read(fmidx, refs, r1_rec, percent_mismatch, false).unwrap();
-            let r1_rc_match_likelihoods = query_read(fmidx, refs, r1_rec, percent_mismatch, true).unwrap();
+            let r1_match_likelihoods = query_read(fmidx, header_to_ref, refs, r1_rec, percent_mismatch, false).unwrap();
+            let r1_rc_match_likelihoods = query_read(fmidx, header_to_ref, refs, r1_rec, percent_mismatch, true).unwrap();
 
-            let r2_match_likelihoods = query_read(fmidx, refs, r2_rec, percent_mismatch, false).unwrap();
-            let r2_rc_match_likelihoods = query_read(fmidx, refs, r2_rec, percent_mismatch, true).unwrap();
+            let r2_match_likelihoods = query_read(fmidx, header_to_ref, refs, r2_rec, percent_mismatch, false).unwrap();
+            let r2_rc_match_likelihoods = query_read(fmidx, header_to_ref, refs, r2_rec, percent_mismatch, true).unwrap();
 
             r1_match_likelihoods.keys().filter(|k| r2_rc_match_likelihoods.contains_key(k)).for_each(|x| {
                 let (match_likelihood, best_align_ll, best_align_pos) = merge_read_pairs(r1_match_likelihoods.get(x).unwrap(), r2_rc_match_likelihoods.get(x).unwrap(), r2_len);
@@ -1006,23 +1060,38 @@ fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
             );
     println!("{}", log_str);
 
-    let dna_alphabet = alphabet::ascii_dna_iupac_as_dna_with_n();
-    let fmidx: FmIndexFlat64<_> = FmIndexConfig::<i64, FlatTextWithRankSupport<i64, Block64>>::new()
-        .suffix_array_sampling_rate(1)
-        .lookup_table_depth(13)
-        .construct_index(
-            refs_texts.iter().map(|x| str::from_utf8(x).unwrap()).collect_vec(),
-            dna_alphabet,
-        );
+    let sequences: Vec<DnaSequence> = (0..refs_texts.len())
+        .map(|i| {
+            let header = ref_ids_rev.get(&RefIdx(i)).map(|id| id.0.as_str()).unwrap_or("");
+            let seq_str: String = str::from_utf8(&refs_texts[i]).unwrap()
+                .chars()
+                .map(|c| match c.to_ascii_uppercase() {
+                    'A' | 'C' | 'G' | 'T' | 'N' => c.to_ascii_uppercase(),
+                    _ => 'N',
+                })
+                .collect();
+            DnaSequence::from_str_with_header(&seq_str, header)
+                .expect("valid DNA sequence after IUPAC normalization")
+        })
+        .collect();
+
+    let config = WgpuFmIndexConfig { sa_sample_rate: 1, use_gpu: false };
+    let fmidx = WgpuFmIndex::build_cpu(&sequences, &config)
+        .map_err(|e| anyhow::anyhow!("FM-index construction error: {}", e))?;
+
+    let header_to_idx: HashMap<String, RefIdx> = ref_ids_rev.iter()
+        .map(|(k, v)| (v.0.clone(), *k))
+        .collect();
 
     let io_struct = IOFMIndex {
         fmidx,
         idx_to_id: ref_ids_rev,
         id_to_idx: ref_ids,
         idx_to_seq: refs,
+        header_to_idx,
     };
 
-    let bytes = save_to_mem(0, &io_struct).map_err(|e| anyhow::anyhow!("Serialization error: {}", e))?;
+    let bytes = io_struct.to_bytes()?;
     Ok((bytes, log_str))
 }
 
@@ -1232,10 +1301,12 @@ fn run_alignment(
     let all_read_ids: BTreeSet<ReadID> = forward_fastq_records.into_keys().collect();
     let num_reads = all_read_ids.len();
 
-    let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
+    let file_bytes = std::fs::read(ref_file)?;
+    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)?;
     let fmidx = iofmidx.fmidx;
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
+    let header_to_idx = iofmidx.header_to_idx;
 
     let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nEps_2: {:e}",
                 Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -1246,7 +1317,7 @@ fn run_alignment(
     println!("{}", log_str);
 
     let (out_alignments, _) = process_read_pairs(
-        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY), LogProb(eps_2.ln()), None,
+        &fmidx, &header_to_idx, &refs, &all_reads, &percent_mismatch, LogProb(f64::NEG_INFINITY), LogProb(eps_2.ln()), None,
     )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
@@ -1337,10 +1408,12 @@ fn run_query(
 
     let all_read_ids: BTreeSet<ReadID> = forward_fastq_records.into_keys().collect();
 
-    let iofmidx: IOFMIndex = load_file(ref_file, 0)?;
+    let file_bytes = std::fs::read(ref_file)?;
+    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)?;
     let fmidx = iofmidx.fmidx;
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
+    let header_to_idx = iofmidx.header_to_idx;
 
     let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -1356,7 +1429,7 @@ fn run_query(
     println!("{}", log_str);
 
     let (out_aligns, _all_refs) = process_read_pairs(
-        &fmidx, &refs, &all_reads, &percent_mismatch, LogProb(eps_1.ln()), LogProb(eps_2.ln()), progress.clone(),
+        &fmidx, &header_to_idx, &refs, &all_reads, &percent_mismatch, LogProb(eps_1.ln()), LogProb(eps_2.ln()), progress.clone(),
     )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
@@ -2006,7 +2079,7 @@ mod tests {
     fn build_test_index(fasta: &[u8]) -> IOFMIndex {
         let (bytes, _) =
             build_index_from_bytes(fasta).expect("build_index_from_bytes failed in test");
-        savefile::load_from_mem(&bytes, 0).expect("load_from_mem failed in test")
+        IOFMIndex::from_bytes(&bytes).expect("IOFMIndex::from_bytes failed in test")
     }
 
     fn make_record(id: &str, seq: &[u8]) -> fastq::Record {
@@ -2032,7 +2105,7 @@ mod tests {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let (_, mems) =
-            clean_kmer_matches(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false);
+            clean_kmer_matches(&iofmidx.fmidx, &iofmidx.header_to_idx, &iofmidx.idx_to_seq, &record, &5.0, false);
 
         assert!(mems.contains_key(&RefIdx(0)), "expected alignment to ref_A");
         assert!(
@@ -2063,7 +2136,7 @@ mod tests {
         // N replaces 'T' at position 15 of ref_A[0..50]
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let hits =
-            query_read(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false)
+            query_read(&iofmidx.fmidx, &iofmidx.header_to_idx, &iofmidx.idx_to_seq, &record, &5.0, false)
                 .expect("query_read failed");
 
         let positions = hits.get(&RefIdx(0)).unwrap_or_else(|| {
@@ -2094,7 +2167,7 @@ mod tests {
         // N replaces 'T' at position 25 of ref_A[0..50]
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGANCGAATCGAATCGATCGATCGATCG");
         let hits =
-            query_read(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false)
+            query_read(&iofmidx.fmidx, &iofmidx.header_to_idx, &iofmidx.idx_to_seq, &record, &5.0, false)
                 .expect("query_read failed");
 
         let positions = hits
@@ -2119,7 +2192,7 @@ mod tests {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let (_, mems) =
-            clean_kmer_matches(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, false);
+            clean_kmer_matches(&iofmidx.fmidx, &iofmidx.header_to_idx, &iofmidx.idx_to_seq, &record, &5.0, false);
 
         if let Some(mem_list) = mems.get(&RefIdx(0)) {
             for (i, mem) in mem_list.iter().enumerate() {
@@ -2165,7 +2238,7 @@ mod tests {
 
         let record = make_record("r_rc", &seq_with_n);
         let hits =
-            query_read(&iofmidx.fmidx, &iofmidx.idx_to_seq, &record, &5.0, true)
+            query_read(&iofmidx.fmidx, &iofmidx.header_to_idx, &iofmidx.idx_to_seq, &record, &5.0, true)
                 .expect("query_read (complement) failed");
 
         let positions = hits.get(&RefIdx(0)).unwrap_or_else(|| {
