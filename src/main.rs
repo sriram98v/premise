@@ -95,7 +95,6 @@ impl std::ops::Deref for RefIdx {
 pub struct IOFMIndex {
     fmidx: WgpuFmIndex,
     idx_to_id: HashMap<RefIdx, RefID>,
-    id_to_idx: HashMap<RefID, RefIdx>,
     idx_to_seq: HashMap<RefIdx, Vec<u8>>,
     header_to_idx: HashMap<String, RefIdx>,
 }
@@ -145,8 +144,6 @@ impl IOFMIndex {
             .into_iter()
             .map(|(k, v)| (RefIdx(k), RefID(v)))
             .collect();
-        let id_to_idx: HashMap<RefID, RefIdx> =
-            idx_to_id.iter().map(|(k, v)| (v.clone(), *k)).collect();
         let idx_to_seq: HashMap<RefIdx, Vec<u8>> = idx_to_seq_vec
             .into_iter()
             .map(|(k, v)| (RefIdx(k), v))
@@ -156,18 +153,11 @@ impl IOFMIndex {
         Ok(Self {
             fmidx,
             idx_to_id,
-            id_to_idx,
             idx_to_seq,
             header_to_idx,
         })
     }
 }
-
-/// Floating-point type used for all EM probabilities and log-probabilities in linear space.
-///
-/// Values in alignment likelihood maps are stored as raw `f64`; the [`bio::stats::LogProb`]
-/// newtype is used at boundaries where log-space arithmetic is required.
-type EMProb = f64;
 
 /// Per-read alignment likelihoods: maps each reference index to a map of
 /// alignment start positions → log-probability of the read originating from
@@ -1286,7 +1276,6 @@ fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     let io_struct = IOFMIndex {
         fmidx,
         idx_to_id: ref_ids_rev,
-        id_to_idx: ref_ids,
         idx_to_seq: refs,
         header_to_idx,
     };

@@ -28,6 +28,10 @@ savefile = "0.20.2"
 pollster = "0.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[features]
+# The 'gpu' feature enables the 'wgpu' dependency
+gpu = []
+
 [[bench]]
 name = "fmidx_comparison"
 harness = false

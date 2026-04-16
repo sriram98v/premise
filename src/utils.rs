@@ -5,7 +5,11 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::{fs, io::Write};
 
-use crate::EMProb;
+/// Floating-point type used for all EM probabilities and log-probabilities in linear space.
+///
+/// Values in alignment likelihood maps are stored as raw `f64`; the [`bio::stats::LogProb`]
+/// newtype is used at boundaries where log-space arithmetic is required.
+pub type EMProb = f64;
 
 /// Compute probability of match given ref is true source
 ///
