@@ -103,12 +103,6 @@ pub struct IOFMIndex{
     idx_to_seq: HashMap<RefIdx, Vec<u8>>
 }
 
-/// Floating-point type used for all EM probabilities and log-probabilities in linear space.
-///
-/// Values in alignment likelihood maps are stored as raw `f64`; the [`bio::stats::LogProb`]
-/// newtype is used at boundaries where log-space arithmetic is required.
-type EMProb = f64;
-
 /// Per-read alignment likelihoods: maps each reference index to a map of
 /// alignment start positions → log-probability of the read originating from
 /// that position on that reference.
