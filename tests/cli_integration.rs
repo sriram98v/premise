@@ -110,10 +110,7 @@ fn version_exits_zero() {
     let output = run(&["--version"]);
     assert_success(&output);
     let out = stdout(&output);
-    assert!(
-        !out.trim().is_empty(),
-        "expected non-empty version string"
-    );
+    assert!(!out.trim().is_empty(), "expected non-empty version string");
 }
 
 /// Invoking `premise` with no subcommand prints help and exits 0.
@@ -416,7 +413,10 @@ fn query_posteriors_file_has_data_rows() {
 
     let path = tmpdir.path().join("results.posteriors");
     let content = fs::read_to_string(&path).expect("could not read results.posteriors");
-    assert!(!content.trim().is_empty(), "posteriors file should not be empty");
+    assert!(
+        !content.trim().is_empty(),
+        "posteriors file should not be empty"
+    );
 }
 
 /// The stdout of `query` should mention the output prefix.
@@ -695,18 +695,28 @@ fn query_read_with_n_at_position_15_classified_as_ref_a() {
 
     let output = run(&[
         "query",
-        "-s", index.to_str().unwrap(),
-        "-1", r1.to_str().unwrap(),
-        "-2", r2.to_str().unwrap(),
-        "-p", "5",
-        "-o", outprefix.to_str().unwrap(),
-        "-t", "1",
-        "-i", "5",
+        "-s",
+        index.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+        "-p",
+        "5",
+        "-o",
+        outprefix.to_str().unwrap(),
+        "-t",
+        "1",
+        "-i",
+        "5",
     ]);
     assert_success(&output);
 
     let matches_path = tmpdir.path().join("results_n.matches");
-    assert!(matches_path.exists(), "expected results_n.matches to be created");
+    assert!(
+        matches_path.exists(),
+        "expected results_n.matches to be created"
+    );
 
     let content = fs::read_to_string(&matches_path)
         .unwrap_or_else(|_| panic!("could not read results_n.matches"));
@@ -740,13 +750,20 @@ fn query_read_with_n_forward_position_is_zero() {
 
     let output = run(&[
         "query",
-        "-s", index.to_str().unwrap(),
-        "-1", r1.to_str().unwrap(),
-        "-2", r2.to_str().unwrap(),
-        "-p", "5",
-        "-o", outprefix.to_str().unwrap(),
-        "-t", "1",
-        "-i", "5",
+        "-s",
+        index.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+        "-p",
+        "5",
+        "-o",
+        outprefix.to_str().unwrap(),
+        "-t",
+        "1",
+        "-i",
+        "5",
     ]);
     assert_success(&output);
 

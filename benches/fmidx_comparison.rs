@@ -5,11 +5,11 @@
 ///
 /// For GPU path:
 ///   cargo bench --bench fmidx_comparison -- gpu
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 // ── genedex backend ──────────────────────────────────────────────────────────
 use genedex::text_with_rank_support::{Block64, FlatTextWithRankSupport};
-use genedex::{FmIndexConfig, FmIndexFlat64, alphabet as genedex_alphabet};
+use genedex::{alphabet as genedex_alphabet, FmIndexConfig, FmIndexFlat64};
 
 // ── webgpu-fmidx backend ─────────────────────────────────────────────────────
 use webgpu_fmidx::alphabet::encode_char;
