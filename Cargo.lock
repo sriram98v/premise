@@ -1823,6 +1823,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "bio",
+ "bytemuck",
  "chrono",
  "clap",
  "criterion",
@@ -1839,6 +1840,7 @@ dependencies = [
  "tiny_http",
  "ureq",
  "webgpu-fmidx",
+ "wgpu",
 ]
 
 [[package]]

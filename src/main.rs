@@ -1,5 +1,7 @@
 extern crate clap;
 pub mod utils;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 use anyhow::Result;
 use bio::alphabets;
 use bio::alphabets::Alphabet;
@@ -231,6 +233,7 @@ impl ReadAlignment {
 /// Maps each read ID (borrowed from the input slice) to its per-reference
 /// likelihood deques. The inner [`DashMap`] allows concurrent writes during
 /// parallel alignment.
+#[derive(Debug)]
 pub struct ReadAlignments<'a>(DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<ReadAlignment>>>);
 
 impl<'a> ReadAlignments<'a> {
@@ -744,6 +747,9 @@ fn get_proportions_par_sparse(
     SparseArray<EMProb>,
     Vec<EMProb>,
 ) {
+    if ll_array.get_ref_idxs().is_empty() {
+        return (HashMap::new(), HashMap::new(), SparseArray::default(), Vec::new());
+    }
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -1027,6 +1033,9 @@ fn get_proportions_par_sparse_l1_reg(
     SparseArray<EMProb>,
     Vec<EMProb>,
 ) {
+    if ll_array.get_ref_idxs().is_empty() {
+        return (HashMap::new(), HashMap::new(), SparseArray::default(), Vec::new());
+    }
     let num_reads = ll_array.num_reads();
 
     let read_idxs = ll_array.get_read_idxs();
@@ -1495,6 +1504,7 @@ fn run_alignment(
     percent_mismatch: EMProb,
     eps_2: EMProb,
     threads: usize,
+    use_gpu: bool,
 ) -> Result<(String, String)> {
     let num_threads = if threads == 0 {
         thread::available_parallelism()?.get()
@@ -1540,16 +1550,46 @@ fn run_alignment(
     );
     println!("{}", log_str);
 
-    let (out_alignments, _) = process_read_pairs(
-        &fmidx,
-        &header_to_idx,
-        &refs,
-        &all_reads,
-        &percent_mismatch,
-        LogProb(f64::NEG_INFINITY),
-        LogProb(eps_2.ln()),
-        None,
-    )?;
+    #[cfg(feature = "gpu")]
+    let (out_alignments, _) = if use_gpu {
+        gpu::process::process_read_pairs_gpu(
+            &gpu::pipeline::GpuPipeline::new()?,
+            &fmidx,
+            &header_to_idx,
+            &refs,
+            &all_reads,
+            &percent_mismatch,
+            LogProb(f64::NEG_INFINITY),
+            LogProb(eps_2.ln()),
+        )?
+    } else {
+        process_read_pairs(
+            &fmidx,
+            &header_to_idx,
+            &refs,
+            &all_reads,
+            &percent_mismatch,
+            LogProb(f64::NEG_INFINITY),
+            LogProb(eps_2.ln()),
+            None,
+        )?
+    };
+    #[cfg(not(feature = "gpu"))]
+    let (out_alignments, _) = {
+        if use_gpu {
+            eprintln!("Warning: --gpu flag set but gpu feature not compiled in; falling back to CPU");
+        }
+        process_read_pairs(
+            &fmidx,
+            &header_to_idx,
+            &refs,
+            &all_reads,
+            &percent_mismatch,
+            LogProb(f64::NEG_INFINITY),
+            LogProb(eps_2.ln()),
+            None,
+        )?
+    };
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
     let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
@@ -1615,6 +1655,7 @@ fn run_query(
     em_threshold: EMProb,
     use_penalty: bool,
     threads: usize,
+    use_gpu: bool,
     progress: Option<Arc<QueryProgress>>,
 ) -> Result<(String, String, String, String, Vec<EMProb>, String)> {
     let num_threads = if threads == 0 {
@@ -1664,16 +1705,46 @@ fn run_query(
     );
     println!("{}", log_str);
 
-    let (out_aligns, _all_refs) = process_read_pairs(
-        &fmidx,
-        &header_to_idx,
-        &refs,
-        &all_reads,
-        &percent_mismatch,
-        LogProb(eps_1.ln()),
-        LogProb(eps_2.ln()),
-        progress.clone(),
-    )?;
+    #[cfg(feature = "gpu")]
+    let (out_aligns, _all_refs) = if use_gpu {
+        gpu::process::process_read_pairs_gpu(
+            &gpu::pipeline::GpuPipeline::new()?,
+            &fmidx,
+            &header_to_idx,
+            &refs,
+            &all_reads,
+            &percent_mismatch,
+            LogProb(eps_1.ln()),
+            LogProb(eps_2.ln()),
+        )?
+    } else {
+        process_read_pairs(
+            &fmidx,
+            &header_to_idx,
+            &refs,
+            &all_reads,
+            &percent_mismatch,
+            LogProb(eps_1.ln()),
+            LogProb(eps_2.ln()),
+            progress.clone(),
+        )?
+    };
+    #[cfg(not(feature = "gpu"))]
+    let (out_aligns, _all_refs) = {
+        if use_gpu {
+            eprintln!("Warning: --gpu flag set but gpu feature not compiled in; falling back to CPU");
+        }
+        process_read_pairs(
+            &fmidx,
+            &header_to_idx,
+            &refs,
+            &all_reads,
+            &percent_mismatch,
+            LogProb(eps_1.ln()),
+            LogProb(eps_2.ln()),
+            progress.clone(),
+        )?
+    };
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
     let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
@@ -1945,6 +2016,7 @@ fn do_align_run(
         mismatch,
         eps_2,
         threads,
+        false,
     )?;
     Ok(format!(
         r#"{{"ok":true,"tsv":"{}","log":"{}"}}"#,
@@ -2122,6 +2194,7 @@ fn handle_query_run(
             em_threshold,
             use_penalty,
             threads,
+            false,
             Some(progress.clone()),
         );
 
@@ -2225,6 +2298,11 @@ fn main() -> Result<()> {
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
                     )
+                .arg(Arg::new("gpu")
+                    .long("gpu")
+                    .help("Use GPU-accelerated alignment pipeline (requires gpu feature)")
+                    .num_args(0)
+                    .action(ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("query")
@@ -2282,6 +2360,11 @@ fn main() -> Result<()> {
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
                     )
+                .arg(Arg::new("gpu")
+                    .long("gpu")
+                    .help("Use GPU-accelerated alignment pipeline (requires gpu feature)")
+                    .num_args(0)
+                    .action(ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("server")
@@ -2334,10 +2417,11 @@ fn main() -> Result<()> {
             let eps_2 = *sub_m.get_one::<EMProb>("eps_2").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
+            let use_gpu = *sub_m.get_one::<bool>("gpu").unwrap_or(&false);
 
             let now = Instant::now();
             let (tsv, _) =
-                run_alignment(ref_file, r1_file, r2_file, percent_mismatch, eps_2, threads)?;
+                run_alignment(ref_file, r1_file, r2_file, percent_mismatch, eps_2, threads, use_gpu)?;
             std::fs::write(outfile, tsv.as_bytes())?;
             println!("Alignment written to {} ({:.2?})", outfile, now.elapsed());
         }
@@ -2360,6 +2444,7 @@ fn main() -> Result<()> {
             let use_penalty = *sub_m.get_one::<bool>("no-penalty").unwrap();
             let em_threshold = *sub_m.get_one::<EMProb>("em_threshold").expect("required");
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
+            let use_gpu = *sub_m.get_one::<bool>("gpu").unwrap_or(&false);
 
             let now = Instant::now();
             let (matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, _, _) = run_query(
@@ -2375,6 +2460,7 @@ fn main() -> Result<()> {
                 em_threshold,
                 use_penalty,
                 threads,
+                use_gpu,
                 None,
             )?;
             std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
