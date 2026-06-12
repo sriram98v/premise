@@ -36,13 +36,6 @@ pub fn compute_match_log_prob(
     LogProb(match_log_likelihood)
 }
 
-/// Compute minimum length of match required for a partial match.
-pub fn kmer_length(seq_len: usize, percent_mismatch: EMProb) -> usize {
-    let num_mismatches: usize =
-        (seq_len as EMProb * (percent_mismatch / 100 as EMProb)).floor() as usize;
-    seq_len / (num_mismatches + 1)
-}
-
 /// Count the number of positions at which `read_seq` and `ref_seq` differ.
 pub fn num_mismatches(read_seq: &[u8], ref_seq: &[u8]) -> usize {
     read_seq

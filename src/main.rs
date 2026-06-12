@@ -1,10 +1,6 @@
 extern crate clap;
 pub mod utils;
-#[cfg(feature = "gpu")]
-pub mod gpu;
 use anyhow::Result;
-use bio::alphabets;
-use bio::alphabets::Alphabet;
 use bio::bio_types::sequence::SequenceRead;
 use bio::io::fasta;
 use bio::io::fastq;
@@ -30,8 +26,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, fs::File, io::BufReader};
 use tiny_http::{Header, Response, Server, StatusCode};
 use utils::*;
-use webgpu_fmidx::alphabet::encode_char as wgpu_encode_char;
-use webgpu_fmidx::{DnaSequence, FmIndex as WgpuFmIndex, FmIndexConfig as WgpuFmIndexConfig};
+use webgpu_fmidx::alphabet::encode_char;
+use webgpu_fmidx::{DnaSequence, BidirFmIndex as RefIndex, FmIndexConfig as RefIndexConfig};
 
 /// Newtype wrapper around a raw read identifier string.
 ///
@@ -91,11 +87,11 @@ impl std::ops::Deref for RefIdx {
 
 /// Serializable container for a built FM-index and its associated metadata.
 ///
-/// Bundles the raw [`WgpuFmIndex`] with bidirectional index↔ID mappings and
+/// Bundles the raw [`RefIndex`] with bidirectional index↔ID mappings and
 /// the original reference sequences, so that a single `.fmidx` file contains
 /// everything needed for alignment without re-reading the FASTA.
 pub struct IOFMIndex {
-    fmidx: WgpuFmIndex,
+    fmidx: RefIndex,
     idx_to_id: HashMap<RefIdx, RefID>,
     idx_to_seq: HashMap<RefIdx, Vec<u8>>,
     header_to_idx: HashMap<String, RefIdx>,
@@ -137,7 +133,7 @@ impl IOFMIndex {
         }
         let fmidx_bytes = &data[8..8 + fmidx_len];
         let rest = &data[8 + fmidx_len..];
-        let fmidx = WgpuFmIndex::from_bytes(fmidx_bytes)
+        let fmidx = RefIndex::from_bytes(fmidx_bytes)
             .map_err(|e| anyhow::anyhow!("FmIndex deserialize error: {}", e))?;
         let (idx_to_id_vec, idx_to_seq_vec): (Vec<(usize, String)>, Vec<(usize, Vec<u8>)>) =
             bincode::deserialize(rest)
@@ -269,34 +265,6 @@ pub struct MEMPos {
     pub read_end: usize,
 }
 
-impl MEMPos {
-    /// Returns `true` if `kmer` starts at or after this MEM on both the read and reference,
-    /// indicating the two seeds could belong to the same collinear chain.
-    fn is_consecutive(&self, kmer: &MEMPos) -> bool {
-        if kmer.read_start >= self.read_start && kmer.ref_start >= self.ref_start {
-            return true;
-        }
-        false
-    }
-    /// Returns `true` if `kmer` overlaps this MEM with the same offset on both axes,
-    /// meaning the two seeds represent the same underlying alignment and can be merged.
-    fn is_overlapping(&self, kmer: &MEMPos) -> bool {
-        if kmer.read_start - self.read_start == kmer.ref_start - self.ref_start
-            && kmer.read_end - self.read_end == kmer.ref_end - self.ref_end
-        {
-            return true;
-        }
-        false
-    }
-    /// Extend this MEM to span the union of its coordinates and those of `kmer`.
-    fn merge(&mut self, kmer: &MEMPos) {
-        self.read_start = cmp::min(kmer.read_start, self.read_start);
-        self.read_end = cmp::max(kmer.read_end, self.read_end);
-        self.ref_start = cmp::min(kmer.ref_start, self.ref_start);
-        self.ref_end = cmp::max(kmer.ref_end, self.ref_end);
-    }
-}
-
 /// A matched pair of forward (R1) and reverse (R2) FASTQ records sharing a common read ID.
 ///
 /// Created by joining the R1 and R2 FASTQ files on read ID before alignment,
@@ -380,118 +348,51 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
     }
 }
 
-/// Merge overlapping or consecutive MEM seeds into a single, extended MEM.
-///
-/// Iterates the deque and attempts to absorb each seed into an existing running
-/// MEM if it is both consecutive and overlapping with it; otherwise starts a
-/// new MEM for that seed.  This ensures seeds at distinct alignment offsets
-/// each produce their own MEM rather than being silently dropped.
-fn merge_kmer_matches(kmer_matches: &VecDeque<MEMPos>) -> Vec<MEMPos> {
-    let mut out_vec: Vec<MEMPos> = Vec::with_capacity(kmer_matches.len());
-    for kmer_match in kmer_matches {
-        let merged = out_vec.iter_mut().any(|running_mem| {
-            if running_mem.is_consecutive(kmer_match) && running_mem.is_overlapping(kmer_match) {
-                running_mem.merge(kmer_match);
-                true
-            } else {
-                false
-            }
-        });
-        if !merged {
-            out_vec.push(*kmer_match);
-        }
-    }
-
-    out_vec
-}
-
 /// Filters the matches found for different kmers and removes repeated alignments.
-fn clean_kmer_matches(
-    fmidx: &WgpuFmIndex,
+fn clean_mem_matches(
+    fmidx: &RefIndex,
     header_to_ref: &HashMap<String, RefIdx>,
-    refs: &HashMap<RefIdx, Vec<u8>>,
     record: &fastq::Record,
-    percent_mismatch: &EMProb,
+    mem_seed_length: usize,
     complement: bool,
-) -> (
-    HashMap<RefIdx, HashSet<usize>>,
-    HashMap<RefIdx, Vec<MEMPos>>,
-) {
-    let mut match_positions: HashMap<RefIdx, HashSet<usize>> = HashMap::new();
-    let mut mems: HashMap<RefIdx, VecDeque<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a reference
+) -> HashMap<RefIdx, Vec<MEMPos>> {
+    let mut mems: HashMap<RefIdx, Vec<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a reference
     let read_seq = match complement {
         true => bio::alphabets::dna::revcomp(record.seq()),
         false => record.seq().to_vec(),
     };
-    let kmer_size = kmer_length(read_seq.len(), *percent_mismatch);
+    let q_seq = read_seq.iter()
+            .filter_map(|&b| encode_char(b as char))
+            .collect_vec();
 
-    // Enumerate before filter so kmer_start_read reflects the actual position in the read,
-    // not the count of non-N kmers seen so far.
-    let valid_kmers: Vec<(usize, Vec<u8>)> = read_seq
-        .windows(kmer_size)
-        .enumerate()
-        .filter(|(_, kmer)| {
-            let read_alphabet = Alphabet::new(*kmer);
-            let dna_alphabet = alphabets::dna::alphabet();
-            read_alphabet.intersection(&dna_alphabet) == read_alphabet
-        })
-        .map(|(i, kmer)| (i, kmer.to_vec()))
-        .collect();
 
-    for (kmer_start_read, kmer) in &valid_kmers {
-        let encoded: Vec<u8> = kmer
-            .iter()
-            .filter_map(|&b| wgpu_encode_char(b as char))
-            .collect();
-        if encoded.len() != kmer.len() {
-            continue;
-        }
-        for (header, pos) in fmidx.locate(&encoded) {
-            let seq_idx = match header_to_ref.get(&header) {
-                Some(&idx) => idx,
-                None => continue,
-            };
-            let ref_start_pos_kmer = pos as usize;
-            let _seq = refs.get(&seq_idx).unwrap();
+    let x = fmidx.find_mems(&q_seq, cmp::min(mem_seed_length, q_seq.len()), true);
 
-            mems.entry(seq_idx).or_default().push_back(MEMPos {
-                ref_start: ref_start_pos_kmer,
-                ref_end: ref_start_pos_kmer + kmer_size,
-                read_start: *kmer_start_read,
-                read_end: kmer_start_read + kmer_size,
-            });
+    // dbg!(record.id(), mem_seed_length, x.len());
 
-            if ref_start_pos_kmer >= *kmer_start_read {
-                // start position of alignment in reference for read
-                let align_start = ref_start_pos_kmer - kmer_start_read;
-                match_positions
-                    .entry(seq_idx)
-                    .and_modify(|align_pos| {
-                        align_pos.insert(align_start);
-                    })
-                    .or_default()
-                    .insert(align_start);
-            }
+    for i in x{
+        let q_start = i.query_start;
+        let q_end = i.query_end;
+        let q_len = q_end-q_start;
+        for j in &i.positions{
+            let ref_idx = header_to_ref[&j.0];
+            let pos = j.1 as usize;
+            mems.entry(ref_idx).or_default().push(MEMPos { ref_start: pos, ref_end: pos+q_len, read_start: q_start, read_end: q_end });
         }
     }
 
-    let merged_mems: HashMap<RefIdx, Vec<MEMPos>> = mems
-        .into_iter()
-        .map(|(k, v)| (k, merge_kmer_matches(&v)))
-        .collect();
-
-    (match_positions, merged_mems)
+    mems
 }
 
 /// Aligns a single read to each of the references
 /// Returns a pair of Hashmaps. The first maps the read to its best alignment to each reference (reference_name, (alignment_start_pos, likelihood of alignment)).
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)).
 fn query_read(
-    fmidx: &WgpuFmIndex,
+    fmidx: &RefIndex,
     header_to_ref: &HashMap<String, RefIdx>,
     refs: &HashMap<RefIdx, Vec<u8>>,
     record: &fastq::Record,
-    percent_mismatch: &EMProb,
+    mem_seed_length: usize,
     complement: bool,
 ) -> Result<MatchLikelihoods> {
     let read_len = record.seq().len();
@@ -506,12 +407,11 @@ fn query_read(
 
     let mut match_likelihood = MatchLikelihoods::new();
 
-    let (_other_matches, mems) = clean_kmer_matches(
+    let mems = clean_mem_matches(
         fmidx,
         header_to_ref,
-        refs,
         record,
-        percent_mismatch,
+        mem_seed_length,
         complement,
     );
 
@@ -589,11 +489,11 @@ fn merge_read_pairs(
 /// Returns a map of read ID → per-reference likelihood deques, and the set of all
 /// references that received at least one alignment.
 fn process_read_pairs<'a>(
-    fmidx: &WgpuFmIndex,
+    fmidx: &RefIndex,
     header_to_ref: &HashMap<String, RefIdx>,
     refs: &HashMap<RefIdx, Vec<u8>>,
     read_pairs: &'a [ReadPair],
-    percent_mismatch: &EMProb,
+    mem_seed_length: usize,
     eps_1: LogProb,
     eps_2: LogProb,
     progress: Option<Arc<QueryProgress>>,
@@ -626,14 +526,14 @@ fn process_read_pairs<'a>(
             let mut match_likelihoods: HashMap<RefIdx, ReadAlignment> = HashMap::new();
 
             let r1_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r1_rec, percent_mismatch, false).unwrap();
+                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, false).unwrap();
             let r1_rc_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r1_rec, percent_mismatch, true).unwrap();
+                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, true).unwrap();
 
             let r2_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r2_rec, percent_mismatch, false).unwrap();
+                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, false).unwrap();
             let r2_rc_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r2_rec, percent_mismatch, true).unwrap();
+                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, true).unwrap();
 
             r1_match_likelihoods
                 .keys()
@@ -1272,11 +1172,11 @@ fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
         })
         .collect();
 
-    let config = WgpuFmIndexConfig {
+    let config = RefIndexConfig {
         sa_sample_rate: 1,
         use_gpu: false,
     };
-    let fmidx = WgpuFmIndex::build_cpu(&sequences, &config)
+    let fmidx = RefIndex::build_cpu(&sequences, &config)
         .map_err(|e| anyhow::anyhow!("FM-index construction error: {}", e))?;
 
     let header_to_idx: HashMap<String, RefIdx> =
@@ -1501,10 +1401,9 @@ fn run_alignment(
     ref_file: &str,
     r1_file: &str,
     r2_file: &str,
-    percent_mismatch: EMProb,
+    mem_seed_length: usize,
     eps_2: EMProb,
     threads: usize,
-    use_gpu: bool,
 ) -> Result<(String, String)> {
     let num_threads = if threads == 0 {
         thread::available_parallelism()?.get()
@@ -1542,54 +1441,24 @@ fn run_alignment(
     let header_to_idx = iofmidx.header_to_idx;
 
     let log_str = format!(
-        "Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nEps_2: {:e}",
+        "Timestamp: {}\nNum Threads: {}\nMEM seed length: {}\nEps_2: {:e}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         num_threads,
-        percent_mismatch,
+        mem_seed_length,
         eps_2.exp(),
     );
     println!("{}", log_str);
 
-    #[cfg(feature = "gpu")]
-    let (out_alignments, _) = if use_gpu {
-        gpu::process::process_read_pairs_gpu(
-            &gpu::pipeline::GpuPipeline::new()?,
-            &fmidx,
-            &header_to_idx,
-            &refs,
-            &all_reads,
-            &percent_mismatch,
-            LogProb(f64::NEG_INFINITY),
-            LogProb(eps_2.ln()),
-        )?
-    } else {
-        process_read_pairs(
-            &fmidx,
-            &header_to_idx,
-            &refs,
-            &all_reads,
-            &percent_mismatch,
-            LogProb(f64::NEG_INFINITY),
-            LogProb(eps_2.ln()),
-            None,
-        )?
-    };
-    #[cfg(not(feature = "gpu"))]
-    let (out_alignments, _) = {
-        if use_gpu {
-            eprintln!("Warning: --gpu flag set but gpu feature not compiled in; falling back to CPU");
-        }
-        process_read_pairs(
-            &fmidx,
-            &header_to_idx,
-            &refs,
-            &all_reads,
-            &percent_mismatch,
-            LogProb(f64::NEG_INFINITY),
-            LogProb(eps_2.ln()),
-            None,
-        )?
-    };
+    let (out_alignments, _) = process_read_pairs(
+        &fmidx,
+        &header_to_idx,
+        &refs,
+        &all_reads,
+        mem_seed_length,
+        LogProb(f64::NEG_INFINITY),
+        LogProb(eps_2.ln()),
+        None,
+    )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
     let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
@@ -1646,7 +1515,7 @@ fn run_query(
     ref_file: &str,
     r1_file: &str,
     r2_file: &str,
-    percent_mismatch: EMProb,
+    mem_seed_length: usize,
     eps_1: EMProb,
     eps_2: EMProb,
     num_iter: usize,
@@ -1655,7 +1524,6 @@ fn run_query(
     em_threshold: EMProb,
     use_penalty: bool,
     threads: usize,
-    use_gpu: bool,
     progress: Option<Arc<QueryProgress>>,
 ) -> Result<(String, String, String, String, Vec<EMProb>, String)> {
     let num_threads = if threads == 0 {
@@ -1692,10 +1560,10 @@ fn run_query(
     let refs = iofmidx.idx_to_seq;
     let header_to_idx = iofmidx.header_to_idx;
 
-    let log_str = format!("Timestamp: {}\nNum Threads: {}\nPercent Mismatch: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}",
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nMEM seed length: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         num_threads,
-        percent_mismatch,
+        mem_seed_length,
         eps_1,
         eps_1.ln(),
         eps_2,
@@ -1705,46 +1573,16 @@ fn run_query(
     );
     println!("{}", log_str);
 
-    #[cfg(feature = "gpu")]
-    let (out_aligns, _all_refs) = if use_gpu {
-        gpu::process::process_read_pairs_gpu(
-            &gpu::pipeline::GpuPipeline::new()?,
-            &fmidx,
-            &header_to_idx,
-            &refs,
-            &all_reads,
-            &percent_mismatch,
-            LogProb(eps_1.ln()),
-            LogProb(eps_2.ln()),
-        )?
-    } else {
-        process_read_pairs(
-            &fmidx,
-            &header_to_idx,
-            &refs,
-            &all_reads,
-            &percent_mismatch,
-            LogProb(eps_1.ln()),
-            LogProb(eps_2.ln()),
-            progress.clone(),
-        )?
-    };
-    #[cfg(not(feature = "gpu"))]
-    let (out_aligns, _all_refs) = {
-        if use_gpu {
-            eprintln!("Warning: --gpu flag set but gpu feature not compiled in; falling back to CPU");
-        }
-        process_read_pairs(
-            &fmidx,
-            &header_to_idx,
-            &refs,
-            &all_reads,
-            &percent_mismatch,
-            LogProb(eps_1.ln()),
-            LogProb(eps_2.ln()),
-            progress.clone(),
-        )?
-    };
+    let (out_aligns, _all_refs) = process_read_pairs(
+        &fmidx,
+        &header_to_idx,
+        &refs,
+        &all_reads,
+        mem_seed_length,
+        LogProb(eps_1.ln()),
+        LogProb(eps_2.ln()),
+        progress.clone(),
+    )?;
 
     let mut read_ids: HashMap<&ReadID, ReadIdx> = HashMap::new();
     let mut read_ids_rev: HashMap<ReadIdx, &ReadID> = HashMap::new();
@@ -1976,7 +1814,7 @@ fn handle_align_upload(
 
 /// Parse query parameters and run pairwise alignment for an uploaded session.
 ///
-/// Reads `mismatch`, `eps_2`, and `threads` from the URL query string, resolves
+/// Reads `mem_seed_length`, `eps_2`, and `threads` from the URL query string, resolves
 /// the session's uploaded file paths, calls [`run_alignment`], and returns the
 /// result as a JSON object with `tsv` and `log` fields.
 fn do_align_run(
@@ -1988,10 +1826,10 @@ fn do_align_run(
     let session_id = qs
         .get("session")
         .ok_or_else(|| anyhow::anyhow!("Missing session"))?;
-    let mismatch: EMProb = qs
-        .get("mismatch")
+    let mem_seed_length: usize = qs
+        .get("mem_seed_length")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(22);
     let eps_2: EMProb = qs
         .get("eps_2")
         .and_then(|s| s.parse().ok())
@@ -2013,10 +1851,9 @@ fn do_align_run(
         ref_path.to_str().unwrap(),
         r1_path.to_str().unwrap(),
         r2_path.to_str().unwrap(),
-        mismatch,
+        mem_seed_length,
         eps_2,
         threads,
-        false,
     )?;
     Ok(format!(
         r#"{{"ok":true,"tsv":"{}","log":"{}"}}"#,
@@ -2061,7 +1898,7 @@ fn json_escape(s: &str) -> String {
 
 /// Parse query parameters and run the full PREMISE classification pipeline for an uploaded session.
 ///
-/// Reads all EM parameters (`mismatch`, `eps_1`, `eps_2`, `iter`, `rho`, `omega`,
+/// Reads all EM parameters (`mem_seed_length`, `eps_1`, `eps_2`, `iter`, `rho`, `omega`,
 /// `em_threshold`, `no_penalty`, `threads`) from the URL query string, resolves
 /// session file paths, calls [`run_query`], and returns a JSON object containing
 /// `matches`, `posteriors`, `props`, `convergence` (array of per-iteration data
@@ -2114,10 +1951,10 @@ fn handle_query_run(
         }
     };
 
-    let mismatch: EMProb = qs
-        .get("mismatch")
+    let mem_seed_length: usize = qs
+        .get("mem_seed_length")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5.0);
+        .unwrap_or(22);
     let eps_1: EMProb = qs
         .get("eps_1")
         .and_then(|s| s.parse().ok())
@@ -2185,7 +2022,7 @@ fn handle_query_run(
             &ref_path,
             &r1_path,
             &r2_path,
-            mismatch,
+            mem_seed_length,
             eps_1,
             eps_2,
             num_iter,
@@ -2194,7 +2031,6 @@ fn handle_query_run(
             em_threshold,
             use_penalty,
             threads,
-            false,
             Some(progress.clone()),
         );
 
@@ -2274,9 +2110,9 @@ fn main() -> Result<()> {
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
-                .arg(arg!(-p --percent_mismatch <PERCENT_MISMATCH>"Percent mismatch to reference sequences")
+                .arg(arg!(-m --mem-seed-length <MEM_SEED_LENGTH> "Minimum seed length for MEM")
                     .required(true)
-                    .value_parser(clap::value_parser!(EMProb))
+                    .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
                     .required(true)
@@ -2298,11 +2134,6 @@ fn main() -> Result<()> {
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
                     )
-                .arg(Arg::new("gpu")
-                    .long("gpu")
-                    .help("Use GPU-accelerated alignment pipeline (requires gpu feature)")
-                    .num_args(0)
-                    .action(ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("query")
@@ -2310,9 +2141,9 @@ fn main() -> Result<()> {
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
-                .arg(arg!(-p --percent_mismatch <PERCENT_MISMATCH>"Percent mismatch to reference sequences")
+                .arg(arg!(-l --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
                     .required(true)
-                    .value_parser(clap::value_parser!(EMProb))
+                    .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(--eps_1 <EPS_1>"Cutoff likelihood for dropping alignments")
                     .default_value("1e-32")
@@ -2360,11 +2191,6 @@ fn main() -> Result<()> {
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
                     )
-                .arg(Arg::new("gpu")
-                    .long("gpu")
-                    .help("Use GPU-accelerated alignment pipeline (requires gpu feature)")
-                    .num_args(0)
-                    .action(ArgAction::SetTrue))
         )
         .subcommand(
             Command::new("server")
@@ -2411,17 +2237,16 @@ fn main() -> Result<()> {
                 .as_str();
             let r1_file = sub_m.get_one::<String>("r1").expect("required").as_str();
             let r2_file = sub_m.get_one::<String>("r2").expect("required").as_str();
-            let percent_mismatch = *sub_m
-                .get_one::<EMProb>("percent_mismatch")
+            let mem_seed_length = *sub_m
+                .get_one::<usize>("mem_seed_length")
                 .expect("required");
             let eps_2 = *sub_m.get_one::<EMProb>("eps_2").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
-            let use_gpu = *sub_m.get_one::<bool>("gpu").unwrap_or(&false);
 
             let now = Instant::now();
             let (tsv, _) =
-                run_alignment(ref_file, r1_file, r2_file, percent_mismatch, eps_2, threads, use_gpu)?;
+                run_alignment(ref_file, r1_file, r2_file, mem_seed_length, eps_2, threads)?;
             std::fs::write(outfile, tsv.as_bytes())?;
             println!("Alignment written to {} ({:.2?})", outfile, now.elapsed());
         }
@@ -2433,8 +2258,8 @@ fn main() -> Result<()> {
             let r1_file = sub_m.get_one::<String>("r1").expect("required").as_str();
             let r2_file = sub_m.get_one::<String>("r2").expect("required").as_str();
             let num_iter = *sub_m.get_one::<usize>("iter").expect("required");
-            let percent_mismatch = *sub_m
-                .get_one::<EMProb>("percent_mismatch")
+            let mem_seed_length = *sub_m
+                .get_one::<usize>("mem")
                 .expect("required");
             let eps_1 = *sub_m.get_one::<EMProb>("eps_1").expect("required");
             let eps_2 = *sub_m.get_one::<EMProb>("eps_2").expect("required");
@@ -2444,14 +2269,13 @@ fn main() -> Result<()> {
             let use_penalty = *sub_m.get_one::<bool>("no-penalty").unwrap();
             let em_threshold = *sub_m.get_one::<EMProb>("em_threshold").expect("required");
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
-            let use_gpu = *sub_m.get_one::<bool>("gpu").unwrap_or(&false);
 
             let now = Instant::now();
             let (matches_tsv, posteriors_tsv, props_tsv, aligns_tsv, _, _) = run_query(
                 ref_file,
                 r1_file,
                 r2_file,
-                percent_mismatch,
+                mem_seed_length,
                 eps_1,
                 eps_2,
                 num_iter,
@@ -2460,7 +2284,6 @@ fn main() -> Result<()> {
                 em_threshold,
                 use_penalty,
                 threads,
-                use_gpu,
                 None,
             )?;
             std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
@@ -2557,14 +2380,6 @@ mod tests {
         fastq::Record::with_attrs(id, None, seq, &vec![b'I'; seq.len()])
     }
 
-    // ─── kmer_length sanity ──────────────────────────────────────────────────────
-
-    /// For a 50 bp read at 5 % mismatch: kmer_size = 50 / (2+1) = 16.
-    #[test]
-    fn kmer_size_for_50bp_at_5pct_is_16() {
-        assert_eq!(kmer_length(50, 5.0), 16);
-    }
-
     // ─── Regression: no N characters ────────────────────────────────────────────
 
     /// Baseline: exact-prefix read must produce at least one MEM at offset 0
@@ -2575,12 +2390,11 @@ mod tests {
     fn clean_kmer_matches_no_n_all_mems_have_zero_offset() {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
-        let (_, mems) = clean_kmer_matches(
+        let mems = clean_mem_matches(
             &iofmidx.fmidx,
             &iofmidx.header_to_idx,
-            &iofmidx.idx_to_seq,
             &record,
-            &5.0,
+            5,
             false,
         );
 
@@ -2617,7 +2431,7 @@ mod tests {
             &iofmidx.header_to_idx,
             &iofmidx.idx_to_seq,
             &record,
-            &5.0,
+            5,
             false,
         )
         .expect("query_read failed");
@@ -2654,7 +2468,7 @@ mod tests {
             &iofmidx.header_to_idx,
             &iofmidx.idx_to_seq,
             &record,
-            &5.0,
+            5,
             false,
         )
         .expect("query_read failed");
@@ -2680,12 +2494,11 @@ mod tests {
     fn debug_mem_positions_n_at_15() {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
-        let (_, mems) = clean_kmer_matches(
+        let mems = clean_mem_matches(
             &iofmidx.fmidx,
             &iofmidx.header_to_idx,
-            &iofmidx.idx_to_seq,
             &record,
-            &5.0,
+            5,
             false,
         );
 
@@ -2740,7 +2553,7 @@ mod tests {
             &iofmidx.header_to_idx,
             &iofmidx.idx_to_seq,
             &record,
-            &5.0,
+            5,
             true,
         )
         .expect("query_read (complement) failed");
