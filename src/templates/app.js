@@ -1194,7 +1194,7 @@ document.getElementById('query-btn').addEventListener('click', async () => {
 
     setQueryProgress(30, 'Starting query…');
 
-    const mismatch  = document.getElementById('query-mismatch').value  || '5';
+    const mismatch  = document.getElementById('query-seed-length').value  || '22';
     const eps1      = document.getElementById('query-eps1').value      || '1e-32';
     const iter      = document.getElementById('query-iter').value      || '100';
     const threads   = document.getElementById('query-threads').value   || '0';
@@ -1208,7 +1208,7 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     startQueryPoll(querySession, () => {});
 
     const res = await fetch(
-      `/api/query/run?session=${querySession}&mismatch=${mismatch}&eps_1=${eps1}` +
+      `/api/query/run?session=${querySession}&mem_seed_length=${mismatch}&eps_1=${eps1}` +
       `&iter=${iter}&threads=${threads}&rho=${rho}&omega=${omega}&eps_2=${eps2}` +
       `&em_threshold=${emThreshold}&no_penalty=${noPenalty}`,
       { method: 'POST' }
@@ -1289,10 +1289,10 @@ if (alignBtn) alignBtn.addEventListener('click', async () => {
     // ── Alignment phase ───────────────────────────────────────────
     animateProgress('Running alignment…', 30);
 
-    const mismatch = document.getElementById('align-mismatch').value || '5';
+    const mismatch = document.getElementById('align-seed-length').value || '22';
     const threads  = document.getElementById('align-threads').value  || '0';
     const res = await fetch(
-      `/api/align/run?session=${alignSession}&mismatch=${mismatch}&threads=${threads}`,
+      `/api/align/run?session=${alignSession}&mem_seed_length=${mismatch}&threads=${threads}`,
       { method: 'POST' }
     );
     if (!res.ok) throw new Error(await res.text());
