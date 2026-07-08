@@ -11,3 +11,6 @@
 *.txt
 *.props
 /graphify-out
+/.claude
+/datasets
+CLAUDE.md

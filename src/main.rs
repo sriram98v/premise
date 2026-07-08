@@ -352,21 +352,12 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
 fn clean_mem_matches(
     fmidx: &RefIndex,
     header_to_ref: &HashMap<String, RefIdx>,
-    record: &fastq::Record,
+    q_seq: &[u8],
     mem_seed_length: usize,
-    complement: bool,
 ) -> HashMap<RefIdx, Vec<MEMPos>> {
-    let mut mems: HashMap<RefIdx, Vec<MEMPos>> = HashMap::new(); // Contains all the MEMs between a read and a reference
-    let read_seq = match complement {
-        true => bio::alphabets::dna::revcomp(record.seq()),
-        false => record.seq().to_vec(),
-    };
-    let q_seq = read_seq.iter()
-            .filter_map(|&b| encode_char(b as char))
-            .collect_vec();
+    let mut mems: HashMap<RefIdx, Vec<MEMPos>> = HashMap::new();
 
-
-    let x = fmidx.find_mems(&q_seq, cmp::min(mem_seed_length, q_seq.len()), true);
+    let x = fmidx.find_smems(q_seq, cmp::min(mem_seed_length, q_seq.len()), true);
 
     // dbg!(record.id(), mem_seed_length, x.len());
 
@@ -404,15 +395,18 @@ fn query_read(
         true => record.qual().iter().rev().cloned().collect_vec(),
         false => record.qual().to_vec(),
     };
+    let q_seq: Vec<u8> = read_seq
+        .iter()
+        .filter_map(|&b| encode_char(b as char))
+        .collect_vec();
 
     let mut match_likelihood = MatchLikelihoods::new();
 
     let mems = clean_mem_matches(
         fmidx,
         header_to_ref,
-        record,
+        &q_seq,
         mem_seed_length,
-        complement,
     );
 
     mems.into_iter().for_each(|hit| {
@@ -1175,6 +1169,7 @@ fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     let config = RefIndexConfig {
         sa_sample_rate: 1,
         use_gpu: false,
+        ..Default::default()
     };
     let fmidx = RefIndex::build_cpu(&sequences, &config)
         .map_err(|e| anyhow::anyhow!("FM-index construction error: {}", e))?;
@@ -2110,7 +2105,7 @@ fn main() -> Result<()> {
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
-                .arg(arg!(-m --mem-seed-length <MEM_SEED_LENGTH> "Minimum seed length for MEM")
+                .arg(arg!(-m --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
                     .required(true)
                     .value_parser(clap::value_parser!(usize))
                     )
@@ -2141,7 +2136,7 @@ fn main() -> Result<()> {
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
-                .arg(arg!(-l --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
+                .arg(arg!(-p --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
                     .required(true)
                     .value_parser(clap::value_parser!(usize))
                     )
@@ -2238,7 +2233,7 @@ fn main() -> Result<()> {
             let r1_file = sub_m.get_one::<String>("r1").expect("required").as_str();
             let r2_file = sub_m.get_one::<String>("r2").expect("required").as_str();
             let mem_seed_length = *sub_m
-                .get_one::<usize>("mem_seed_length")
+                .get_one::<usize>("mem")
                 .expect("required");
             let eps_2 = *sub_m.get_one::<EMProb>("eps_2").expect("required");
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
@@ -2390,12 +2385,12 @@ mod tests {
     fn clean_kmer_matches_no_n_all_mems_have_zero_offset() {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
+        let q_seq: Vec<u8> = record.seq().iter().filter_map(|&b| encode_char(b as char)).collect_vec();
         let mems = clean_mem_matches(
             &iofmidx.fmidx,
             &iofmidx.header_to_idx,
-            &record,
+            &q_seq,
             5,
-            false,
         );
 
         assert!(mems.contains_key(&RefIdx(0)), "expected alignment to ref_A");
@@ -2494,12 +2489,12 @@ mod tests {
     fn debug_mem_positions_n_at_15() {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
+        let q_seq: Vec<u8> = record.seq().iter().filter_map(|&b| encode_char(b as char)).collect_vec();
         let mems = clean_mem_matches(
             &iofmidx.fmidx,
             &iofmidx.header_to_idx,
-            &record,
+            &q_seq,
             5,
-            false,
         );
 
         if let Some(mem_list) = mems.get(&RefIdx(0)) {

@@ -220,7 +220,7 @@ fn query_help_exits_zero_and_lists_flags() {
     let output = run(&["query", "--help"]);
     assert_success(&output);
     let out = stdout(&output);
-    for flag in &["--source", "--r1", "--r2", "--percent_mismatch"] {
+    for flag in &["--source", "--r1", "--r2", "--mem"] {
         assert!(
             out.contains(flag),
             "query help missing expected flag '{}'\nfull output:\n{}",

@@ -1,6 +1,6 @@
 [package]
 name = "premise"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -14,7 +14,7 @@ itertools = "0.14.0"
 anyhow = "1.0.98"
 flate2 = "1.1.2"
 chrono = "0.4.42"
-webgpu-fmidx = { git = "https://github.com/sriram98v/webgpu-fmidx", features = ["cpu"], version="0.4.1" }
+webgpu-fmidx = { git = "https://github.com/sriram98v/webgpu-fmidx", features = ["cpu"], version="0.5.0" }
 bincode = "1"
 dashmap = "6.1.0"
 num = "0.4.3"
