@@ -145,7 +145,7 @@ fn bench_query(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!{
+criterion_group! {
     name = benches;
     config = Criterion::default().sample_size(100);
     targets = bench_index_construction, bench_query
