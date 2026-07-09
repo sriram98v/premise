@@ -11,12 +11,9 @@ use std::process::Command;
 
 // ─────────────────────────── helpers ────────────────────────────────────────
 
-/// Absolute path to the compiled `premise` binary (debug build).
+/// Absolute path to the compiled `premise` binary under test (profile/target-aware).
 fn bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("debug")
-        .join("premise")
+    PathBuf::from(env!("CARGO_BIN_EXE_premise"))
 }
 
 /// Absolute path to the fixtures directory.

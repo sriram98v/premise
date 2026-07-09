@@ -2319,8 +2319,8 @@ dependencies = [
 
 [[package]]
 name = "webgpu-fmidx"
-version = "0.5.0"
-source = "git+https://github.com/sriram98v/webgpu-fmidx#3b5933e8b30d2c5f881d4fb74de5944308246326"
+version = "0.5.1"
+source = "git+https://github.com/sriram98v/webgpu-fmidx#6cda460a84a807fa9730b49c34936dcf9cc4ee04"
 dependencies = [
  "bincode",
  "log",
