@@ -267,7 +267,7 @@ async function uploadAlignFile(part, file, sessionId) {
     sun.style.display  = on ? ''     : 'none';
   }
 
-  applyDark(localStorage.getItem('dark') === '1');
+  applyDark(localStorage.getItem('dark') !== '0');
 
   btn.addEventListener('click', () => {
     const next = document.documentElement.getAttribute('data-theme') !== 'dark';
@@ -652,32 +652,34 @@ function qCompileFilter(inputId, colIdx) {
 }
 
 function qApplyFilters() {
-  _qFilteredRows = _qTsvRows.filter(row => {
-    const cells = row.split('\t');
-    for (let i = 0; i < 2; i++) {
-      if (_qFilterRx[i] && !_qFilterRx[i].test(cells[i] || '')) return false;
-    }
+  const rx0 = _qFilterRx[0], rx1 = _qFilterRx[1];
+  if (!rx0 && !rx1) { _qFilteredRows = _qTsvRows; return; }
+  _qFilteredRows = _qTsvRows.filter(cells => {
+    if (rx0 && !rx0.test(cells[0] || '')) return false;
+    if (rx1 && !rx1.test(cells[1] || '')) return false;
     return true;
   });
 }
 
 function qApplySort() {
   if (_qSortCol === null) { _qSortedRows = _qFilteredRows.slice(); return; }
-  const col = _qSortCol, dir = _qSortDir;
-  _qSortedRows = _qFilteredRows.slice().sort((a, b) => {
-    const ca = a.split('\t')[col] ?? '';
-    const cb = b.split('\t')[col] ?? '';
-    let cmp;
-    if (col === 2) {
-      if (ca === '-' && cb === '-') return 0;
-      if (ca === '-') return 1;
-      if (cb === '-') return -1;
-      cmp = parseFloat(ca) - parseFloat(cb);
+  const col = _qSortCol, dir = _qSortDir === 'asc' ? 1 : -1;
+  const numeric = col === 2;
+  // Decorate–sort–undecorate: compute each row's sort key once instead of
+  // splitting/parsing inside the O(N log N) comparator (freezes on large data).
+  const decorated = _qFilteredRows.map(cells => {
+    let key;
+    if (numeric) {
+      const v = cells[col];
+      key = (v === undefined || v === '-') ? Infinity : parseFloat(v);
+      if (Number.isNaN(key)) key = Infinity;
     } else {
-      cmp = ca.localeCompare(cb, undefined, { sensitivity: 'base' });
+      key = (cells[col] ?? '').toLowerCase();
     }
-    return dir === 'asc' ? cmp : -cmp;
+    return { cells, key };
   });
+  decorated.sort((a, b) => (a.key < b.key ? -dir : a.key > b.key ? dir : 0));
+  _qSortedRows = decorated.map(d => d.cells);
 }
 
 function qRecompute() {
@@ -691,7 +693,7 @@ function initQueryTable(tsv) {
   const lines = tsv.trim().split('\n');
   if (lines.length < 2) { _qTsvRows = []; _qFilteredRows = []; _qSortedRows = []; return; }
   _qTsvHeaders  = lines[0].split('\t');
-  _qTsvRows     = lines.slice(1);
+  _qTsvRows     = lines.slice(1).map(l => l.split('\t')); // parse once, not per sort/filter
   _qFilteredRows = _qTsvRows.slice();
   _qSortedRows   = _qTsvRows.slice();
   _qSortCol = null;
@@ -735,8 +737,7 @@ function qRenderTablePage() {
   });
   html += '</tr></thead><tbody>';
 
-  for (const row of slice) {
-    const cells = row.split('\t');
+  for (const cells of slice) {
     const isUnclassified = cells[1] === 'unclassified';
     html += `<tr${isUnclassified ? ' class="unclassified"' : ''}>`
       + cells.map((c, i) => `<td>${i === 1 && c !== 'unclassified' ? ncbiLink(c) : escHtml(c)}</td>`).join('') + '</tr>';
@@ -813,9 +814,9 @@ document.getElementById('query-rows-per-page')
 
 // ── D3 Pie chart ───────────────────────────────────────────────────────────
 const PIE_COLORS = [
-  '#0d6e6e','#e97b2a','#2a7be9','#e92a6c','#7be92a',
-  '#9b59b6','#e9c02a','#2ae9c0','#e94a2a','#2ac0e9',
-  '#8e8e00','#e92ab6'
+  '#2ee6a6','#22d3ee','#a78bfa','#fbbf24','#fb7185',
+  '#34d399','#60a5fa','#f472b6','#facc15','#38bdf8',
+  '#c084fc','#f97316'
 ];
 
 function renderQueryPie(tsv) {
@@ -840,7 +841,7 @@ function renderQueryPie(tsv) {
   data.forEach(d => { d.proportion /= total; });
   data.sort((a, b) => b.proportion - a.proportion);
 
-  const W = wrap.clientWidth || 260;
+  const W = Math.min(wrap.clientWidth || 260, 300); // cap so the pie stays compact
   const H = W;
   const R = W / 2 * 0.85;
 
