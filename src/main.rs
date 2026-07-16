@@ -403,7 +403,7 @@ fn query_read(
                 continue;
             }
             let ref_pos = mem.ref_start - mem.read_start;
-            if ref_pos + read_len < ref_len {
+            if ref_pos + read_len <= ref_len {
                 let ref_match_seg = &ref_seq[ref_pos..ref_pos + read_len];
                 let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, ref_match_seg);
 
@@ -898,7 +898,7 @@ fn get_proportions_par_sparse(
 /// `lambda`, the expected count `ej`, penalty weight `rho`, and floor `omega`.
 fn _update_pi(rho: EMProb, omega: EMProb, ej: EMProb, lambda: EMProb) -> EMProb {
     let phi = _compute_phi(lambda, omega, rho, ej);
-    (-phi + (phi * phi - 4.0 * lambda * ej * omega).sqrt()) / (2.0 * lambda)
+    (-phi + (phi * phi + 4.0 * lambda * ej * omega).sqrt()) / (2.0 * lambda)
 }
 
 /// Find the Lagrange multiplier λ that enforces the simplex constraint Σπ_j = 1.
@@ -933,7 +933,7 @@ fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, 
         .map(|ref_idx| {
             let ej = *ejs.get(ref_idx).unwrap();
             let phi = _compute_phi(lambda, omega, rho, ej);
-            -phi + (phi * phi - 4.0 * lambda * ej * omega).sqrt()
+            -phi + (phi * phi + 4.0 * lambda * ej * omega).sqrt()
         })
         .sum::<EMProb>()
         - 2.0 * lambda
@@ -950,10 +950,10 @@ fn _compute_deriv_f(
         .map(|ref_idx| {
             let ej = *ejs.get(ref_idx).unwrap();
             let phi = _compute_phi(lambda, omega, rho, ej);
-            omega
+            -omega
                 + 0.5
-                    * (1.0 / (phi * phi - 4.0 * lambda * ej * omega).sqrt())
-                    * (2.0 * phi * omega - 4.0 * ej * omega)
+                    * (1.0 / (phi * phi + 4.0 * lambda * ej * omega).sqrt())
+                    * (2.0 * phi * omega + 4.0 * ej * omega)
         })
         .sum::<EMProb>()
         - 2.0
@@ -1047,7 +1047,7 @@ fn get_proportions_par_sparse_l1_reg(
         let lambda = _update_lambda(rho, omega, &ejs, lambda_init, num_iter);
         pi = (0..n_refs)
             .map(|j| {
-                let tmp_pi = _update_pi(rho, 1e-20, ej[j], lambda);
+                let tmp_pi = _update_pi(rho, omega, ej[j], lambda);
                 if tmp_pi > 0.0 {
                     tmp_pi
                 } else {
@@ -1920,7 +1920,7 @@ fn handle_query_run(
     let eps_1: EMProb = qs
         .get("eps_1")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-32);
+        .unwrap_or(1e-64);
     let eps_2: EMProb = qs
         .get("eps_2")
         .and_then(|s| s.parse().ok())
@@ -2108,7 +2108,7 @@ fn main() -> Result<()> {
                     .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(--eps_1 <EPS_1>"Cutoff likelihood for dropping alignments")
-                    .default_value("1e-32")
+                    .default_value("1e-64")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
@@ -2322,7 +2322,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Single-line version of the fixture ref_A sequence (185 bp).
+    // Single-line version of the fixture ref_A sequence (156 bp).
     const TEST_FASTA: &[u8] =
         b">ref_A\nAGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCGATCGATCGAATCGATCGATCGAATCGATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAAT\n";
 
@@ -2364,6 +2364,38 @@ mod tests {
                 .iter()
                 .map(|m| (m.ref_start, m.read_start))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A read matching the final bases of a reference aligns at
+    /// `ref_pos + read_len == ref_len`, which the right-edge guard must accept.
+    /// The bound was `<`, which silently discarded every alignment flush against
+    /// the reference's 3' end.
+    #[test]
+    fn query_read_aligns_read_flush_against_reference_end() {
+        let iofmidx = build_test_index(TEST_FASTA);
+        let ref_len = iofmidx.idx_to_seq[&RefIdx(0)].len();
+        let read_seq = b"ATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAAT";
+        let expected_pos = ref_len - read_seq.len();
+
+        let hits = query_read(
+            &iofmidx.fmidx,
+            &iofmidx.header_to_idx,
+            &iofmidx.idx_to_seq,
+            &make_record("r", read_seq),
+            5,
+            false,
+        )
+        .expect("query_read failed");
+
+        let positions = hits
+            .get(&RefIdx(0))
+            .expect("no alignments to ref_A for a read taken verbatim from its 3' end");
+        assert!(
+            positions.contains_key(&expected_pos),
+            "expected an alignment at ref_pos {expected_pos} (flush with ref_len {ref_len}); \
+             got positions: {:?}",
+            positions.keys().collect::<Vec<_>>()
         );
     }
 
