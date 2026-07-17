@@ -10,6 +10,8 @@ use clap::{arg, Arg, ArgAction, Command};
 use core::f64;
 use dashmap::{DashMap, DashSet};
 use flate2::read::GzDecoder;
+use haystackfm::alphabet::encode_char;
+use haystackfm::{BidirFmIndex as RefIndex, DnaSequence, FmIndexConfig as RefIndexConfig};
 use indicatif::ProgressStyle;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
@@ -26,8 +28,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, fs::File, io::BufReader};
 use tiny_http::{Header, Response, Server, StatusCode};
 use utils::*;
-use webgpu_fmidx::alphabet::encode_char;
-use webgpu_fmidx::{BidirFmIndex as RefIndex, DnaSequence, FmIndexConfig as RefIndexConfig};
 
 /// Newtype wrapper around a raw read identifier string.
 ///
