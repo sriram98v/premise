@@ -54,16 +54,18 @@ Produces `<reference>.fmidx`. This index is required for both the CLI and GUI qu
 
 ```bash
 premise query \
-  -s <reference.fasta> \
+  -s <reference.fmidx>     \  # FM-index built in Step 1
   -1 <R1.fastq.gz> \
   -2 <R2.fastq.gz> \
-  -p <percent_mismatch>   \  # e.g. 5
-  --eps_1 <float>          \  # alignment likelihood cutoff (default 1e-4)
+  -p <min_seed_length>     \  # minimum MEM seed length, e.g. 22
+  --eps_1 <float>          \  # alignment likelihood cutoff (default 1e-64)
   --eps_2 <float>          \  # minimum match log-probability (default 1e-18)
   --rho   <float>          \  # EM penalty weight ρ (default 20)
   --omega <float>          \  # EM penalty weight ω (default 1e-20)
   --iter  <int>            \  # EM iterations (default 100)
-  -t <threads>             \  # 0 = all available cores
+  --em_threshold <float>   \  # EM convergence threshold (default 1e-6)
+  --no-penalty             \  # disable the L1 penalty (plain EM)
+  -t <threads>             \  # default 2; 0 = all available cores
   -o <output_prefix>
 ```
 
@@ -73,6 +75,7 @@ Outputs:
 | `<output>.matches` | Per-read assignments (TSV) |
 | `<output>.posteriors` | Per-read posterior probabilities (TSV) |
 | `<output>.props` | Reference abundance proportions (TSV) |
+| `<output>.aligns` | Raw per-alignment likelihoods, one row per (read, reference) (TSV) |
 
 Run `premise query -h` for the full option list.
 
@@ -86,7 +89,7 @@ Opens a browser UI at `http://localhost:8080` with drag-and-drop file upload, in
 
 ## Algorithm
 
-PREMISE uses a seeded alignment strategy based on exact FM-index lookups, followed by seed extension with a configurable mismatch tolerance. Read-level alignment log-likelihoods are computed using base quality scores (Phred-scaled error probabilities in natural log space).
+PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then rescored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-p`/`--mem` sets the minimum seed length.
 
 The EM step solves a penalized likelihood maximization:
 
@@ -107,8 +110,7 @@ premise/
 │       ├── index.html   # Browser GUI markup (embedded at compile time)
 │       ├── styles.css   # Pico.css overrides (embedded at compile time)
 │       └── app.js       # Frontend logic — D3 charts, dropzones, dark mode
-├── pkg/                 # WASM build artefacts (experimental)
-├── eval_tool/           # Evaluation scripts and notebooks
+├── tests/               # Integration tests (CLI + local server)
 ├── Cargo.toml
 └── README.md
 ```
