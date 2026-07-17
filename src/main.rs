@@ -2036,7 +2036,7 @@ fn handle_query_run(
 
 fn main() -> Result<()> {
     let matches = Command::new("Maximum Likelihood Metagenomic Classification")
-        .version("1.0")
+        .version(env!("CARGO_PKG_VERSION"))
         .author("Sriram Vijendran <vijendran.sriram@gmail.com>")
         .subcommand(
             Command::new("build")
