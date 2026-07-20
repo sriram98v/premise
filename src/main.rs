@@ -1,6 +1,6 @@
 extern crate clap;
 pub mod utils;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bio::bio_types::sequence::SequenceRead;
 use bio::io::fasta;
 use bio::io::fastq;
@@ -490,9 +490,9 @@ fn process_read_pairs<'a>(
 
     let half_log_prob = LogProb::from(Prob(0.5));
 
-    read_pairs
+    let alignment_results = read_pairs
         .par_iter()
-        .map(|read_pair| {
+        .map(|read_pair| -> anyhow::Result<_> {
             let r1_rec = &read_pair.r1;
             let r2_rec = &read_pair.r2;
 
@@ -502,14 +502,32 @@ fn process_read_pairs<'a>(
             let mut match_likelihoods: HashMap<RefIdx, ReadAlignment> = HashMap::new();
 
             let r1_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, false).unwrap();
+                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, false)
+                    .with_context(|| {
+                        format!("failed to align read '{}' (R1)", read_pair.read_id.as_str())
+                    })?;
             let r1_rc_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, true).unwrap();
+                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, true)
+                    .with_context(|| {
+                        format!(
+                            "failed to align read '{}' (R1, reverse-complement)",
+                            read_pair.read_id.as_str()
+                        )
+                    })?;
 
             let r2_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, false).unwrap();
+                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, false)
+                    .with_context(|| {
+                        format!("failed to align read '{}' (R2)", read_pair.read_id.as_str())
+                    })?;
             let r2_rc_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, true).unwrap();
+                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, true)
+                    .with_context(|| {
+                        format!(
+                            "failed to align read '{}' (R2, reverse-complement)",
+                            read_pair.read_id.as_str()
+                        )
+                    })?;
 
             r1_match_likelihoods
                 .keys()
@@ -582,8 +600,12 @@ fn process_read_pairs<'a>(
                 }
             }
 
-            (&read_pair.read_id, match_likelihoods)
+            Ok((&read_pair.read_id, match_likelihoods))
         })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    alignment_results
+        .into_iter()
         .for_each(|(read_id, match_likelihoods)| {
             match_likelihoods.iter().for_each(|x| {
                 all_ref_ids.insert(*x.0);
@@ -1115,23 +1137,26 @@ fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     println!("{}", log_str);
 
     let sequences: Vec<DnaSequence> = (0..refs_texts.len())
-        .map(|i| {
+        .map(|i| -> anyhow::Result<DnaSequence> {
             let header = ref_ids_rev
                 .get(&RefIdx(i))
                 .map(|id| id.0.as_str())
                 .unwrap_or("");
             let seq_str: String = str::from_utf8(&refs_texts[i])
-                .unwrap()
+                .map_err(|e| {
+                    anyhow::anyhow!("FASTA sequence for record {} is not valid UTF-8: {}", i, e)
+                })?
                 .chars()
                 .map(|c| match c.to_ascii_uppercase() {
                     'A' | 'C' | 'G' | 'T' | 'N' => c.to_ascii_uppercase(),
                     _ => 'N',
                 })
                 .collect();
-            DnaSequence::from_str_with_header(&seq_str, header)
-                .expect("valid DNA sequence after IUPAC normalization")
+            DnaSequence::from_str_with_header(&seq_str, header).map_err(|e| {
+                anyhow::anyhow!("could not build DNA sequence for record '{}': {}", header, e)
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<Vec<DnaSequence>>>()?;
 
     let config = RefIndexConfig {
         sa_sample_rate: 1,
@@ -1287,6 +1312,31 @@ fn parse_qs(url: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Collect FASTQ records from an iterator, counting and warning about any that
+/// fail to parse instead of silently dropping them.
+fn collect_fastq_records<I, E>(records: I, mate: &str, path: &str) -> Vec<fastq::Record>
+where
+    I: Iterator<Item = std::result::Result<fastq::Record, E>>,
+{
+    let mut dropped = 0usize;
+    let good: Vec<fastq::Record> = records
+        .filter_map(|x| match x {
+            Ok(rec) => Some(rec),
+            Err(_) => {
+                dropped += 1;
+                None
+            }
+        })
+        .collect();
+    if dropped > 0 {
+        eprintln!(
+            "Warning: skipped {} malformed record(s) while reading {} file '{}'",
+            dropped, mate, path
+        );
+    }
+    good
+}
+
 /// Load forward (R1) reads from a FASTQ or gzipped FASTQ file into a read-ID map.
 ///
 /// Strips a trailing `/1` suffix from read IDs (common in paired-end naming
@@ -1294,20 +1344,21 @@ fn parse_qs(url: &str) -> HashMap<String, String> {
 fn load_fastq_forward(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
     match get_extension_from_filename(path) {
         Some("gz") => {
-            let f = File::open(path)?;
-            Ok(
-                fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f)))
-                    .records()
-                    .filter_map(|x| x.ok())
-                    .map(|rec| (ReadID(rec.id().to_string()), rec))
-                    .collect(),
-            )
+            let f = File::open(path)
+                .with_context(|| format!("failed to open R1 (forward) reads file '{}'", path))?;
+            let records =
+                fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f))).records();
+            Ok(collect_fastq_records(records, "R1", path)
+                .into_iter()
+                .map(|rec| (ReadID(rec.id().to_string()), rec))
+                .collect())
         }
         Some("fastq") | Some("fq") => {
-            let f = File::open(path)?;
-            Ok(fastq::Reader::from_bufread(BufReader::new(f))
-                .records()
-                .filter_map(|x| x.ok())
+            let f = File::open(path)
+                .with_context(|| format!("failed to open R1 (forward) reads file '{}'", path))?;
+            let records = fastq::Reader::from_bufread(BufReader::new(f)).records();
+            Ok(collect_fastq_records(records, "R1", path)
+                .into_iter()
                 .map(|rec| {
                     (
                         ReadID(rec.id().strip_suffix("/1").unwrap_or(rec.id()).to_string()),
@@ -1326,20 +1377,21 @@ fn load_fastq_forward(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
 fn load_fastq_reverse(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
     match get_extension_from_filename(path) {
         Some("gz") => {
-            let f = File::open(path)?;
-            Ok(
-                fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f)))
-                    .records()
-                    .filter_map(|x| x.ok())
-                    .map(|rec| (ReadID(rec.id().to_string()), rec))
-                    .collect(),
-            )
+            let f = File::open(path)
+                .with_context(|| format!("failed to open R2 (reverse) reads file '{}'", path))?;
+            let records =
+                fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f))).records();
+            Ok(collect_fastq_records(records, "R2", path)
+                .into_iter()
+                .map(|rec| (ReadID(rec.id().to_string()), rec))
+                .collect())
         }
         Some("fastq") | Some("fq") => {
-            let f = File::open(path)?;
-            Ok(fastq::Reader::from_bufread(BufReader::new(f))
-                .records()
-                .filter_map(|x| x.ok())
+            let f = File::open(path)
+                .with_context(|| format!("failed to open R2 (reverse) reads file '{}'", path))?;
+            let records = fastq::Reader::from_bufread(BufReader::new(f)).records();
+            Ok(collect_fastq_records(records, "R2", path)
+                .into_iter()
                 .map(|rec| {
                     (
                         ReadID(rec.id().strip_suffix("/2").unwrap_or(rec.id()).to_string()),
@@ -1349,6 +1401,26 @@ fn load_fastq_reverse(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
                 .collect())
         }
         _ => Err(anyhow::anyhow!("Unsupported R2 file type: {}", path)),
+    }
+}
+
+/// Resolve the worker-thread count, treating `0` as "auto".
+///
+/// On the rare platforms where [`thread::available_parallelism`] fails, warn and
+/// fall back to a single thread instead of aborting the run.
+fn resolve_thread_count(threads: usize) -> usize {
+    if threads != 0 {
+        return threads;
+    }
+    match thread::available_parallelism() {
+        Ok(n) => n.get(),
+        Err(e) => {
+            eprintln!(
+                "Warning: could not determine available parallelism ({}); falling back to 1 thread",
+                e
+            );
+            1
+        }
     }
 }
 
@@ -1367,11 +1439,7 @@ fn run_alignment(
     eps_2: EMProb,
     threads: usize,
 ) -> Result<(String, String)> {
-    let num_threads = if threads == 0 {
-        thread::available_parallelism()?.get()
-    } else {
-        threads
-    };
+    let num_threads = resolve_thread_count(threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global();
@@ -1382,21 +1450,35 @@ fn run_alignment(
     let all_reads: Vec<ReadPair> = reverse_fastq_records
         .into_iter()
         .filter(|(read_id, _)| forward_fastq_records.contains_key(read_id))
-        .map(|(read_id, rev_rec)| {
-            let fw_rec = forward_fastq_records.get(&read_id).unwrap();
-            ReadPair {
-                read_id,
+        .filter_map(|(read_id, rev_rec)| {
+            forward_fastq_records.get(&read_id).map(|fw_rec| ReadPair {
                 r1: fw_rec.clone(),
                 r2: rev_rec,
-            }
+                read_id,
+            })
         })
         .collect();
+
+    if all_reads.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no valid read pairs after matching R1 '{}' with R2 '{}'; \
+             R1 and R2 read IDs do not correspond (check for mismatched files or /1,/2 suffix handling)",
+            r1_file,
+            r2_file
+        ));
+    }
 
     let all_read_ids: BTreeSet<ReadID> = forward_fastq_records.into_keys().collect();
     let num_reads = all_read_ids.len();
 
-    let file_bytes = std::fs::read(ref_file)?;
-    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)?;
+    let file_bytes = std::fs::read(ref_file).with_context(|| {
+        format!(
+            "failed to read FM-index '{}' (build it first with the `build` subcommand)",
+            ref_file
+        )
+    })?;
+    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
+        .with_context(|| format!("failed to parse FM-index '{}'", ref_file))?;
     let fmidx = iofmidx.fmidx;
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
@@ -1488,11 +1570,7 @@ fn run_query(
     threads: usize,
     progress: Option<Arc<QueryProgress>>,
 ) -> Result<(String, String, String, String, Vec<EMProb>, String)> {
-    let num_threads = if threads == 0 {
-        thread::available_parallelism()?.get()
-    } else {
-        threads
-    };
+    let num_threads = resolve_thread_count(threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global();
@@ -1503,20 +1581,34 @@ fn run_query(
     let all_reads: Vec<ReadPair> = reverse_fastq_records
         .into_iter()
         .filter(|(read_id, _)| forward_fastq_records.contains_key(read_id))
-        .map(|(read_id, rev_rec)| {
-            let fw_rec = forward_fastq_records.get(&read_id).unwrap();
-            ReadPair {
-                read_id,
+        .filter_map(|(read_id, rev_rec)| {
+            forward_fastq_records.get(&read_id).map(|fw_rec| ReadPair {
                 r1: fw_rec.clone(),
                 r2: rev_rec,
-            }
+                read_id,
+            })
         })
         .collect();
 
+    if all_reads.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no valid read pairs after matching R1 '{}' with R2 '{}'; \
+             R1 and R2 read IDs do not correspond (check for mismatched files or /1,/2 suffix handling)",
+            r1_file,
+            r2_file
+        ));
+    }
+
     let all_read_ids: BTreeSet<ReadID> = forward_fastq_records.into_keys().collect();
 
-    let file_bytes = std::fs::read(ref_file)?;
-    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)?;
+    let file_bytes = std::fs::read(ref_file).with_context(|| {
+        format!(
+            "failed to read FM-index '{}' (build it first with the `build` subcommand)",
+            ref_file
+        )
+    })?;
+    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
+        .with_context(|| format!("failed to parse FM-index '{}'", ref_file))?;
     let fmidx = iofmidx.fmidx;
     let ref_ids_rev = iofmidx.idx_to_id;
     let refs = iofmidx.idx_to_seq;
@@ -1809,10 +1901,20 @@ fn do_align_run(
     let r1_path = session.dir.join(format!("r1.{}", r1_ext));
     let r2_path = session.dir.join(format!("r2.{}", r2_ext));
 
+    let ref_path_str = ref_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("session path is not valid UTF-8"))?;
+    let r1_path_str = r1_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("session path is not valid UTF-8"))?;
+    let r2_path_str = r2_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("session path is not valid UTF-8"))?;
+
     let (tsv, log_str) = run_alignment(
-        ref_path.to_str().unwrap(),
-        r1_path.to_str().unwrap(),
-        r2_path.to_str().unwrap(),
+        ref_path_str,
+        r1_path_str,
+        r2_path_str,
         mem_seed_length,
         eps_2,
         threads,
@@ -1952,24 +2054,30 @@ fn handle_query_run(
 
     let r1_ext = session.r1_ext.as_deref().unwrap_or("fastq").to_string();
     let r2_ext = session.r2_ext.as_deref().unwrap_or("fastq").to_string();
-    let ref_path = session
-        .dir
-        .join("index.fmidx")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let r1_path = session
-        .dir
-        .join(format!("r1.{}", r1_ext))
-        .to_str()
-        .unwrap()
-        .to_string();
-    let r2_path = session
-        .dir
-        .join(format!("r2.{}", r2_ext))
-        .to_str()
-        .unwrap()
-        .to_string();
+
+    let paths = [
+        session.dir.join("index.fmidx"),
+        session.dir.join(format!("r1.{}", r1_ext)),
+        session.dir.join(format!("r2.{}", r2_ext)),
+    ];
+    let path_strs: Option<Vec<String>> = paths
+        .iter()
+        .map(|p| p.to_str().map(|s| s.to_string()))
+        .collect();
+    let path_strs = match path_strs {
+        Some(v) => v,
+        None => {
+            eprintln!("Error: session path is not valid UTF-8");
+            let _ = request.respond(
+                Response::from_string("session path is not valid UTF-8")
+                    .with_status_code(StatusCode(500)),
+            );
+            return;
+        }
+    };
+    let ref_path = path_strs[0].clone();
+    let r1_path = path_strs[1].clone();
+    let r2_path = path_strs[2].clone();
 
     // Register fresh progress entry for this session
     let progress = Arc::new(QueryProgress::new());
@@ -2182,14 +2290,16 @@ fn main() -> Result<()> {
                 .as_str();
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
 
-            let fasta_data = std::fs::read(src_file)?;
+            let fasta_data = std::fs::read(src_file)
+                .with_context(|| format!("failed to read reference FASTA '{}'", src_file))?;
             let (idx_bytes, _) = build_index_from_bytes(&fasta_data)?;
 
             let out_path = match outfile {
                 "" => format!("{}.fmidx", src_file),
                 p => p.to_string(),
             };
-            std::fs::write(&out_path, &idx_bytes)?;
+            std::fs::write(&out_path, &idx_bytes)
+                .with_context(|| format!("failed to write index to '{}'", out_path))?;
             println!("Index written to {}", out_path);
         }
         Some(("align", sub_m)) => {
@@ -2207,7 +2317,8 @@ fn main() -> Result<()> {
             let now = Instant::now();
             let (tsv, _) =
                 run_alignment(ref_file, r1_file, r2_file, mem_seed_length, eps_2, threads)?;
-            std::fs::write(outfile, tsv.as_bytes())?;
+            std::fs::write(outfile, tsv.as_bytes())
+                .with_context(|| format!("failed to write alignment output to '{}'", outfile))?;
             println!("Alignment written to {} ({:.2?})", outfile, now.elapsed());
         }
         Some(("query", sub_m)) => {
@@ -2244,15 +2355,80 @@ fn main() -> Result<()> {
                 threads,
                 None,
             )?;
-            std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())?;
-            std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())?;
-            std::fs::write(format!("{}.props", outfile), props_tsv.as_bytes())?;
-            std::fs::write(format!("{}.aligns", outfile), aligns_tsv.as_bytes())?;
+            std::fs::write(format!("{}.matches", outfile), matches_tsv.as_bytes())
+                .with_context(|| format!("failed to write '{}.matches'", outfile))?;
+            std::fs::write(format!("{}.posteriors", outfile), posteriors_tsv.as_bytes())
+                .with_context(|| format!("failed to write '{}.posteriors'", outfile))?;
+            std::fs::write(format!("{}.props", outfile), props_tsv.as_bytes())
+                .with_context(|| format!("failed to write '{}.props'", outfile))?;
+            std::fs::write(format!("{}.aligns", outfile), aligns_tsv.as_bytes())
+                .with_context(|| format!("failed to write '{}.aligns'", outfile))?;
             println!(
                 "Query written to {}.{{matches,posteriors,props,aligns}} ({:.2?})",
                 outfile,
                 now.elapsed()
             );
+        }
+        Some(("fasta", sub_m)) => {
+            let index_file = sub_m.get_one::<String>("index").expect("required").as_str();
+
+            let file_bytes = std::fs::read(index_file).with_context(|| {
+                format!(
+                    "failed to read FM-index '{}' (build it first with the `build` subcommand)",
+                    index_file
+                )
+            })?;
+            let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
+                .with_context(|| format!("failed to parse FM-index '{}'", index_file))?;
+
+            let mut indices: Vec<&RefIdx> = iofmidx.idx_to_seq.keys().collect();
+            indices.sort_by_key(|r| r.0);
+
+            let mut out = String::new();
+            for ref_idx in indices {
+                let header = iofmidx
+                    .idx_to_id
+                    .get(ref_idx)
+                    .map(|id| id.0.as_str())
+                    .unwrap_or("");
+                let seq = iofmidx
+                    .idx_to_seq
+                    .get(ref_idx)
+                    .map(|s| String::from_utf8_lossy(s).into_owned())
+                    .unwrap_or_default();
+                out.push_str(&format!(">{}\n{}\n", header, seq));
+            }
+            print!("{}", out);
+        }
+        Some(("inspect", sub_m)) => {
+            let index_file = sub_m.get_one::<String>("index").expect("required").as_str();
+
+            let file_bytes = std::fs::read(index_file).with_context(|| {
+                format!(
+                    "failed to read FM-index '{}' (build it first with the `build` subcommand)",
+                    index_file
+                )
+            })?;
+            let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
+                .with_context(|| format!("failed to parse FM-index '{}'", index_file))?;
+
+            let mut indices: Vec<&RefIdx> = iofmidx.idx_to_seq.keys().collect();
+            indices.sort_by_key(|r| r.0);
+
+            let total_len: usize = iofmidx.idx_to_seq.values().map(|s| s.len()).sum();
+            println!("Index file: {}", index_file);
+            println!("Number of references: {}", indices.len());
+            println!("Total sequence length: {} bp", total_len);
+            println!("References:");
+            for ref_idx in indices {
+                let header = iofmidx
+                    .idx_to_id
+                    .get(ref_idx)
+                    .map(|id| id.0.as_str())
+                    .unwrap_or("");
+                let len = iofmidx.idx_to_seq.get(ref_idx).map(|s| s.len()).unwrap_or(0);
+                println!("  [{}] {} ({} bp)", ref_idx.0, header, len);
+            }
         }
         Some(("server", sub_m)) => {
             let port = *sub_m.get_one::<u16>("port").unwrap();
@@ -2286,22 +2462,60 @@ fn main() -> Result<()> {
                         let _ = request.respond(Response::from_string(&html).with_header(ct));
                     }
                     (tiny_http::Method::Post, "/api/build") => {
-                        handle_api_build(request);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_api_build(request)
+                        }))
+                        .is_err()
+                        {
+                            eprintln!("Error: /api/build handler panicked; request dropped");
+                        }
                     }
                     (tiny_http::Method::Post, "/api/align/upload") => {
-                        handle_align_upload(request, &mut sessions);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_align_upload(request, &mut sessions)
+                        }))
+                        .is_err()
+                        {
+                            eprintln!("Error: /api/align/upload handler panicked; request dropped");
+                        }
                     }
                     (tiny_http::Method::Post, "/api/align/run") => {
-                        handle_align_run(request, &sessions);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_align_run(request, &sessions)
+                        }))
+                        .is_err()
+                        {
+                            eprintln!("Error: /api/align/run handler panicked; request dropped");
+                        }
                     }
                     (tiny_http::Method::Post, "/api/query/upload") => {
-                        handle_align_upload(request, &mut query_sessions);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_align_upload(request, &mut query_sessions)
+                        }))
+                        .is_err()
+                        {
+                            eprintln!("Error: /api/query/upload handler panicked; request dropped");
+                        }
                     }
                     (tiny_http::Method::Post, "/api/query/run") => {
-                        handle_query_run(request, &query_sessions, progress_map.clone());
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_query_run(request, &query_sessions, progress_map.clone())
+                        }))
+                        .is_err()
+                        {
+                            eprintln!("Error: /api/query/run handler panicked; request dropped");
+                        }
                     }
                     (tiny_http::Method::Get, "/api/query/progress") => {
-                        handle_query_progress(request, &progress_map);
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            handle_query_progress(request, &progress_map)
+                        }))
+                        .is_err()
+                        {
+                            eprintln!(
+                                "Error: /api/query/progress handler panicked; request dropped"
+                            );
+                        }
                     }
                     _ => {
                         let _ = request.respond(
@@ -2312,7 +2526,7 @@ fn main() -> Result<()> {
             }
         }
         _ => {
-            println!("No option selected! Refer help page (-h flag)");
+            println!("No subcommand selected. Run with --help to see available commands.");
         }
     }
 
