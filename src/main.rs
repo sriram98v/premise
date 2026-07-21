@@ -2232,7 +2232,7 @@ fn main() -> Result<()> {
                     .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(--omega <OMEGA>"penalty weight")
-                    .default_value("1e-20")
+                    .default_value("1e-10")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(--rho <RHO>"penalty weight")
