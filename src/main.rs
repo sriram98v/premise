@@ -438,9 +438,10 @@ fn merge_read_pairs(
     let mut best_alignment_likelihood: LogProb = LogProb(f64::NEG_INFINITY);
     let mut best_alignment_positions: (usize, usize) = (0, 0);
     for (r1_start, r1_log_prob) in forward.iter() {
+        let r1_end = r1_start + read_len;
         for (r2_rc_start, r2_log_prob) in reverse.iter() {
             let r2_rc_end = r2_rc_start + read_len;
-            if r2_rc_end > *r1_start {
+            if r2_rc_end > *r1_start || r1_end > *r2_rc_start {
                 let align_ll = r1_log_prob + r2_log_prob;
                 if align_ll > best_alignment_likelihood {
                     best_alignment_likelihood = align_ll;
@@ -1489,7 +1490,7 @@ fn run_alignment(
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         num_threads,
         mem_seed_length,
-        eps_2.exp(),
+        eps_2,
     );
     println!("{}", log_str);
 
