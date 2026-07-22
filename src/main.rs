@@ -2029,11 +2029,11 @@ fn handle_query_run(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1e-18);
     let num_iter: usize = qs.get("iter").and_then(|s| s.parse().ok()).unwrap_or(100);
-    let rho: EMProb = qs.get("rho").and_then(|s| s.parse().ok()).unwrap_or(20.0);
+    let rho: EMProb = qs.get("rho").and_then(|s| s.parse().ok()).unwrap_or(150.0);
     let omega: EMProb = qs
         .get("omega")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-20);
+        .unwrap_or(1e-10);
     let em_threshold: EMProb = qs
         .get("em_threshold")
         .and_then(|s| s.parse().ok())
@@ -2237,7 +2237,7 @@ fn main() -> Result<()> {
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(--rho <RHO>"penalty weight")
-                    .default_value("20")
+                    .default_value("150")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-o --out <OUT_FILE>"Output file")
