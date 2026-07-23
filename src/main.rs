@@ -255,8 +255,8 @@ impl<'a> std::ops::DerefMut for ReadAlignments<'a> {
 /// Half-open interval describing where a single MEM seed aligns on both the read and a reference.
 ///
 /// All positions are 0-based and half-open (`start` inclusive, `end` exclusive).
-/// Multiple `MEMPos` values for the same read–reference pair are merged into
-/// longer alignments by [`merge_kmer_matches`].
+/// Multiple `MEMPos` values for the same read–reference pair that share a
+/// reference diagonal collapse into a single scored alignment position.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub struct MEMPos {
     pub ref_start: usize,
@@ -340,8 +340,6 @@ fn clean_mem_matches(
     let mut mems: HashMap<RefIdx, Vec<MEMPos>> = HashMap::new();
 
     let x = fmidx.find_smems(q_seq, cmp::min(mem_seed_length, q_seq.len()), true);
-
-    // dbg!(record.id(), mem_seed_length, x.len());
 
     for i in x {
         let q_start = i.query_start;
@@ -937,14 +935,12 @@ fn _update_lambda(
 ) -> EMProb {
     let mut lambda = lambda_init;
     for _ in 0..iterations {
-        // dbg!(lambda, _compute_f(lambda, omega, rho, ejs), _compute_deriv_f(lambda, omega, rho, ejs));
         lambda -=
             (_compute_f(lambda, omega, rho, ejs)) / (_compute_deriv_f(lambda, omega, rho, ejs));
         if _compute_f(lambda, omega, rho, ejs) == 0.0 {
             break;
         }
     }
-    // dbg!(lambda, _compute_f(lambda, omega, rho, ejs), _compute_deriv_f(lambda, omega, rho, ejs));
     lambda
 }
 
@@ -985,21 +981,6 @@ fn _compute_deriv_f(
 /// Compute the auxiliary scalar φ = λω + ρ − e_j used in the closed-form π update.
 fn _compute_phi(lambda: EMProb, omega: EMProb, rho: EMProb, ej: EMProb) -> EMProb {
     return lambda * omega + rho - ej;
-}
-
-/// Return the L1 norm (sum of absolute values) of a proportion map.
-fn _l1_norm(props: &HashMap<RefIdx, EMProb>) -> EMProb {
-    props.values().sum()
-}
-
-/// Return the squared L2 norm (sum of squares) of a proportion map.
-fn _l2_norm_sq(props: &HashMap<RefIdx, EMProb>) -> EMProb {
-    props.values().map(|x| x * x).sum()
-}
-
-/// Compute the log-barrier penalty Σ_j ln(1 + π_j / ω) for a proportion map.
-fn _penalty(props: &HashMap<RefIdx, EMProb>, omega: EMProb) -> EMProb {
-    props.values().map(|x| (1.0 + (x / omega)).ln()).sum()
 }
 
 /// Run the L1-penalized EM algorithm to estimate reference proportions.
@@ -1688,6 +1669,16 @@ fn run_query(
         }
     }
 
+    // References retained by EM (i.e. written to .props with non-zero abundance).
+    // A read whose MAP assignment falls on a reference EM pruned to zero is not
+    // supported by the estimated profile, so it is reclassified as unclassified
+    // in the matches output below (leaves .props/abundance untouched).
+    let props_refs: HashSet<RefIdx> = props
+        .iter()
+        .filter(|(_, prop)| **prop > 0.0)
+        .map(|(ref_idx, _)| *ref_idx)
+        .collect();
+
     // Build posteriors TSV
     let mut posteriors_tsv = String::from("ReadID\tRefID\tPosterior\n");
     for read_id in all_read_ids.iter() {
@@ -1727,6 +1718,14 @@ fn run_query(
             continue;
         }
         let ref_idx = read_assignments.get(read_idx.unwrap()).unwrap();
+
+        // Reclassify reads whose MAP reference was pruned by EM (absent from
+        // .props) as unclassified instead of assigning them a zero-abundance ref.
+        if !props_refs.contains(ref_idx) {
+            matches_tsv.push_str(&format!("{}\tunclassified\t-\t-\t-\n", **read_id));
+            continue;
+        }
+
         let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
         let read_id = read_ids_rev.get(read_idx.unwrap()).unwrap();
 
@@ -2558,9 +2557,9 @@ mod tests {
     /// Baseline: exact-prefix read must produce at least one MEM at offset 0
     /// (ref_start == read_start), which is the correct alignment position.
     /// Additional MEMs at other offsets may also be present when the reference
-    /// is repetitive; that is now expected after the merge_kmer_matches fix.
+    /// is repetitive; that is expected given SMEM seeding.
     #[test]
-    fn clean_kmer_matches_no_n_all_mems_have_zero_offset() {
+    fn clean_mem_matches_no_n_all_mems_have_zero_offset() {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let q_seq: Vec<u8> = record
