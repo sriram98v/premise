@@ -1,9 +1,7 @@
 use bio::stats::{LogProb, Prob};
 use itertools::izip;
-use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::{fs, io::Write};
 
 /// Floating-point type used for all EM probabilities and log-probabilities in linear space.
 ///
@@ -34,71 +32,6 @@ pub fn compute_match_log_prob(
         }
     }
     LogProb(match_log_likelihood)
-}
-
-/// Count the number of positions at which `read_seq` and `ref_seq` differ.
-pub fn num_mismatches(read_seq: &[u8], ref_seq: &[u8]) -> usize {
-    read_seq
-        .iter()
-        .zip(ref_seq.iter())
-        .map(|(a, b)| (a != b) as usize)
-        .sum()
-}
-
-/// Write alignment matches to a TSV file or stdout.
-///
-/// If `outpath` is `Some`, the results are written to that path (overwriting any existing file).
-/// If `outpath` is `None`, results are printed to stdout.
-/// Each row contains: Read_ID, Ref_ID, hit position, and log-likelihood.
-pub fn write_matches(
-    outpath: Option<&String>,
-    matches: &HashMap<String, Vec<(String, usize, f32)>>,
-) -> std::io::Result<()> {
-    match outpath {
-        Some(path) => {
-            if Path::new(path).exists() {
-                fs::remove_file(path)?;
-            }
-            let mut file_ref = fs::OpenOptions::new()
-                .create_new(true)
-                .append(true)
-                .open(path)
-                .expect("Invalid path for result file!");
-            let result_header: String =
-                "Read_ID\tRef_ID\thit position\tLog-Likelihood\n".to_string();
-            file_ref
-                .write_all(result_header.as_bytes())
-                .expect("write failed");
-            matches
-                .iter()
-                .filter(|(_seq_id, all_matches)| all_matches[0].0.is_empty())
-                .for_each(|(seq_id, all_matches)| {
-                    all_matches
-                        .iter()
-                        .for_each(|(read_id, hit_pos, match_score)| {
-                            let out_string: String =
-                                format!("{}\t{}\t{}\t{}\n", seq_id, read_id, hit_pos, match_score);
-                            file_ref
-                                .write_all(out_string.as_bytes())
-                                .expect("write failed");
-                        });
-                });
-        }
-        None => {
-            let result_header: String = "Read_ID\tRef_ID\tposition\tLog-Likelihood\n".to_string();
-            print!("{}", result_header);
-            matches.iter().for_each(|(seq_id, all_matches)| {
-                all_matches
-                    .iter()
-                    .for_each(|(read_id, hit_pos, match_score)| {
-                        let out_string: String =
-                            format!("{}\t{}\t{}\t{}\n", seq_id, read_id, hit_pos, match_score);
-                        println!("{}", out_string);
-                    });
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Convert a Phred+33 quality byte to its linear-space base-call error probability.
