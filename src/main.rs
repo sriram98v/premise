@@ -1688,6 +1688,16 @@ fn run_query(
         }
     }
 
+    // References retained by EM (i.e. written to .props with non-zero abundance).
+    // A read whose MAP assignment falls on a reference EM pruned to zero is not
+    // supported by the estimated profile, so it is reclassified as unclassified
+    // in the matches output below (leaves .props/abundance untouched).
+    let props_refs: HashSet<RefIdx> = props
+        .iter()
+        .filter(|(_, prop)| **prop > 0.0)
+        .map(|(ref_idx, _)| *ref_idx)
+        .collect();
+
     // Build posteriors TSV
     let mut posteriors_tsv = String::from("ReadID\tRefID\tPosterior\n");
     for read_id in all_read_ids.iter() {
@@ -1727,6 +1737,14 @@ fn run_query(
             continue;
         }
         let ref_idx = read_assignments.get(read_idx.unwrap()).unwrap();
+
+        // Reclassify reads whose MAP reference was pruned by EM (absent from
+        // .props) as unclassified instead of assigning them a zero-abundance ref.
+        if !props_refs.contains(ref_idx) {
+            matches_tsv.push_str(&format!("{}\tunclassified\t-\t-\t-\n", **read_id));
+            continue;
+        }
+
         let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
         let read_id = read_ids_rev.get(read_idx.unwrap()).unwrap();
 
@@ -2558,9 +2576,9 @@ mod tests {
     /// Baseline: exact-prefix read must produce at least one MEM at offset 0
     /// (ref_start == read_start), which is the correct alignment position.
     /// Additional MEMs at other offsets may also be present when the reference
-    /// is repetitive; that is now expected after the merge_kmer_matches fix.
+    /// is repetitive; that is expected given SMEM seeding.
     #[test]
-    fn clean_kmer_matches_no_n_all_mems_have_zero_offset() {
+    fn clean_mem_matches_no_n_all_mems_have_zero_offset() {
         let iofmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let q_seq: Vec<u8> = record
