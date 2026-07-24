@@ -1,4 +1,5 @@
 use bio::stats::{LogProb, Prob};
+use std::sync::LazyLock;
 use itertools::izip;
 use std::ffi::OsStr;
 use std::path::Path;
@@ -34,11 +35,27 @@ pub fn compute_match_log_prob(
     LogProb(match_log_likelihood)
 }
 
+/// Precomputed lookup table mapping every possible Phred+33 quality byte to its
+/// linear-space base-call error probability `10^(-((q - 33) / 10))`.
+///
+/// Built once on first use. On the alignment hot path `error_prob` is called
+/// once per base of every diagonal of every read (×4 orientations); memoizing
+/// the `powf` here removes it entirely from that loop. For valid quality bytes
+/// (`q >= 33`) the table values are bit-identical to the direct formula.
+static ERROR_PROB_LUT: LazyLock<[f64; 256]> = LazyLock::new(|| {
+    let mut table = [0.0f64; 256];
+    for (i, slot) in table.iter_mut().enumerate() {
+        *slot = 10_f64.powf(-((i as f64 - 33.0) / 10_f64));
+    }
+    table
+});
+
 /// Convert a Phred+33 quality byte to its linear-space base-call error probability.
 ///
-/// Uses the standard formula: P(error) = 10^(-(Q - 33) / 10).
+/// Uses the standard formula: P(error) = 10^(-(Q - 33) / 10), served from a
+/// precomputed 256-entry lookup table ([`ERROR_PROB_LUT`]).
 pub fn error_prob(q: u8) -> Prob {
-    Prob(10_f64.powf(-((q - 33) as f64 / 10_f64)))
+    Prob(ERROR_PROB_LUT[q as usize])
 }
 
 /// Return the DNA complement of a sequence (A↔T, C↔G).
