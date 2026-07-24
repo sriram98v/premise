@@ -18,6 +18,7 @@ use itertools::Itertools;
 use num::{Float, Zero};
 use rayon::prelude::*;
 use std::cmp;
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -63,6 +64,13 @@ impl std::ops::Deref for RefID {
 /// for the lifetime of a single run. `Deref`s to `usize`.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, Copy)]
 pub struct ReadIdx(usize);
+
+impl ReadIdx {
+    /// Construct a dense read index. Primarily for tests and benchmarks.
+    pub fn new(n: usize) -> Self {
+        Self(n)
+    }
+}
 
 impl std::ops::Deref for ReadIdx {
     type Target = usize;
@@ -298,7 +306,10 @@ pub struct SparseArray<T: Float + Zero + Copy + Send + Sync + Debug> {
 
 impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
     /// Insert a likelihood value for the (read, reference) pair, updating both index maps.
-    fn insert(&mut self, read_idx: ReadIdx, ref_idx: RefIdx, val: T) {
+    ///
+    /// Takes `&self` (all backing maps are `DashMap`s) so the DoK build can run
+    /// concurrently across reads.
+    fn insert(&self, read_idx: ReadIdx, ref_idx: RefIdx, val: T) {
         self.values.insert((read_idx, ref_idx), val);
         self.read_idxs_ref_map
             .entry(read_idx)
@@ -385,13 +396,15 @@ pub fn query_read(
     complement: bool,
 ) -> Result<MatchLikelihoods> {
     let read_len = record.seq().len();
-    let read_seq = match complement {
-        true => bio::alphabets::dna::revcomp(record.seq()),
-        false => record.seq().to_vec(),
+    // Borrow the forward-orientation sequence/quality directly; only the
+    // reverse-complement orientation needs to allocate (#3: cut per-pair Vec churn).
+    let read_seq: Cow<[u8]> = match complement {
+        true => Cow::Owned(bio::alphabets::dna::revcomp(record.seq())),
+        false => Cow::Borrowed(record.seq()),
     };
-    let read_qual = match complement {
-        true => record.qual().iter().rev().cloned().collect_vec(),
-        false => record.qual().to_vec(),
+    let read_qual: Cow<[u8]> = match complement {
+        true => Cow::Owned(record.qual().iter().rev().cloned().collect()),
+        false => Cow::Borrowed(record.qual()),
     };
     let q_seq: Vec<u8> = read_seq
         .iter()
@@ -402,32 +415,34 @@ pub fn query_read(
 
     let mems = clean_mem_matches(fmidx, header_to_ref, &q_seq, mem_seed_length);
 
-    mems.into_iter().for_each(|hit| {
-        let ref_id = hit.0;
+    mems.into_iter().for_each(|(ref_id, positions)| {
         let ref_seq = refs.get(&ref_id).unwrap();
         let ref_len = ref_seq.len();
 
-        for mem in hit.1.iter() {
+        // #2: dedup diagonals. Several SMEMs on the same reference can project to
+        // the same ref_pos; the ungapped rescore is deterministic per ref_pos, so
+        // score each distinct diagonal exactly once instead of re-scanning and
+        // overwriting. The resulting map is identical to scoring every SMEM.
+        let mut scored: HashSet<usize> = HashSet::new();
+        for mem in positions.iter() {
             let read_pos = mem.read_start;
-
             if mem.ref_start < read_pos {
                 continue;
             }
             let ref_pos = mem.ref_start - mem.read_start;
-            if ref_pos + read_len <= ref_len {
-                let ref_match_seg = &ref_seq[ref_pos..ref_pos + read_len];
-                let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, ref_match_seg);
-
-                if match_log_prob.exp() != 0.0 {
-                    // update match score
-                    match_likelihood
-                        .entry(ref_id)
-                        .and_modify(|e| {
-                            e.insert(ref_pos, match_log_prob);
-                        })
-                        .or_default()
-                        .insert(ref_pos, match_log_prob);
-                }
+            if ref_pos + read_len > ref_len {
+                continue;
+            }
+            if !scored.insert(ref_pos) {
+                continue;
+            }
+            let ref_match_seg = &ref_seq[ref_pos..ref_pos + read_len];
+            let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, ref_match_seg);
+            if match_log_prob.exp() != 0.0 {
+                match_likelihood
+                    .entry(ref_id)
+                    .or_default()
+                    .insert(ref_pos, match_log_prob);
             }
         }
     });
@@ -1550,6 +1565,34 @@ fn run_alignment(
 /// - `aligns_tsv`: raw per-read alignment likelihoods (TSV, same format as `run_alignment`)
 /// - `em_data_likelihoods`: data log-likelihood at each EM iteration
 /// - `log_str`: human-readable summary of run parameters
+/// Build the DoK [`SparseArray`] of per-(read, reference) likelihoods from the
+/// alignment results. NOTE: parallelizing this across reads with a shared
+/// `DashMap` was benchmarked (#4) and regressed (~16% slower at 2000 reads) due
+/// to shard contention, so the build is kept serial; the extraction stands on
+/// its own and is covered by `build/sparse_from_alignments`.
+///
+/// Only finite, non-zero full-match likelihoods are inserted, matching the
+/// previous serial construction exactly.
+pub fn build_sparse_array<'a>(
+    out_aligns: &ReadAlignments<'a>,
+    read_ids: &HashMap<&'a ReadID, ReadIdx>,
+) -> SparseArray<EMProb> {
+    let ll_array: SparseArray<EMProb> = SparseArray::default();
+    out_aligns.iter().for_each(|val| {
+        let read_id = val.key();
+        let read_idx = *read_ids.get(read_id).unwrap();
+        for (ref_idx, positions) in val.value() {
+            for score in positions.iter() {
+                let ll = score.get_full_match_ll().exp();
+                if ll.is_finite() && ll != 0.0 {
+                    ll_array.insert(read_idx, *ref_idx, ll as EMProb);
+                }
+            }
+        }
+    });
+    ll_array
+}
+
 fn run_query(
     ref_file: &str,
     r1_file: &str,
@@ -1640,25 +1683,7 @@ fn run_query(
         read_ids_rev.insert(ReadIdx(n), *val.key());
     }
 
-    let mut ll_array: SparseArray<EMProb> = SparseArray::default();
-    for val in out_aligns.iter() {
-        let read_id = val.key();
-        let alignments = val.value();
-        for (ref_idx, positions) in alignments {
-            let read_idx = read_ids.get(read_id).unwrap();
-            for score in positions.iter() {
-                if score.get_full_match_ll().exp().is_finite()
-                    && score.get_full_match_ll().exp() != 0.0
-                {
-                    ll_array.insert(
-                        *read_idx,
-                        *ref_idx,
-                        score.get_full_match_ll().exp() as EMProb,
-                    );
-                }
-            }
-        }
-    }
+    let ll_array = build_sparse_array(&out_aligns, &read_ids);
 
     let (read_assignments, props, posteriors, em_data_likelihoods) = if use_penalty {
         get_proportions_par_sparse_l1_reg(
