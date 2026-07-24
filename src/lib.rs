@@ -10,15 +10,25 @@ use clap::{arg, Arg, ArgAction, Command};
 use core::f64;
 use dashmap::{DashMap, DashSet};
 use flate2::read::GzDecoder;
-use haystackfm::alphabet::encode_char;
-use haystackfm::{BidirFmIndex as RefIndex, DnaSequence, FmIndexConfig as RefIndexConfig};
+use haystackfm::alphabet;
+use haystackfm::alphabet::{decode_char, encode_byte};
+pub use haystackfm::BidirFmIndex as RefIndex;
+use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
+
+/// Dense integer identifier for a reference sequence, assigned by the FM-index in FASTA
+/// order and stable across serialization.
+///
+/// This is haystackfm's own id type, reported directly by `find_smems`, so seeding never
+/// hashes a header string. It is the key for every reference-indexed map in the alignment
+/// and EM stages; headers are resolved only at output time via `RefIndex::seq_header`.
+pub use haystackfm::SeqId;
 use indicatif::ProgressStyle;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
 use num::{Float, Zero};
 use rayon::prelude::*;
-use std::cmp;
 use std::borrow::Cow;
+use std::cmp;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -38,20 +48,6 @@ use utils::*;
 pub struct ReadID(String);
 
 impl std::ops::Deref for ReadID {
-    type Target = String;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// Newtype wrapper around a raw reference sequence identifier string.
-///
-/// Stored in the FM-index alongside sequence data and used to label output rows.
-/// `Deref`s to `String` for convenient string operations.
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-pub struct RefID(String);
-
-impl std::ops::Deref for RefID {
     type Target = String;
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -79,96 +75,10 @@ impl std::ops::Deref for ReadIdx {
     }
 }
 
-/// Dense integer index assigned to each reference sequence for use as a `SparseArray` column key.
-///
-/// Indices correspond to the order in which sequences appear in the FASTA file
-/// and are stored in the serialized FM-index. `Deref`s to `usize`.
-#[derive(Debug, Clone, Hash, PartialEq, Eq, Copy)]
-pub struct RefIdx(usize);
-
-impl std::ops::Deref for RefIdx {
-    type Target = usize;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// Serializable container for a built FM-index and its associated metadata.
-///
-/// Bundles the raw [`RefIndex`] with bidirectional index↔ID mappings and
-/// the original reference sequences, so that a single `.fmidx` file contains
-/// everything needed for alignment without re-reading the FASTA.
-pub struct IOFMIndex {
-    pub fmidx: RefIndex,
-    pub idx_to_id: HashMap<RefIdx, RefID>,
-    pub idx_to_seq: HashMap<RefIdx, Vec<u8>>,
-    pub header_to_idx: HashMap<String, RefIdx>,
-}
-
-impl IOFMIndex {
-    fn to_bytes(&self) -> anyhow::Result<Vec<u8>> {
-        let fmidx_bytes = self
-            .fmidx
-            .to_bytes()
-            .map_err(|e| anyhow::anyhow!("FmIndex serialize error: {}", e))?;
-        let idx_to_id: Vec<(usize, String)> = self
-            .idx_to_id
-            .iter()
-            .map(|(k, v)| (**k, v.0.clone()))
-            .collect();
-        let idx_to_seq: Vec<(usize, Vec<u8>)> = self
-            .idx_to_seq
-            .iter()
-            .map(|(k, v)| (**k, v.clone()))
-            .collect();
-        let fmidx_len = fmidx_bytes.len() as u64;
-        let mut out = Vec::new();
-        out.extend_from_slice(&fmidx_len.to_le_bytes());
-        out.extend_from_slice(&fmidx_bytes);
-        let rest = bincode::serialize(&(idx_to_id, idx_to_seq))
-            .map_err(|e| anyhow::anyhow!("bincode serialize error: {}", e))?;
-        out.extend_from_slice(&rest);
-        Ok(out)
-    }
-
-    pub fn from_bytes(data: &[u8]) -> anyhow::Result<Self> {
-        if data.len() < 8 {
-            return Err(anyhow::anyhow!("IOFMIndex data truncated"));
-        }
-        let fmidx_len = u64::from_le_bytes(data[..8].try_into().unwrap()) as usize;
-        if data.len() < 8 + fmidx_len {
-            return Err(anyhow::anyhow!("IOFMIndex fmidx bytes truncated"));
-        }
-        let fmidx_bytes = &data[8..8 + fmidx_len];
-        let rest = &data[8 + fmidx_len..];
-        let fmidx = RefIndex::from_bytes(fmidx_bytes)
-            .map_err(|e| anyhow::anyhow!("FmIndex deserialize error: {}", e))?;
-        let (idx_to_id_vec, idx_to_seq_vec): (Vec<(usize, String)>, Vec<(usize, Vec<u8>)>) =
-            bincode::deserialize(rest)
-                .map_err(|e| anyhow::anyhow!("bincode deserialize error: {}", e))?;
-        let idx_to_id: HashMap<RefIdx, RefID> = idx_to_id_vec
-            .into_iter()
-            .map(|(k, v)| (RefIdx(k), RefID(v)))
-            .collect();
-        let idx_to_seq: HashMap<RefIdx, Vec<u8>> = idx_to_seq_vec
-            .into_iter()
-            .map(|(k, v)| (RefIdx(k), v))
-            .collect();
-        let header_to_idx: HashMap<String, RefIdx> =
-            idx_to_id.iter().map(|(k, v)| (v.0.clone(), *k)).collect();
-        Ok(Self {
-            fmidx,
-            idx_to_id,
-            idx_to_seq,
-            header_to_idx,
-        })
-    }
-}
-
 /// Per-read alignment likelihoods: maps each reference index to a map of
 /// alignment start positions → log-probability of the read originating from
 /// that position on that reference.
-pub struct MatchLikelihoods(HashMap<RefIdx, HashMap<usize, LogProb>>);
+pub struct MatchLikelihoods(HashMap<SeqId, HashMap<usize, LogProb>>);
 
 impl MatchLikelihoods {
     /// Create an empty `MatchLikelihoods` map.
@@ -178,7 +88,7 @@ impl MatchLikelihoods {
 }
 
 impl std::ops::Deref for MatchLikelihoods {
-    type Target = HashMap<RefIdx, HashMap<usize, LogProb>>;
+    type Target = HashMap<SeqId, HashMap<usize, LogProb>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -238,7 +148,7 @@ impl ReadAlignment {
 /// likelihood deques. The inner [`DashMap`] allows concurrent writes during
 /// parallel alignment.
 #[derive(Debug)]
-pub struct ReadAlignments<'a>(DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<ReadAlignment>>>);
+pub struct ReadAlignments<'a>(DashMap<&'a ReadID, HashMap<SeqId, VecDeque<ReadAlignment>>>);
 
 impl<'a> ReadAlignments<'a> {
     /// Create an empty `ReadAlignments` map.
@@ -248,7 +158,7 @@ impl<'a> ReadAlignments<'a> {
 }
 
 impl<'a> std::ops::Deref for ReadAlignments<'a> {
-    type Target = DashMap<&'a ReadID, HashMap<RefIdx, VecDeque<ReadAlignment>>>;
+    type Target = DashMap<&'a ReadID, HashMap<SeqId, VecDeque<ReadAlignment>>>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -299,9 +209,9 @@ impl ReadPair {
 /// Dictionary of Keys (DoK) format for sparse array to store likelihoods
 #[derive(Debug, Clone, Default)]
 pub struct SparseArray<T: Float + Zero + Copy + Send + Sync + Debug> {
-    pub values: DashMap<(ReadIdx, RefIdx), T>,
-    pub read_idxs_ref_map: DashMap<ReadIdx, HashSet<RefIdx>>,
-    pub ref_idxs_read_map: DashMap<RefIdx, HashSet<ReadIdx>>,
+    pub values: DashMap<(ReadIdx, SeqId), T>,
+    pub read_idxs_ref_map: DashMap<ReadIdx, HashSet<SeqId>>,
+    pub ref_idxs_read_map: DashMap<SeqId, HashSet<ReadIdx>>,
 }
 
 impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
@@ -309,7 +219,7 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
     ///
     /// Takes `&self` (all backing maps are `DashMap`s) so the DoK build can run
     /// concurrently across reads.
-    fn insert(&self, read_idx: ReadIdx, ref_idx: RefIdx, val: T) {
+    fn insert(&self, read_idx: ReadIdx, ref_idx: SeqId, val: T) {
         self.values.insert((read_idx, ref_idx), val);
         self.read_idxs_ref_map
             .entry(read_idx)
@@ -322,7 +232,7 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
     }
 
     /// Return the stored value for a (read, reference) pair, or zero if absent.
-    fn get(&self, index: &(ReadIdx, RefIdx)) -> T {
+    fn get(&self, index: &(ReadIdx, SeqId)) -> T {
         if self.values.contains_key(index) {
             *self.values.get(index).unwrap()
         } else {
@@ -336,14 +246,14 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
     }
 
     /// Return the set of all reference indices that have at least one stored entry.
-    fn get_ref_idxs(&self) -> HashSet<RefIdx> {
+    fn get_ref_idxs(&self) -> HashSet<SeqId> {
         self.ref_idxs_read_map.iter().map(|x| *x.key()).collect()
     }
 
     /// Return all (reference index, value) pairs stored for a given read.
-    fn get_all_read_hits_idx(&self, read_idx: &ReadIdx) -> Vec<(RefIdx, T)> {
-        let ref_idxs: &HashSet<RefIdx> = &self.read_idxs_ref_map.get(read_idx).unwrap();
-        let mut out: Vec<(RefIdx, T)> = Vec::with_capacity(ref_idxs.len());
+    fn get_all_read_hits_idx(&self, read_idx: &ReadIdx) -> Vec<(SeqId, T)> {
+        let ref_idxs: &HashSet<SeqId> = &self.read_idxs_ref_map.get(read_idx).unwrap();
+        let mut out: Vec<(SeqId, T)> = Vec::with_capacity(ref_idxs.len());
 
         for ref_idx in ref_idxs {
             if let Some(x) = self.values.get(&(*read_idx, *ref_idx)) {
@@ -357,11 +267,10 @@ impl<T: Float + Zero + Copy + Send + Sync + Debug> SparseArray<T> {
 /// Filters the matches found for different kmers and removes repeated alignments.
 pub fn clean_mem_matches(
     fmidx: &RefIndex,
-    header_to_ref: &HashMap<String, RefIdx>,
     q_seq: &[u8],
     mem_seed_length: usize,
-) -> HashMap<RefIdx, Vec<MEMPos>> {
-    let mut mems: HashMap<RefIdx, Vec<MEMPos>> = HashMap::new();
+) -> HashMap<SeqId, Vec<MEMPos>> {
+    let mut mems: HashMap<SeqId, Vec<MEMPos>> = HashMap::new();
 
     let x = fmidx.find_smems(q_seq, cmp::min(mem_seed_length, q_seq.len()), true);
 
@@ -370,7 +279,9 @@ pub fn clean_mem_matches(
         let q_end = i.query_end;
         let q_len = q_end - q_start;
         for j in &i.positions {
-            let ref_idx = header_to_ref[&j.0];
+            // The index reports the reference id directly, so seeding costs no string
+            // hash per occurrence — previously the dominant per-hit cost here.
+            let ref_idx = j.0;
             let pos = j.1 as usize;
             mems.entry(ref_idx).or_default().push(MEMPos {
                 ref_start: pos,
@@ -389,8 +300,6 @@ pub fn clean_mem_matches(
 /// The second returns the sum of likelihoods of all alignments to each reference.(reference_name, (sum of likelihood of all alignments)).
 pub fn query_read(
     fmidx: &RefIndex,
-    header_to_ref: &HashMap<String, RefIdx>,
-    refs: &HashMap<RefIdx, Vec<u8>>,
     record: &fastq::Record,
     mem_seed_length: usize,
     complement: bool,
@@ -406,17 +315,22 @@ pub fn query_read(
         true => Cow::Owned(record.qual().iter().rev().cloned().collect()),
         false => Cow::Borrowed(record.qual()),
     };
+    // One encoded copy of the read serves both seeding and rescoring: the index stores
+    // and reports bases as alphabet codes, so scoring compares codes to codes.
+    // Unencodable bytes map to `N` rather than being dropped, so this stays index-aligned
+    // with `read_qual` and with the read offsets that `find_smems` reports.
     let q_seq: Vec<u8> = read_seq
         .iter()
-        .filter_map(|&b| encode_char(b as char))
+        .map(|&b| encode_byte(b).unwrap_or(alphabet::N))
         .collect_vec();
 
     let mut match_likelihood = MatchLikelihoods::new();
 
-    let mems = clean_mem_matches(fmidx, header_to_ref, &q_seq, mem_seed_length);
+    let mems = clean_mem_matches(fmidx, &q_seq, mem_seed_length);
 
     mems.into_iter().for_each(|(ref_id, positions)| {
-        let ref_seq = refs.get(&ref_id).unwrap();
+        // The index owns the reference bases, so there is no side table to probe.
+        let ref_seq = fmidx.sequence(ref_id).unwrap();
         let ref_len = ref_seq.len();
 
         // #2: dedup diagonals. Several SMEMs on the same reference can project to
@@ -437,7 +351,7 @@ pub fn query_read(
                 continue;
             }
             let ref_match_seg = &ref_seq[ref_pos..ref_pos + read_len];
-            let match_log_prob = compute_match_log_prob(&read_seq, &read_qual, ref_match_seg);
+            let match_log_prob = compute_match_log_prob(&q_seq, &read_qual, ref_match_seg);
             if match_log_prob.exp() != 0.0 {
                 match_likelihood
                     .entry(ref_id)
@@ -493,14 +407,12 @@ pub fn merge_read_pairs(
 /// references that received at least one alignment.
 pub fn process_read_pairs<'a>(
     fmidx: &RefIndex,
-    header_to_ref: &HashMap<String, RefIdx>,
-    refs: &HashMap<RefIdx, Vec<u8>>,
     read_pairs: &'a [ReadPair],
     mem_seed_length: usize,
     eps_1: LogProb,
     eps_2: LogProb,
     progress: Option<Arc<QueryProgress>>,
-) -> Result<(ReadAlignments<'a>, DashSet<RefIdx>)> {
+) -> Result<(ReadAlignments<'a>, DashSet<SeqId>)> {
     let out_aligns = ReadAlignments::new();
 
     let pb =
@@ -513,7 +425,7 @@ pub fn process_read_pairs<'a>(
             .store(read_pairs.len() as u64, Ordering::Relaxed);
     }
 
-    let all_ref_ids: DashSet<RefIdx> = DashSet::new();
+    let all_ref_ids: DashSet<SeqId> = DashSet::new();
 
     let half_log_prob = LogProb::from(Prob(0.5));
 
@@ -526,35 +438,31 @@ pub fn process_read_pairs<'a>(
             let r1_len = r1_rec.len();
             let r2_len = r2_rec.len();
 
-            let mut match_likelihoods: HashMap<RefIdx, ReadAlignment> = HashMap::new();
+            let mut match_likelihoods: HashMap<SeqId, ReadAlignment> = HashMap::new();
 
-            let r1_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, false)
-                    .with_context(|| {
-                        format!("failed to align read '{}' (R1)", read_pair.read_id.as_str())
-                    })?;
-            let r1_rc_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r1_rec, mem_seed_length, true)
-                    .with_context(|| {
-                        format!(
-                            "failed to align read '{}' (R1, reverse-complement)",
-                            read_pair.read_id.as_str()
-                        )
-                    })?;
+            let r1_match_likelihoods = query_read(fmidx, r1_rec, mem_seed_length, false)
+                .with_context(|| {
+                    format!("failed to align read '{}' (R1)", read_pair.read_id.as_str())
+                })?;
+            let r1_rc_match_likelihoods = query_read(fmidx, r1_rec, mem_seed_length, true)
+                .with_context(|| {
+                    format!(
+                        "failed to align read '{}' (R1, reverse-complement)",
+                        read_pair.read_id.as_str()
+                    )
+                })?;
 
-            let r2_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, false)
-                    .with_context(|| {
-                        format!("failed to align read '{}' (R2)", read_pair.read_id.as_str())
-                    })?;
-            let r2_rc_match_likelihoods =
-                query_read(fmidx, header_to_ref, refs, r2_rec, mem_seed_length, true)
-                    .with_context(|| {
-                        format!(
-                            "failed to align read '{}' (R2, reverse-complement)",
-                            read_pair.read_id.as_str()
-                        )
-                    })?;
+            let r2_match_likelihoods = query_read(fmidx, r2_rec, mem_seed_length, false)
+                .with_context(|| {
+                    format!("failed to align read '{}' (R2)", read_pair.read_id.as_str())
+                })?;
+            let r2_rc_match_likelihoods = query_read(fmidx, r2_rec, mem_seed_length, true)
+                .with_context(|| {
+                    format!(
+                        "failed to align read '{}' (R2, reverse-complement)",
+                        read_pair.read_id.as_str()
+                    )
+                })?;
 
             r1_match_likelihoods
                 .keys()
@@ -664,8 +572,8 @@ pub fn process_read_pairs<'a>(
 /// compacted to a dense `0..n_refs` id space so proportions live in a flat
 /// `Vec<EMProb>` rather than a `HashMap`.
 struct CsrLikelihood {
-    /// Compact reference id → original [`RefIdx`].
-    refs: Vec<RefIdx>,
+    /// Compact reference id → original [`SeqId`].
+    refs: Vec<SeqId>,
     /// CSR row → original [`ReadIdx`].
     reads: Vec<ReadIdx>,
     /// `row_ptr[r]..row_ptr[r + 1]` bounds read `r`'s entries in `col`/`lik`.
@@ -681,9 +589,9 @@ impl CsrLikelihood {
     /// parallel, then flattened into contiguous CSR arrays.
     fn build(ll_array: &SparseArray<EMProb>) -> Self {
         // Deterministic, compact reference ordering.
-        let mut refs: Vec<RefIdx> = ll_array.get_ref_idxs().into_iter().collect();
+        let mut refs: Vec<SeqId> = ll_array.get_ref_idxs().into_iter().collect();
         refs.sort_unstable_by_key(|r| r.0);
-        let ref_compact: HashMap<RefIdx, u32> = refs
+        let ref_compact: HashMap<SeqId, u32> = refs
             .iter()
             .enumerate()
             .map(|(i, r)| (*r, i as u32))
@@ -807,9 +715,9 @@ impl CsrLikelihood {
     /// Materialize the final posterior weight matrix and per-read MAP assignment
     /// from proportions `pi`, matching the DoK [`SparseArray`] interface expected
     /// by callers.
-    fn finalize(&self, pi: &[EMProb]) -> (HashMap<ReadIdx, RefIdx>, SparseArray<EMProb>) {
+    fn finalize(&self, pi: &[EMProb]) -> (HashMap<ReadIdx, SeqId>, SparseArray<EMProb>) {
         let w: SparseArray<EMProb> = SparseArray::default();
-        let results: HashMap<ReadIdx, RefIdx> = (0..self.n_reads())
+        let results: HashMap<ReadIdx, SeqId> = (0..self.n_reads())
             .into_par_iter()
             .map(|r| {
                 let (s, e) = (self.row_ptr[r], self.row_ptr[r + 1]);
@@ -862,8 +770,8 @@ fn get_proportions_par_sparse(
     num_iter: usize,
     progress: Option<Arc<QueryProgress>>,
 ) -> (
-    HashMap<ReadIdx, RefIdx>,
-    HashMap<RefIdx, EMProb>,
+    HashMap<ReadIdx, SeqId>,
+    HashMap<SeqId, EMProb>,
     SparseArray<EMProb>,
     Vec<EMProb>,
 ) {
@@ -896,13 +804,12 @@ fn get_proportions_par_sparse(
         let (data_loglikelihood, ej) = csr.e_step(&pi);
 
         // M-step: unpenalized closed-form update (rho = 20, omega = 1e-20).
-        let ejs: HashMap<RefIdx, EMProb> = (0..n_refs).map(|j| (csr.refs[j], ej[j])).collect();
-        let lambda_init = ejs
-            .values()
+        let lambda_init = ej
+            .iter()
             .map(|x| x - 20.0)
             .max_by(|f1, f2| EMProb::total_cmp(f1, f2))
             .unwrap();
-        let lambda = _update_lambda(20.0, 1e-20, &ejs, lambda_init, num_iter);
+        let lambda = _update_lambda(20.0, 1e-20, &ej, lambda_init, num_iter);
         pi = (0..n_refs)
             .map(|j| {
                 let tmp_pi = _update_pi(20.0, 1e-20, ej[j], lambda);
@@ -933,7 +840,7 @@ fn get_proportions_par_sparse(
 
     let (results, w) = csr.finalize(&last_pi);
 
-    let props: HashMap<RefIdx, EMProb> = (0..n_refs)
+    let props: HashMap<SeqId, EMProb> = (0..n_refs)
         .filter(|&j| pi[j] * (num_reads as EMProb) > 1.0)
         .map(|j| (csr.refs[j], pi[j]))
         .collect();
@@ -957,7 +864,7 @@ fn _update_pi(rho: EMProb, omega: EMProb, ej: EMProb, lambda: EMProb) -> EMProb 
 fn _update_lambda(
     rho: EMProb,
     omega: EMProb,
-    ejs: &HashMap<RefIdx, EMProb>,
+    ejs: &[EMProb],
     lambda_init: EMProb,
     iterations: usize,
 ) -> EMProb {
@@ -975,10 +882,9 @@ fn _update_lambda(
 /// Evaluate the constraint function f(λ) = Σ_j π_j(λ) − 1 used by Newton-Raphson.
 ///
 /// A root of this function gives the λ for which the estimated proportions sum to one.
-fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, EMProb>) -> EMProb {
-    ejs.keys()
-        .map(|ref_idx| {
-            let ej = *ejs.get(ref_idx).unwrap();
+fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &[EMProb]) -> EMProb {
+    ejs.iter()
+        .map(|&ej| {
             let phi = _compute_phi(lambda, omega, rho, ej);
             -phi + (phi * phi + 4.0 * lambda * ej * omega).sqrt()
         })
@@ -987,15 +893,9 @@ fn _compute_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &HashMap<RefIdx, 
 }
 
 /// Evaluate the derivative f′(λ) = Σ_j ∂π_j/∂λ used by Newton-Raphson.
-fn _compute_deriv_f(
-    lambda: EMProb,
-    omega: EMProb,
-    rho: EMProb,
-    ejs: &HashMap<RefIdx, EMProb>,
-) -> EMProb {
-    ejs.keys()
-        .map(|ref_idx| {
-            let ej = *ejs.get(ref_idx).unwrap();
+fn _compute_deriv_f(lambda: EMProb, omega: EMProb, rho: EMProb, ejs: &[EMProb]) -> EMProb {
+    ejs.iter()
+        .map(|&ej| {
             let phi = _compute_phi(lambda, omega, rho, ej);
             -omega
                 + 0.5
@@ -1026,8 +926,8 @@ fn get_proportions_par_sparse_l1_reg(
     em_threshold: EMProb,
     progress: Option<Arc<QueryProgress>>,
 ) -> (
-    HashMap<ReadIdx, RefIdx>,
-    HashMap<RefIdx, EMProb>,
+    HashMap<ReadIdx, SeqId>,
+    HashMap<SeqId, EMProb>,
     SparseArray<EMProb>,
     Vec<EMProb>,
 ) {
@@ -1070,13 +970,12 @@ fn get_proportions_par_sparse_l1_reg(
         data_likelihoods.push(data_loglikelihood);
 
         // M-step: L1-penalized closed-form update solved via Newton-Raphson.
-        let ejs: HashMap<RefIdx, EMProb> = (0..n_refs).map(|j| (csr.refs[j], ej[j])).collect();
-        let lambda_init = ejs
-            .values()
+        let lambda_init = ej
+            .iter()
             .map(|x| x - rho)
             .max_by(|f1, f2| EMProb::total_cmp(f1, f2))
             .unwrap();
-        let lambda = _update_lambda(rho, omega, &ejs, lambda_init, num_iter);
+        let lambda = _update_lambda(rho, omega, &ej, lambda_init, num_iter);
         pi = (0..n_refs)
             .map(|j| {
                 let tmp_pi = _update_pi(rho, omega, ej[j], lambda);
@@ -1103,7 +1002,7 @@ fn get_proportions_par_sparse_l1_reg(
 
     let (results, w) = csr.finalize(&last_pi);
 
-    let props: HashMap<RefIdx, EMProb> = (0..n_refs)
+    let props: HashMap<SeqId, EMProb> = (0..n_refs)
         .filter(|&j| pi[j] * (num_reads as EMProb) > 1.0)
         .map(|j| (csr.refs[j], pi[j]))
         .collect();
@@ -1113,25 +1012,21 @@ fn get_proportions_par_sparse_l1_reg(
 
 /// Build a serialized FM-index from raw FASTA bytes.
 ///
-/// Parses all records from `fasta_data`, constructs a [`FmIndexFlat64`] over the
-/// concatenated sequences using an IUPAC-tolerant DNA alphabet, serializes the
-/// index together with its ID↔index mappings into a byte vector, and returns
-/// that vector alongside a human-readable log string.
+/// Parses all records from `fasta_data` and constructs a [`RefIndex`] over the concatenated
+/// sequences using an IUPAC-tolerant DNA alphabet. The index retains the bases and headers
+/// itself, so the serialized form is exactly the index — no side tables. Returns those bytes
+/// alongside a human-readable log string.
 pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     let cursor = Cursor::new(fasta_data);
     let reader = BufReader::new(cursor);
     let records = fasta::Reader::new(reader).records();
 
-    let mut ref_ids: HashMap<RefID, RefIdx> = HashMap::new();
-    let mut ref_ids_rev: HashMap<RefIdx, RefID> = HashMap::new();
-    let mut refs: HashMap<RefIdx, Vec<u8>> = HashMap::new();
+    let mut headers: Vec<String> = vec![];
     let mut refs_texts: Vec<Vec<u8>> = vec![];
 
-    for (idx, result) in records.enumerate() {
+    for result in records {
         let record = result.map_err(|e| anyhow::anyhow!("FASTA parse error: {}", e))?;
-        ref_ids.insert(RefID(record.id().to_string()), RefIdx(idx));
-        ref_ids_rev.insert(RefIdx(idx), RefID(record.id().to_string()));
-        refs.insert(RefIdx(idx), record.seq().to_vec());
+        headers.push(record.id().to_string());
         refs_texts.push(record.seq().to_vec());
     }
 
@@ -1139,19 +1034,31 @@ pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
         return Err(anyhow::anyhow!("No sequences found in FASTA file"));
     }
 
+    // Headers must be unique: they are the index's `SeqId` labels, and a collision would
+    // otherwise surface as an opaque error from deep inside index construction.
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for (idx, header) in headers.iter().enumerate() {
+        if let Some(first) = seen.insert(header.as_str(), idx) {
+            return Err(anyhow::anyhow!(
+                "duplicate FASTA header '{}' (records {} and {}); \
+                 reference headers must be unique",
+                header,
+                first + 1,
+                idx + 1
+            ));
+        }
+    }
+
     let log_str = format!(
         "Timestamp: {}\nNum references: {}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
-        ref_ids.len(),
+        headers.len(),
     );
     println!("{}", log_str);
 
     let sequences: Vec<DnaSequence> = (0..refs_texts.len())
         .map(|i| -> anyhow::Result<DnaSequence> {
-            let header = ref_ids_rev
-                .get(&RefIdx(i))
-                .map(|id| id.0.as_str())
-                .unwrap_or("");
+            let header = headers[i].as_str();
             let seq_str: String = str::from_utf8(&refs_texts[i])
                 .map_err(|e| {
                     anyhow::anyhow!("FASTA sequence for record {} is not valid UTF-8: {}", i, e)
@@ -1163,7 +1070,11 @@ pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
                 })
                 .collect();
             DnaSequence::from_str_with_header(&seq_str, header).map_err(|e| {
-                anyhow::anyhow!("could not build DNA sequence for record '{}': {}", header, e)
+                anyhow::anyhow!(
+                    "could not build DNA sequence for record '{}': {}",
+                    header,
+                    e
+                )
             })
         })
         .collect::<anyhow::Result<Vec<DnaSequence>>>()?;
@@ -1176,18 +1087,25 @@ pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     let fmidx = RefIndex::build_cpu(&sequences, &config)
         .map_err(|e| anyhow::anyhow!("FM-index construction error: {}", e))?;
 
-    let header_to_idx: HashMap<String, RefIdx> =
-        ref_ids_rev.iter().map(|(k, v)| (v.0.clone(), *k)).collect();
-
-    let io_struct = IOFMIndex {
-        fmidx,
-        idx_to_id: ref_ids_rev,
-        idx_to_seq: refs,
-        header_to_idx,
-    };
-
-    let bytes = io_struct.to_bytes()?;
+    let bytes = fmidx
+        .to_bytes()
+        .map_err(|e| anyhow::anyhow!("FmIndex serialize error: {}", e))?;
     Ok((bytes, log_str))
+}
+
+/// Load a serialized [`RefIndex`] from `.fmidx` bytes.
+///
+/// Indexes written before the reference bases moved into the index itself are rejected here
+/// rather than misparsed, so the error names the file and says how to recover.
+pub fn load_index(bytes: &[u8], path: &str) -> Result<RefIndex> {
+    RefIndex::from_bytes(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to parse FM-index '{}': {}. Indexes built by an earlier version of \
+             premise are not readable; rebuild it with the `build` subcommand.",
+            path,
+            e
+        )
+    })
 }
 
 /// HTTP handler for `POST /api/build`.
@@ -1356,8 +1274,7 @@ fn load_fastq_forward(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
         Some("gz") => {
             let f = File::open(path)
                 .with_context(|| format!("failed to open R1 (forward) reads file '{}'", path))?;
-            let records =
-                fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f))).records();
+            let records = fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f))).records();
             Ok(collect_fastq_records(records, "R1", path)
                 .into_iter()
                 .map(|rec| (ReadID(rec.id().to_string()), rec))
@@ -1389,8 +1306,7 @@ fn load_fastq_reverse(path: &str) -> Result<HashMap<ReadID, fastq::Record>> {
         Some("gz") => {
             let f = File::open(path)
                 .with_context(|| format!("failed to open R2 (reverse) reads file '{}'", path))?;
-            let records =
-                fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f))).records();
+            let records = fastq::Reader::from_bufread(BufReader::new(GzDecoder::new(f))).records();
             Ok(collect_fastq_records(records, "R2", path)
                 .into_iter()
                 .map(|rec| (ReadID(rec.id().to_string()), rec))
@@ -1487,12 +1403,7 @@ fn run_alignment(
             ref_file
         )
     })?;
-    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
-        .with_context(|| format!("failed to parse FM-index '{}'", ref_file))?;
-    let fmidx = iofmidx.fmidx;
-    let ref_ids_rev = iofmidx.idx_to_id;
-    let refs = iofmidx.idx_to_seq;
-    let header_to_idx = iofmidx.header_to_idx;
+    let fmidx = load_index(&file_bytes, ref_file)?;
 
     let log_str = format!(
         "Timestamp: {}\nNum Threads: {}\nMEM seed length: {}\nEps_2: {:e}",
@@ -1505,8 +1416,6 @@ fn run_alignment(
 
     let (out_alignments, _) = process_read_pairs(
         &fmidx,
-        &header_to_idx,
-        &refs,
         &all_reads,
         mem_seed_length,
         LogProb(f64::NEG_INFINITY),
@@ -1530,12 +1439,12 @@ fn run_alignment(
         let read_idx = *read_ids.get(read_id).unwrap();
         let read_aligns = out_alignments.get(read_id).unwrap();
         for (ref_idx, aligns) in read_aligns.iter() {
-            let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
             for likelihood in aligns {
                 out.push_str(&format!(
                     "{}\t{}\t{:.5e}\t{}\t{}\n",
                     ***read_ids_rev.get(&read_idx).unwrap(),
-                    *ref_id,
+                    ref_id,
                     likelihood.get_full_match_ll().exp(),
                     likelihood.get_pos().0,
                     likelihood.get_pos().1,
@@ -1645,12 +1554,7 @@ fn run_query(
             ref_file
         )
     })?;
-    let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
-        .with_context(|| format!("failed to parse FM-index '{}'", ref_file))?;
-    let fmidx = iofmidx.fmidx;
-    let ref_ids_rev = iofmidx.idx_to_id;
-    let refs = iofmidx.idx_to_seq;
-    let header_to_idx = iofmidx.header_to_idx;
+    let fmidx = load_index(&file_bytes, ref_file)?;
 
     let log_str = format!("Timestamp: {}\nNum Threads: {}\nMEM seed length: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -1667,8 +1571,6 @@ fn run_query(
 
     let (out_aligns, _all_refs) = process_read_pairs(
         &fmidx,
-        &header_to_idx,
-        &refs,
         &all_reads,
         mem_seed_length,
         LogProb(eps_1.ln()),
@@ -1702,8 +1604,8 @@ fn run_query(
     let mut props_tsv = String::new();
     for (ref_idx, prop) in &props {
         if *prop > 0.0 {
-            let ref_id = ref_ids_rev.get(ref_idx).unwrap();
-            props_tsv.push_str(&format!("{}\t{:.5e}\n", **ref_id, prop));
+            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
+            props_tsv.push_str(&format!("{}\t{:.5e}\n", ref_id, prop));
         }
     }
 
@@ -1711,7 +1613,7 @@ fn run_query(
     // A read whose MAP assignment falls on a reference EM pruned to zero is not
     // supported by the estimated profile, so it is reclassified as unclassified
     // in the matches output below (leaves .props/abundance untouched).
-    let props_refs: HashSet<RefIdx> = props
+    let props_refs: HashSet<SeqId> = props
         .iter()
         .filter(|(_, prop)| **prop > 0.0)
         .map(|(ref_idx, _)| *ref_idx)
@@ -1731,12 +1633,12 @@ fn run_query(
         let read_idx = *read_ids.get(read_id).unwrap();
         let read_aligns = out_aligns.get(read_id).unwrap();
         for (ref_idx, aligns) in read_aligns.value() {
-            let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
             for _ in aligns {
                 posteriors_tsv.push_str(&format!(
                     "{}\t{}\t{:.5e}\n",
                     ***read_ids_rev.get(&read_idx).unwrap(),
-                    *ref_id.clone(),
+                    ref_id,
                     posteriors.get(&(read_idx, *ref_idx)),
                 ));
             }
@@ -1764,7 +1666,7 @@ fn run_query(
             continue;
         }
 
-        let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+        let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
         let read_id = read_ids_rev.get(read_idx.unwrap()).unwrap();
 
         if !out_aligns.get(read_id).unwrap().contains_key(ref_idx) {
@@ -1785,7 +1687,7 @@ fn run_query(
             matches_tsv.push_str(&format!(
                 "{}\t{}\t{:.5e}\t{}\t{}\n",
                 ***read_ids_rev.get(read_idx.unwrap()).unwrap(),
-                *ref_id.clone(),
+                ref_id,
                 posteriors.get(&(*read_idx.unwrap(), *ref_idx)),
                 alignment.get_pos().0,
                 alignment.get_pos().1,
@@ -1803,12 +1705,12 @@ fn run_query(
         let read_idx = *read_ids.get(read_id).unwrap();
         let read_aligns = out_aligns.get(read_id).unwrap();
         for (ref_idx, aligns) in read_aligns.iter() {
-            let ref_id = ref_ids_rev.get(ref_idx).cloned().unwrap();
+            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
             for likelihood in aligns {
                 aligns_tsv.push_str(&format!(
                     "{}\t{}\t{:.5e}\n",
                     ***read_ids_rev.get(&read_idx).unwrap(),
-                    *ref_id,
+                    ref_id,
                     likelihood.get_full_match_ll().exp(),
                 ));
             }
@@ -2416,24 +2318,19 @@ pub fn run() -> Result<()> {
                     index_file
                 )
             })?;
-            let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
-                .with_context(|| format!("failed to parse FM-index '{}'", index_file))?;
+            let fmidx = load_index(&file_bytes, index_file)?;
 
-            let mut indices: Vec<&RefIdx> = iofmidx.idx_to_seq.keys().collect();
-            indices.sort_by_key(|r| r.0);
-
+            // Ids are dense and already ordered, so iterate the range directly.
             let mut out = String::new();
-            for ref_idx in indices {
-                let header = iofmidx
-                    .idx_to_id
-                    .get(ref_idx)
-                    .map(|id| id.0.as_str())
-                    .unwrap_or("");
-                let seq = iofmidx
-                    .idx_to_seq
-                    .get(ref_idx)
-                    .map(|s| String::from_utf8_lossy(s).into_owned())
-                    .unwrap_or_default();
+            for ref_idx in (0..fmidx.num_sequences()).map(SeqId::new) {
+                let header = fmidx.seq_header(ref_idx).unwrap_or("");
+                // The index stores bases as alphabet codes; decode back to IUPAC ASCII.
+                let seq: String = fmidx
+                    .sequence(ref_idx)
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|&c| decode_char(c).unwrap_or('N'))
+                    .collect();
                 out.push_str(&format!(">{}\n{}\n", header, seq));
             }
             print!("{}", out);
@@ -2447,25 +2344,21 @@ pub fn run() -> Result<()> {
                     index_file
                 )
             })?;
-            let iofmidx: IOFMIndex = IOFMIndex::from_bytes(&file_bytes)
-                .with_context(|| format!("failed to parse FM-index '{}'", index_file))?;
+            let fmidx = load_index(&file_bytes, index_file)?;
 
-            let mut indices: Vec<&RefIdx> = iofmidx.idx_to_seq.keys().collect();
-            indices.sort_by_key(|r| r.0);
-
-            let total_len: usize = iofmidx.idx_to_seq.values().map(|s| s.len()).sum();
+            let ids: Vec<SeqId> = (0..fmidx.num_sequences()).map(SeqId::new).collect();
+            let total_len: usize = ids
+                .iter()
+                .map(|id| fmidx.sequence(*id).map(|s| s.len()).unwrap_or(0))
+                .sum();
             println!("Index file: {}", index_file);
-            println!("Number of references: {}", indices.len());
+            println!("Number of references: {}", ids.len());
             println!("Total sequence length: {} bp", total_len);
             println!("References:");
-            for ref_idx in indices {
-                let header = iofmidx
-                    .idx_to_id
-                    .get(ref_idx)
-                    .map(|id| id.0.as_str())
-                    .unwrap_or("");
-                let len = iofmidx.idx_to_seq.get(ref_idx).map(|s| s.len()).unwrap_or(0);
-                println!("  [{}] {} ({} bp)", ref_idx.0, header, len);
+            for ref_idx in ids {
+                let header = fmidx.seq_header(ref_idx).unwrap_or("");
+                let len = fmidx.sequence(ref_idx).map(|s| s.len()).unwrap_or(0);
+                println!("  [{}] {} ({} bp)", ref_idx.index(), header, len);
             }
         }
         Some(("server", sub_m)) => {
@@ -2580,10 +2473,10 @@ mod tests {
 
     // ─── helpers ────────────────────────────────────────────────────────────────
 
-    fn build_test_index(fasta: &[u8]) -> IOFMIndex {
+    fn build_test_index(fasta: &[u8]) -> RefIndex {
         let (bytes, _) =
             build_index_from_bytes(fasta).expect("build_index_from_bytes failed in test");
-        IOFMIndex::from_bytes(&bytes).expect("IOFMIndex::from_bytes failed in test")
+        load_index(&bytes, "<test>").expect("load_index failed in test")
     }
 
     fn make_record(id: &str, seq: &[u8]) -> fastq::Record {
@@ -2598,21 +2491,26 @@ mod tests {
     /// is repetitive; that is expected given SMEM seeding.
     #[test]
     fn clean_mem_matches_no_n_all_mems_have_zero_offset() {
-        let iofmidx = build_test_index(TEST_FASTA);
+        let fmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let q_seq: Vec<u8> = record
             .seq()
             .iter()
-            .filter_map(|&b| encode_char(b as char))
+            .map(|&b| encode_byte(b).unwrap_or(alphabet::N))
             .collect_vec();
-        let mems = clean_mem_matches(&iofmidx.fmidx, &iofmidx.header_to_idx, &q_seq, 5);
+        let mems = clean_mem_matches(&fmidx, &q_seq, 5);
 
-        assert!(mems.contains_key(&RefIdx(0)), "expected alignment to ref_A");
         assert!(
-            mems[&RefIdx(0)].iter().any(|m| m.ref_start == m.read_start),
+            mems.contains_key(&SeqId::new(0)),
+            "expected alignment to ref_A"
+        );
+        assert!(
+            mems[&SeqId::new(0)]
+                .iter()
+                .any(|m| m.ref_start == m.read_start),
             "expected at least one MEM with ref_start == read_start (offset 0); \
              got MEMs: {:?}",
-            mems[&RefIdx(0)]
+            mems[&SeqId::new(0)]
                 .iter()
                 .map(|m| (m.ref_start, m.read_start))
                 .collect::<Vec<_>>()
@@ -2625,23 +2523,16 @@ mod tests {
     /// the reference's 3' end.
     #[test]
     fn query_read_aligns_read_flush_against_reference_end() {
-        let iofmidx = build_test_index(TEST_FASTA);
-        let ref_len = iofmidx.idx_to_seq[&RefIdx(0)].len();
+        let fmidx = build_test_index(TEST_FASTA);
+        let ref_len = fmidx.sequence(SeqId::new(0)).unwrap().len();
         let read_seq = b"ATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAAT";
         let expected_pos = ref_len - read_seq.len();
 
-        let hits = query_read(
-            &iofmidx.fmidx,
-            &iofmidx.header_to_idx,
-            &iofmidx.idx_to_seq,
-            &make_record("r", read_seq),
-            5,
-            false,
-        )
-        .expect("query_read failed");
+        let hits =
+            query_read(&fmidx, &make_record("r", read_seq), 5, false).expect("query_read failed");
 
         let positions = hits
-            .get(&RefIdx(0))
+            .get(&SeqId::new(0))
             .expect("no alignments to ref_A for a read taken verbatim from its 3' end");
         assert!(
             positions.contains_key(&expected_pos),
@@ -2664,20 +2555,12 @@ mod tests {
     ///                    matching probability at that wrong position ≈ 0.
     #[test]
     fn query_read_n_at_15_produces_alignment_at_position_0() {
-        let iofmidx = build_test_index(TEST_FASTA);
+        let fmidx = build_test_index(TEST_FASTA);
         // N replaces 'T' at position 15 of ref_A[0..50]
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
-        let hits = query_read(
-            &iofmidx.fmidx,
-            &iofmidx.header_to_idx,
-            &iofmidx.idx_to_seq,
-            &record,
-            5,
-            false,
-        )
-        .expect("query_read failed");
+        let hits = query_read(&fmidx, &record, 5, false).expect("query_read failed");
 
-        let positions = hits.get(&RefIdx(0)).unwrap_or_else(|| {
+        let positions = hits.get(&SeqId::new(0)).unwrap_or_else(|| {
             panic!(
                 "no alignments to ref_A — N-filtering bug likely caused alignment \
                  probability at the wrong position to underflow to 0"
@@ -2701,21 +2584,13 @@ mod tests {
     /// 10-18 instead of 26-34, so ref_pos = 26 - 10 = 16 (wrong; correct is 0).
     #[test]
     fn query_read_n_at_25_produces_alignment_at_position_0() {
-        let iofmidx = build_test_index(TEST_FASTA);
+        let fmidx = build_test_index(TEST_FASTA);
         // N replaces 'T' at position 25 of ref_A[0..50]
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGANCGAATCGAATCGATCGATCGATCG");
-        let hits = query_read(
-            &iofmidx.fmidx,
-            &iofmidx.header_to_idx,
-            &iofmidx.idx_to_seq,
-            &record,
-            5,
-            false,
-        )
-        .expect("query_read failed");
+        let hits = query_read(&fmidx, &record, 5, false).expect("query_read failed");
 
         let positions = hits
-            .get(&RefIdx(0))
+            .get(&SeqId::new(0))
             .expect("expected at least one alignment to ref_A");
 
         assert!(
@@ -2733,16 +2608,16 @@ mod tests {
     /// After fix: offset = 0.
     #[test]
     fn debug_mem_positions_n_at_15() {
-        let iofmidx = build_test_index(TEST_FASTA);
+        let fmidx = build_test_index(TEST_FASTA);
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let q_seq: Vec<u8> = record
             .seq()
             .iter()
-            .filter_map(|&b| encode_char(b as char))
+            .map(|&b| encode_byte(b).unwrap_or(alphabet::N))
             .collect_vec();
-        let mems = clean_mem_matches(&iofmidx.fmidx, &iofmidx.header_to_idx, &q_seq, 5);
+        let mems = clean_mem_matches(&fmidx, &q_seq, 5);
 
-        if let Some(mem_list) = mems.get(&RefIdx(0)) {
+        if let Some(mem_list) = mems.get(&SeqId::new(0)) {
             for (i, mem) in mem_list.iter().enumerate() {
                 eprintln!(
                     "[debug_mem] MEM[{}]: ref_start={} ref_end={} \
@@ -2759,7 +2634,7 @@ mod tests {
             eprintln!("[debug_mem] No MEMs found for ref_A — alignment completely lost.");
         }
 
-        let mems_for_ref = mems.get(&RefIdx(0)).expect("expected MEMs for ref_A");
+        let mems_for_ref = mems.get(&SeqId::new(0)).expect("expected MEMs for ref_A");
         assert!(
             mems_for_ref.iter().any(|m| m.ref_start == m.read_start),
             "BUG: no MEM with zero offset found.\n\
@@ -2780,7 +2655,7 @@ mod tests {
     /// 50-1-34 = 15 of read_seq, triggering the same kmer-filtering shift.
     #[test]
     fn query_read_complement_n_at_record_pos_34_produces_alignment_at_zero() {
-        let iofmidx = build_test_index(TEST_FASTA);
+        let fmidx = build_test_index(TEST_FASTA);
         let ref_a_prefix: &[u8] = b"AGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCG";
         let rc = bio::alphabets::dna::revcomp(ref_a_prefix);
         // N at record pos 34 → pos 15 of revcomp(record), triggering the bug.
@@ -2788,17 +2663,9 @@ mod tests {
         seq_with_n[34] = b'N';
 
         let record = make_record("r_rc", &seq_with_n);
-        let hits = query_read(
-            &iofmidx.fmidx,
-            &iofmidx.header_to_idx,
-            &iofmidx.idx_to_seq,
-            &record,
-            5,
-            true,
-        )
-        .expect("query_read (complement) failed");
+        let hits = query_read(&fmidx, &record, 5, true).expect("query_read (complement) failed");
 
-        let positions = hits.get(&RefIdx(0)).unwrap_or_else(|| {
+        let positions = hits.get(&SeqId::new(0)).unwrap_or_else(|| {
             panic!(
                 "no alignments to ref_A via complement path — N-filtering bug may have \
                  caused alignment probability at the wrong position to underflow"
