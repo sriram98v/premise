@@ -24,6 +24,12 @@ tiny_http = "0.12"
 tempfile = "3"
 ureq = "2"
 savefile = "0.20.2"
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.13", features = ["flamegraph", "criterion", "protobuf-codec"] }
+
+[[bench]]
+name = "alignment"
+harness = false
 
 [profile.release]
 debug = true
