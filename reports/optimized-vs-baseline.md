@@ -40,3 +40,48 @@ pprof -diff_base reports/profile-baseline.pb reports/profile-optimized.pb
 - Synthetic in-memory data (4 refs, 300 bp shared block). Real metagenomic DBs have far higher seed multiplicity, so the **LTO** locate gains should be *larger* in production, while the **LUT** gain is input-independent (always removes the per-base `powf`).
 - The phase bench runs 200 pairs over 16 threads; absolute per-pair time is parallel wall-clock, not single-core cost.
 - EM stages not measured (future work).
+
+---
+
+# Follow-up edits: diagonal dedup (#2), borrow forward reads (#3), DoK build (#4)
+
+Same machine/data/seed. Columns are **cumulative** (each adds to the one on its
+left). Medians. `≈` = statistically unchanged (edit doesn't touch that path).
+
+| bench | before | LUT+LTO | +#2 dedup | +#3 Cow | verdict |
+|---|--:|--:|--:|--:|---|
+| `scorer/error_prob` | 1.96 µs | 121 ns | ≈ 124 ns | ≈ 124 ns | untouched |
+| `scorer/compute_match_log_prob` | 3.37 µs | 745 ns | ≈ 795 ns | ≈ 795 ns | untouched |
+| `rescore/query_read` | 37.96 µs | 23.90 µs | 24.06 µs | 24.50 µs | flat (noise) |
+| `seed/clean_mem_matches` | 26.75 µs | 20.92 µs | ≈ 22.0 µs | ≈ 22.0 µs | untouched |
+| `merge/merge_read_pairs` | 114 ns | 114 ns | ≈ 117 ns | ≈ 117 ns | untouched |
+| `phase/process_read_pairs/200` | 4.857 ms | 4.241 ms | **4.10 ms** | **4.07 ms** | **−3.3% then −0.7%** |
+
+### #4 — parallel DoK build (measured separately; not cumulative)
+
+New bench `build/sparse_from_alignments` (2000 reads):
+
+| variant | median | outcome |
+|---|--:|---|
+| serial (`iter`) | **627 µs** | kept |
+| parallel (`par_iter` over shared `DashMap`) | 729 µs | **reverted — +16% regression** |
+
+## Interpretation
+
+- **#2 (dedup diagonals)** is the only follow-up with a real signal: **phase −3.3%**
+  (4.24 → 4.10 ms). It fires only when several SMEMs on one reference project to
+  the same diagonal; the synthetic data has low multiplicity, so this is a floor —
+  on real metagenomic DBs with high seed multiplicity the gain should be larger.
+  `query_read` is flat because post-LUT the per-read rescore is already cheap.
+- **#3 (Cow / borrow forward reads)** is within noise here (saves two ~150-byte
+  `Vec` clones on the forward orientations). Kept anyway: strictly fewer
+  allocations, lower allocator pressure at scale, cleaner code — no downside.
+- **#4 (parallelize DoK build)** was implemented and benchmarked, and it **regressed
+  ~16%**: rayon-over-a-shared-`DashMap` trades a cheap serial insert for shard-lock
+  contention at this read count. Kept **serial**. The extraction + bench remain so a
+  future lock-free design (thread-local buffers + merge) can be measured directly.
+
+**Bottom line:** the large wins are still LUT (input-independent) + LTO. Of the
+follow-ups only diagonal dedup pays off measurably here, and it should pay off more
+on real data. #4's takeaway is a negative result worth keeping: naive shared-map
+parallelism loses to the serial build at these sizes.
