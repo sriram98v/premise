@@ -19,14 +19,13 @@
 
 use bio::io::fastq;
 use bio::stats::LogProb;
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
-};
-use haystackfm::alphabet::encode_char;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use haystackfm::alphabet;
+use haystackfm::alphabet::encode_byte;
 use pprof::criterion::{Output, PProfProfiler};
 use premise::{
-    build_index_from_bytes, build_sparse_array, clean_mem_matches, merge_read_pairs,
-    process_read_pairs, query_read, IOFMIndex, ReadIdx, ReadPair,
+    build_index_from_bytes, build_sparse_array, clean_mem_matches, load_index, merge_read_pairs,
+    process_read_pairs, query_read, ReadIdx, ReadPair, RefIndex,
 };
 use std::collections::HashMap;
 
@@ -41,13 +40,17 @@ const INSERT: usize = 200; // gap between R1 start and R2 start on the reference
 
 /// Tiny LCG (Numerical Recipes constants) — deterministic, no external RNG.
 fn lcg(state: &mut u64) -> u64 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     *state
 }
 
 fn random_dna(len: usize, state: &mut u64) -> Vec<u8> {
     const B: [u8; 4] = [b'A', b'C', b'G', b'T'];
-    (0..len).map(|_| B[(lcg(state) >> 33) as usize & 3]).collect()
+    (0..len)
+        .map(|_| B[(lcg(state) >> 33) as usize & 3])
+        .collect()
 }
 
 /// A `>refN`-headed FASTA of `N_REFS` pseudo-random references that all share a
@@ -74,10 +77,10 @@ fn rec(id: &str, seq: &[u8]) -> fastq::Record {
     fastq::Record::with_attrs(id, None, seq, &vec![b'I'; seq.len()])
 }
 
-fn main_index() -> IOFMIndex {
-    let (fasta, _) = synthetic_fasta();
+fn main_index() -> (RefIndex, Vec<Vec<u8>>) {
+    let (fasta, refs) = synthetic_fasta();
     let (bytes, _) = build_index_from_bytes(&fasta).expect("build index");
-    IOFMIndex::from_bytes(&bytes).expect("load index")
+    (load_index(&bytes, "<bench>").expect("load index"), refs)
 }
 
 /// `N_PAIRS` FR read pairs sampled from ref0: R1 forward at offset o, R2 the
@@ -97,10 +100,8 @@ fn synthetic_pairs(ref0: &[u8]) -> Vec<ReadPair> {
 // ─── benches ──────────────────────────────────────────────────────────────────
 
 fn bench_alignment(c: &mut Criterion) {
-    let idx = main_index();
-    let refs = &idx.idx_to_seq;
-    let h2r = &idx.header_to_idx;
-    let ref0 = refs.values().next().unwrap().clone();
+    let (idx, refs) = main_index();
+    let ref0 = refs[0].clone();
 
     // A representative 150 bp read taken verbatim from a reference (with 2 SNPs),
     // plus its raw + encoded forms and quality string.
@@ -108,8 +109,14 @@ fn bench_alignment(c: &mut Criterion) {
     read[40] ^= 0b0000_0110; // flip a couple of bases so it isn't a perfect match
     read[110] ^= 0b0000_0110;
     let qual = vec![b'I'; READ_LEN];
-    let ref_seg = ref0[100..100 + READ_LEN].to_vec();
-    let q_enc: Vec<u8> = read.iter().filter_map(|&b| encode_char(b as char)).collect();
+    let ref_seg: Vec<u8> = ref0[100..100 + READ_LEN]
+        .iter()
+        .map(|&b| encode_byte(b).unwrap_or(alphabet::N))
+        .collect();
+    let q_enc: Vec<u8> = read
+        .iter()
+        .map(|&b| encode_byte(b).unwrap_or(alphabet::N))
+        .collect();
     let record = rec("read", &read);
 
     // scorer/compute_match_log_prob ───────────────────────────────────────────
@@ -118,7 +125,7 @@ fn bench_alignment(c: &mut Criterion) {
     g.bench_function("compute_match_log_prob", |b| {
         b.iter(|| {
             premise::utils::compute_match_log_prob(
-                black_box(&read),
+                black_box(&q_enc),
                 black_box(&qual),
                 black_box(&ref_seg),
             )
@@ -139,14 +146,7 @@ fn bench_alignment(c: &mut Criterion) {
     // seed/clean_mem_matches ────────────────────────────────────────────────────
     let mut g = c.benchmark_group("seed");
     g.bench_function("clean_mem_matches", |b| {
-        b.iter(|| {
-            clean_mem_matches(
-                black_box(&idx.fmidx),
-                black_box(h2r),
-                black_box(&q_enc),
-                black_box(SEED_LEN),
-            )
-        })
+        b.iter(|| clean_mem_matches(black_box(&idx), black_box(&q_enc), black_box(SEED_LEN)))
     });
     g.finish();
 
@@ -155,9 +155,7 @@ fn bench_alignment(c: &mut Criterion) {
     g.bench_function("query_read", |b| {
         b.iter(|| {
             query_read(
-                black_box(&idx.fmidx),
-                black_box(h2r),
-                black_box(refs),
+                black_box(&idx),
                 black_box(&record),
                 black_box(SEED_LEN),
                 black_box(false),
@@ -169,10 +167,12 @@ fn bench_alignment(c: &mut Criterion) {
 
     // merge/merge_read_pairs ─────────────────────────────────────────────────────
     // Representative position maps (a handful of diagonals per mate).
-    let fwd: HashMap<usize, LogProb> =
-        (0..4).map(|k| (100 + k * 10, LogProb(-(k as f64) - 1.0))).collect();
-    let rev: HashMap<usize, LogProb> =
-        (0..4).map(|k| (250 + k * 10, LogProb(-(k as f64) - 1.0))).collect();
+    let fwd: HashMap<usize, LogProb> = (0..4)
+        .map(|k| (100 + k * 10, LogProb(-(k as f64) - 1.0)))
+        .collect();
+    let rev: HashMap<usize, LogProb> = (0..4)
+        .map(|k| (250 + k * 10, LogProb(-(k as f64) - 1.0)))
+        .collect();
     let mut g = c.benchmark_group("merge");
     g.bench_function("merge_read_pairs", |b| {
         b.iter(|| merge_read_pairs(black_box(&fwd), black_box(&rev), black_box(READ_LEN)))
@@ -192,9 +192,7 @@ fn bench_alignment(c: &mut Criterion) {
         |b, pairs| {
             b.iter(|| {
                 process_read_pairs(
-                    black_box(&idx.fmidx),
-                    black_box(h2r),
-                    black_box(refs),
+                    black_box(&idx),
                     black_box(pairs),
                     black_box(SEED_LEN),
                     black_box(eps_1),
@@ -221,7 +219,7 @@ fn bench_alignment(c: &mut Criterion) {
         })
         .collect();
     let (big_aligns, _) =
-        process_read_pairs(&idx.fmidx, h2r, refs, &big_pairs, SEED_LEN, eps_1, eps_2, None).unwrap();
+        process_read_pairs(&idx, &big_pairs, SEED_LEN, eps_1, eps_2, None).unwrap();
     let mut read_ids = HashMap::new();
     for (n, val) in big_aligns.iter().enumerate() {
         read_ids.insert(*val.key(), ReadIdx::new(n));

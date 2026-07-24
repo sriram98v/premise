@@ -14,7 +14,7 @@ itertools = "0.14.0"
 anyhow = "1.0.98"
 flate2 = "1.1.2"
 chrono = "0.4.42"
-haystackfm = { git = "https://github.com/sriram98v/haystackfm", features = ["cpu"], version="0.1.0" }
+haystackfm = { git = "https://github.com/sriram98v/haystackfm", features = ["cpu"], version="0.3.0" }
 bincode = "1"
 dashmap = "6.1.0"
 num = "0.4.3"
