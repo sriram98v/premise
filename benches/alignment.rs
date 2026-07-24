@@ -25,8 +25,8 @@ use criterion::{
 use haystackfm::alphabet::encode_char;
 use pprof::criterion::{Output, PProfProfiler};
 use premise::{
-    build_index_from_bytes, clean_mem_matches, merge_read_pairs, process_read_pairs, query_read,
-    IOFMIndex, ReadPair,
+    build_index_from_bytes, build_sparse_array, clean_mem_matches, merge_read_pairs,
+    process_read_pairs, query_read, IOFMIndex, ReadIdx, ReadPair,
 };
 use std::collections::HashMap;
 
@@ -205,6 +205,32 @@ fn bench_alignment(c: &mut Criterion) {
             })
         },
     );
+    g.finish();
+
+    // build/sparse_from_alignments ──────────────────────────────────────────────
+    // The DoK SparseArray build that sits between the parallel align and parallel
+    // EM phases. Uses a larger read set (where the serial->parallel win matters).
+    const BUILD_PAIRS: usize = 2000;
+    let big_pairs: Vec<ReadPair> = (0..BUILD_PAIRS)
+        .map(|i| {
+            let max_off = REF_LEN - INSERT - READ_LEN;
+            let o = (i * 7) % max_off;
+            let r1 = ref0[o..o + READ_LEN].to_vec();
+            let r2 = bio::alphabets::dna::revcomp(&ref0[o + INSERT..o + INSERT + READ_LEN]);
+            ReadPair::new(&format!("r{i}"), rec("a", &r1), rec("b", &r2))
+        })
+        .collect();
+    let (big_aligns, _) =
+        process_read_pairs(&idx.fmidx, h2r, refs, &big_pairs, SEED_LEN, eps_1, eps_2, None).unwrap();
+    let mut read_ids = HashMap::new();
+    for (n, val) in big_aligns.iter().enumerate() {
+        read_ids.insert(*val.key(), ReadIdx::new(n));
+    }
+    let mut g = c.benchmark_group("build");
+    g.throughput(Throughput::Elements(BUILD_PAIRS as u64));
+    g.bench_function("sparse_from_alignments", |b| {
+        b.iter(|| build_sparse_array(black_box(&big_aligns), black_box(&read_ids)))
+    });
     g.finish();
 }
 
