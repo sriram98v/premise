@@ -250,3 +250,58 @@ is the more trustworthy signal. And `merge/merge_read_pairs` reports a *signific
 regression despite being **completely unmodified** (it never touches reference ids); at
 125 ns this is almost certainly a code-layout/LTO artifact rather than a real regression,
 but it is recorded here rather than omitted.
+
+---
+
+# Cumulative: `origin/main` vs `feat/seqid-ids`
+
+Every comparison above measures one increment. This one measures the whole effort end to end:
+**`origin/main` (`35a3dcc`) vs `feat/seqid-ids` (`7458e6d`)** — LUT + fat LTO + diagonal dedup +
+`Cow` borrowing + SeqId, together.
+
+This matters because the 16-sample sweep's "old" binary was `feat/code-optim`, which *already*
+contained the LUT and dedup work. That sweep therefore measured only the SeqId increment (−0.60%)
+and badly understated the total.
+
+The baseline is genuinely unoptimised: `origin/main` has `[profile.release] debug = true` and
+nothing else — no LTO, default `codegen-units = 16` — and `haystackfm 0.1.0`. Its binary is
+66.5 MB against 31.1 MB for the LTO'd build.
+
+Same controls as the sweep: harness-matching filtered inputs and parameters (`-p 22`,
+`-i 200`/`100`, same eps/rho/omega), `-t 16`, page cache warmed before each pair, run order
+alternating, separate index per binary (the formats differ).
+
+| sample | pairs | `origin/main` | `feat/seqid-ids` | change |
+|---|--:|--:|--:|--:|
+| real/isolate/SRR31013467 | 421,150 | 86.87 s | 75.98 s | **−12.54%** |
+| real/mixed/SRR3360140 | 792,685 | 186.51 s | 164.58 s | **−11.76%** |
+| synthetic/isolate/Dataset-1 | 500,000 | 155.05 s | 135.40 s | **−12.67%** |
+| synthetic/mixed/Dataset-1 | 500,000 | 182.23 s | 147.52 s | **−19.05%** |
+| **total** | | **610.66 s** | **523.48 s** | **−14.28%** |
+
+**1.167× faster overall** — 87 s saved on 611 s of baseline work — and consistent across every
+category, unlike the SeqId increment which was category-dependent.
+
+## Where the gain actually came from
+
+Splicing in each sample's `feat/code-optim` time from the 16-sample sweep splits the total into
+its two phases:
+
+| sample | `origin/main` → `feat/code-optim` | `feat/code-optim` → `feat/seqid-ids` |
+|---|--:|--:|
+| real/isolate/SRR31013467 | −10.4% | −2.4% |
+| real/mixed/SRR3360140 | −11.5% | −0.3% |
+| synthetic/isolate/Dataset-1 | −12.7% | +0.0% |
+| synthetic/mixed/Dataset-1 | −17.8% | −1.5% |
+
+**Roughly 90% of the improvement came from the first phase** — memoising `error_prob` into a
+256-entry LUT, fat LTO, and diagonal dedup. The SeqId refactor contributed the remainder.
+
+*Caveat:* the `feat/code-optim` column is taken from a different run session, so this split is
+indicative rather than a controlled paired measurement. The `origin/main` vs `feat/seqid-ids`
+columns above **are** controlled — paired, same session, alternating order, warm cache.
+
+That split matches the profile. Before the LUT, `error_prob`'s `powf` ran once per base of every
+diagonal of every read across four orientations, and scoring dominated. Afterwards `src/utils.rs`
+measures **0.09%** of runtime and FM-index search accounts for ~81% — which is why the later,
+seeding-side work had so much less headroom to recover.
