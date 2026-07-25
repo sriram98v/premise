@@ -133,10 +133,17 @@ silently inherits the slower encoding.
 
 Set `occ_encoding: OccEncoding::OneHot` in `build_index_from_bytes`'s `RefIndexConfig`. One line.
 
-**Caveat worth testing rather than assuming:** OneHot stores 16 `u64` per block instead of 4, so
-the Occ table grows ~4×. Since `rank()` is memory-latency-bound, a larger table could give back
-some of the win through cache misses. Measure both encodings end-to-end. This interacts with
-Bottleneck 3 — freeing index memory there may make the larger Occ table affordable.
+**Memory cost.** The alphabet is compacted to the symbols present in the BWT, so premise's index has
+6 lanes and 3 planes: OneHot stores 6 `u64` per block instead of 3, a **2×** growth of Level-3
+storage — about +0.375 bytes/base, or roughly **+2.8 MB** on this 7.5 Mbp index. (Not the 4× that an
+uncompacted 16-symbol alphabet would imply.)
+
+**Caveat worth testing rather than assuming:** `rank()` is memory-latency-bound — the `OccTable`
+docs note the block record was deliberately interleaved because "~58% of `backward_search` self-time
+was these reads". Doubling the block stride halves how many block records fit in a cache line's
+worth of prefetch, so the instruction-count win may not translate fully to wall-clock. Measure both
+encodings end-to-end. This also interacts with Bottleneck 3 — freeing index memory there gives this
+more headroom.
 
 ---
 
@@ -194,13 +201,18 @@ Recorded so this is not re-proposed later.
 
 | # | bottleneck | share | fix location | expected |
 |---|---|--:|---|---|
-| 1 | IUPAC expansion searching absent symbols | drives most of the >70% in `rank` | premise config, or upstream alphabet | **2–3×**, highest confidence of large gain |
-| 2 | Occ bitplane reconstruction loop | 27.6% | premise config one-liner | large, but must verify cache trade |
-| 3 | Full SA inflating the index | indirect | premise config | index shrink; enables #2 |
+| 1a | `count_smaller_than` issuing ~70% of all `rank` calls, redundantly re-probing the same two positions | ~70% of rank calls | upstream batching | **largest remaining win** |
+| 1b | wasted `N` probe from the IUPAC alphabet | ~2 ranks/step | upstream alphabet, or `ExactDna` | ~20–30% (revised down from 2–3×) |
+| 2 | Occ bitplane reconstruction loop | 27.6% | premise config one-liner | large; +2.8 MB index, verify cache trade |
+| 3 | Full SA inflating the index | indirect | premise config | index shrink; gives #2 headroom |
 | 4 | Allocator churn | 6.5% | Cargo + upstream API | modest, cheap to try |
 | — | premise's own scoring | 0.09% | — | nothing left |
 
-Suggested sequence: **3 → 2 → 1 → 4.** Shrink the index first so the memory budget for OneHot
+Suggested sequence: **2 → 1a → 3 → 1b → 4.** Take the one-line OneHot change first (cheapest, and
+its memory cost turns out to be small), then batch `count_smaller_than` upstream, which is the
+largest remaining win and composes with OneHot rather than competing with it.
+
+Superseded ordering, kept for context — **3 → 2 → 1 → 4.** Shrink the index first so the memory budget for OneHot
 exists, then the encoding, then the alphabet change (largest but also the one that touches
 matching semantics, so it wants a clean baseline and a correctness diff), then the allocator.
 
