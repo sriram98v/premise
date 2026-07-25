@@ -159,3 +159,94 @@ FASTA bytes:
    scored literally.
 
 A real-DB diff quantifying how many bases this touches is still outstanding.
+
+---
+
+# Real-data runtime: SeqId premise vs pre-refactor premise
+
+The micro-benches above run against a synthetic 4-reference, 8 kb index. This section
+measures the actual binary on a real workload, which tells a materially different story.
+
+**Setup.** Reference DB `sequences.fasta` — 4400 influenza references, 7.5 Mb, mean header
+131 chars (max 194). Reads: 400,000 real pairs from `SRR31013463` (109 bp). 8 threads,
+`-p 20`. Binaries: `premise-old` = `feat/code-optim` (`d4a5d2d`), `premise-new` =
+`feat/seqid-ids` (`7458e6d`). 3 alternating repetitions each.
+
+| stage | old (mean) | new (mean) | change |
+|---|--:|--:|--:|
+| `query` (align + EM) | 89.71 s | **88.10 s** | **−1.8%** |
+| `align` only | 88.20 s | **86.81 s** | **−1.6%** |
+| index build | 1.14 s | 1.15 s | ~0% |
+
+Run-to-run spread was tight — sd 0.08 s (old) and 0.17 s (new) on ~88 s, i.e. ~0.2% — so
+the difference is well outside noise, just small. Scaling from a 10,000-pair run gives a
+fixed overhead of ≈0 s and a per-pair cost of **220.4 µs → 216.8 µs**, confirming the gain
+is genuinely per-pair rather than a startup artifact.
+
+Index footprint: **85,827,340 → 85,646,978 bytes** (180 KB smaller — the reference bases
+moved into the index instead of being stored a second time in premise's own blob). Peak
+RSS during build rose 344 MB → 351 MB (+1.9%), the expected cost of retaining the text.
+
+## Why this is far below the micro-bench's −8%
+
+**A prediction in the previous section was wrong, and the real data corrects it.** That
+section argued the synthetic bench *understates* the seeding win because its headers are
+4 characters (`ref0`) against ~131 for real accessions, so the eliminated `String` hash and
+allocation were unrealistically cheap. The header-length effect is real, but it is swamped
+by an index-size effect running the other way:
+
+- Per-pair cost is **220 µs on the real DB vs ~20 µs in the synthetic bench** — 11× more
+  expensive per pair against an index ~1000× larger.
+- That extra cost is FM-index backward search and SA resolution over an 85 MB structure —
+  cache-miss-bound work that this change does not touch.
+- The id bookkeeping that was removed is a *fixed* cost per occurrence. As search cost
+  grows with index size, that bookkeeping shrinks as a fraction of the total.
+
+So the synthetic bench **overstates** the end-to-end gain, because its trivially small index
+makes bookkeeping a large share of a small total. Both effects are real; the index-size one
+dominates.
+
+**The remaining bottleneck is SMEM search itself, not reference-id handling.** Further work
+on ids, map keys, or allocation around seeding has little left to recover on realistic
+inputs.
+
+## What the change is still worth
+
+−1.6% per pair, reproducibly, plus a smaller index, one fewer side table, and the deletion
+of `IOFMIndex`. It is free and correct. It is not the ~8% the micro-bench implied.
+
+## Correctness on real data
+
+193 of 405,784 alignment rows differ (**0.048%**), and the cause is confirmed rather than
+assumed:
+
+- **105 of 105 gained alignments (100%) fall on references carrying IUPAC ambiguity codes.**
+  Top: `KT225475.1` (+57 rows, 42 ambiguity codes), `GU646028.1` (+37, 2 codes).
+- 88 rows lost, half on ambiguity-bearing references — the knock-on from reads whose best
+  hit moved.
+- **6 reads went unclassified → classified.**
+- Abundances (`.props`) list the same 4 references and agree to 5 significant figures;
+  ordering differs because the map key type changed, so float summation order changed.
+
+This is the predicted ambiguity-code correction, measured: previously an `R` in a reference
+scored as a hard mismatch against every read base, often pushing an alignment below `eps_2`;
+it is now skipped as ambiguous. Blast radius on this DB is **345 ambiguity codes in
+7,495,851 bases (0.0046%)** and **zero lowercase bases**, so the lowercase fix has no effect
+here.
+
+## Criterion re-run on the final (crates.io) build
+
+| bench | change vs opt234 | p |
+|---|--:|--:|
+| `build/sparse_from_alignments` | −16.2% | 0.00 |
+| `phase/process_read_pairs/200` | −5.3% | 0.00 |
+| `rescore/query_read` | −2.7% | 0.35 (ns) |
+| `seed/clean_mem_matches` | +0.1% | 0.96 (ns) |
+| `merge/merge_read_pairs` | +7.3% | 0.00 |
+
+Two caveats. The phase figure was −8.2% on the earlier run and −5.3% here, so these
+micro-benches carry several points of run-to-run variance — the real-data measurement above
+is the more trustworthy signal. And `merge/merge_read_pairs` reports a *significant* 7.3%
+regression despite being **completely unmodified** (it never touches reference ids); at
+125 ns this is almost certainly a code-layout/LTO artifact rather than a real regression,
+but it is recorded here rather than omitted.
