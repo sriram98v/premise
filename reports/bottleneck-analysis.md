@@ -50,60 +50,64 @@ is in the index library or in configuration handed to it.
 
 ---
 
-## Bottleneck 1 — IUPAC ambiguity expansion in SMEM search
+## Bottleneck 1 — redundant `rank()` calls in interval extension
 
-**The largest single opportunity, and it is almost entirely wasted work.**
-
-`premise` builds via `RefIndex::build_cpu`, which is `build_cpu_with::<IupacDna>`. The stored
-alphabet drives `extend_multi_right` (`haystackfm/src/fm_index/smem.rs`):
-
-```rust
-fn extend_multi_right(ivs: &[BidirInterval], c: u8, rev: &FmIndex) -> Vec<BidirInterval> {
-    let bases = (rev.alphabet_fns.compatible_fn)(c);   // IupacDna: 8 symbols for a plain base
-    let mut result = Vec::new();
-    for &base in bases {
-        for iv in ivs {
-            if let Some(ext) = iv.extend_right(base, rev) { result.push(ext); }
-        }
-    }
-```
-
-With `IupacDna` (`alphabet.rs:174`):
-
-```
-A => [A, N, R, W, M, D, H, V]      // 8
-N => [A, C, G, T, N, R, Y, S, W, K, M, B, D, H, V]   // 15
-```
-
-So every extension step issues **8 interval extensions per interval**, each doing `rank()` calls.
-`extend_multi_right` alone is 19.9% self time, and it drives much of the `occ` cost attributed to
-the inlined `query_read`.
-
-**But premise's indexed text contains only A, C, G, T, N.** `build_index_from_bytes` normalises
-every reference base:
+**Correction.** An earlier revision of this document claimed that six of the eight IUPAC-compatible
+symbol searches per extension step were "guaranteed-empty but still pay full `rank()` cost", and
+projected a 2-3x end-to-end win from changing the alphabet. That was wrong. `rank()` short-circuits
+on absent symbols:
 
 ```rust
-.map(|c| match c.to_ascii_uppercase() { 'A'|'C'|'G'|'T'|'N' => .., _ => 'N' })
+pub fn rank(&self, c: u8, i: u32) -> u32 {
+    let lane = self.symbol_to_lane[c as usize];
+    if lane == NO_LANE { return 0; }     // absent symbols exit here
+    self.rank_at_lane(lane as usize, i)
+}
 ```
 
-and reads are encoded the same way (`encode_byte(b).unwrap_or(alphabet::N)`). Measured composition
-of `sequences.fasta`: 7,495,851 bases, of which 345 are ambiguity codes — all collapsed to `N` at
-build time. **R, W, M, D, H, V never occur in the text.** Six of the eight symbol searches per
-extension step are guaranteed to return nothing, and still pay full `rank()` cost.
+The alphabet is compacted to symbols actually present in the BWT. Premise normalises all references
+and reads to ACGTN, so `R, W, M, D, H, V` are `NO_LANE` and cost an array index plus a branch. The
+only genuinely wasted IUPAC work is the `N` probe (`N` is present -- 345 positions), costing about
+2 real `rank()` calls per extension step. Worth roughly 20-30%, not 2-3x.
+
+### The larger finding: `count_smaller_than`
+
+Reading that path surfaced the real structural cost. Every *successful* `extend_right` calls:
+
+```rust
+fn count_smaller_than(c: u8, lo: u32, hi: u32, index: &FmIndex) -> u32 {
+    (0..c_idx.min(ALPHABET_SIZE))
+        .map(|b| index.occ.rank(b as u8, hi) - index.occ.rank(b as u8, lo))
+        .sum()
+}
+```
+
+Two `rank()` calls per symbol below `c`. With codes `$=0, A=1, C=2, G=3, T=4, N=5`:
+
+| extending by | ranks in `count_smaller_than` | + 2 for the extension | total |
+|---|--:|--:|--:|
+| A | 2 | 2 | 4 |
+| C | 4 | 2 | 6 |
+| G | 6 | 2 | 8 |
+| T | 8 | 2 | 10 |
+| N | 10 | 2 | 12 |
+
+Averaged over A/C/G/T that is ~7 `rank()` calls per successful extension, of which **~5 (about 70%)
+come from `count_smaller_than`**. It is the dominant consumer of the primitive that dominates runtime.
+
+Those calls are also highly redundant: they all probe the **same two positions** `lo` and `hi`, so
+they reload the same one or two block records repeatedly and re-run the bitplane reconstruction each
+time. haystackfm already provides `rank_many` and `prefetch_block`; `count_smaller_than` uses neither.
 
 ### Recommendations
 
-| option | effect | cost / risk |
-|---|---|---|
-| **A. Build with `ExactDna`** (`build_cpu_with::<ExactDna>`) | 8 symbols → 1. Potentially the largest available win. | `N` in the reference stops matching, so reads overlapping those 345 positions lose seeds there. Same blast radius (0.0046%) as the ambiguity change already made — and arguably in the same direction. Requires haystackfm to expose a `BidirFmIndex::build_cpu_with` path premise can call (it exists). |
-| **B. An ACGTN-only alphabet** upstream | `A => [A, N]`, `N => [A,C,G,T,N]`. 8 → 2 for ordinary bases, a 4× cut, while preserving current N semantics exactly. | New alphabet variant in haystackfm; a small, additive change. My preferred option — it keeps behaviour identical to today. |
-| **C. Skip provably-absent symbols** upstream | Build a per-index symbol-presence bitmap and have `extend_multi_right` skip symbols with zero occurrences. | Fully automatic and behaviour-preserving for *any* input; helps every haystackfm user, not just premise. Slightly more invasive. |
-
-Expected magnitude: `rank()` and its callers are >70% of runtime, and this cuts the number of
-`rank()` calls per extension step by 4–8×. A **2–3× end-to-end speedup** is plausible. This should
-be measured, not assumed — the interval set is not uniform and some extensions terminate early.
-
----
+1. **Batch the symbol counts (upstream, behaviour-preserving).** Compute all lane counts at `lo` and
+   at `hi` in a single pass per block: one block load, one reconstruction, all lanes popcounted
+   together. Replaces up to 10 independent `rank()` calls with 2 block visits. Composes with the
+   OneHot encoding below rather than competing with it. This is the highest-value change found.
+2. **An ACGTN-only alphabet (upstream), or `ExactDna`.** Removes the wasted `N` probe per step.
+   Now expected at ~20-30%, and `ExactDna` additionally stops `N` matching at all (blast radius
+   0.0046% of bases on this DB). Lower priority than (1).
 
 ## Bottleneck 2 — Occ bitplane reconstruction (27.6%)
 
@@ -117,7 +121,7 @@ for p in 0..num_planes {
 }
 ```
 
-With a 16-symbol alphabet this loop runs 4 iterations on **every** `rank()` call, reconstructing a
+With premise's 6 compacted lanes this loop runs 3 iterations on **every** `rank()` call, reconstructing a
 one-hot mask from bitplanes.
 
 haystackfm already offers the alternative: `OccEncoding::OneHot` stores the one-hot vectors
