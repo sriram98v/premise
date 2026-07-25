@@ -14,7 +14,7 @@ itertools = "0.14.0"
 anyhow = "1.0.98"
 flate2 = "1.1.2"
 chrono = "0.4.42"
-haystackfm = { git = "https://github.com/sriram98v/haystackfm", features = ["cpu"], version="0.1.0" }
+haystackfm = { version = "0.3.0", features = ["cpu"] }
 bincode = "1"
 dashmap = "6.1.0"
 num = "0.4.3"
@@ -24,6 +24,21 @@ tiny_http = "0.12"
 tempfile = "3"
 ureq = "2"
 savefile = "0.20.2"
+criterion = { version = "0.5", features = ["html_reports"] }
+pprof = { version = "0.13", features = ["flamegraph", "criterion", "protobuf-codec"] }
+
+[[bench]]
+name = "alignment"
+harness = false
 
 [profile.release]
+lto = "fat"
+codegen-units = 1
+debug = true
+
+# The bench profile does NOT inherit lto/codegen-units from [profile.release];
+# set them here so the A/B benchmark measures the same optimized build.
+[profile.bench]
+lto = "fat"
+codegen-units = 1
 debug = true
