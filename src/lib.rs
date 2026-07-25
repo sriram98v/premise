@@ -279,8 +279,7 @@ pub fn clean_mem_matches(
         let q_end = i.query_end;
         let q_len = q_end - q_start;
         for j in &i.positions {
-            // The index reports the reference id directly, so seeding costs no string
-            // hash per occurrence — previously the dominant per-hit cost here.
+
             let ref_idx = j.0;
             let pos = j.1 as usize;
             mems.entry(ref_idx).or_default().push(MEMPos {
@@ -305,8 +304,7 @@ pub fn query_read(
     complement: bool,
 ) -> Result<MatchLikelihoods> {
     let read_len = record.seq().len();
-    // Borrow the forward-orientation sequence/quality directly; only the
-    // reverse-complement orientation needs to allocate (#3: cut per-pair Vec churn).
+
     let read_seq: Cow<[u8]> = match complement {
         true => Cow::Owned(bio::alphabets::dna::revcomp(record.seq())),
         false => Cow::Borrowed(record.seq()),
@@ -315,10 +313,7 @@ pub fn query_read(
         true => Cow::Owned(record.qual().iter().rev().cloned().collect()),
         false => Cow::Borrowed(record.qual()),
     };
-    // One encoded copy of the read serves both seeding and rescoring: the index stores
-    // and reports bases as alphabet codes, so scoring compares codes to codes.
-    // Unencodable bytes map to `N` rather than being dropped, so this stays index-aligned
-    // with `read_qual` and with the read offsets that `find_smems` reports.
+
     let q_seq: Vec<u8> = read_seq
         .iter()
         .map(|&b| encode_byte(b).unwrap_or(alphabet::N))
@@ -329,14 +324,9 @@ pub fn query_read(
     let mems = clean_mem_matches(fmidx, &q_seq, mem_seed_length);
 
     mems.into_iter().for_each(|(ref_id, positions)| {
-        // The index owns the reference bases, so there is no side table to probe.
         let ref_seq = fmidx.sequence(ref_id).unwrap();
         let ref_len = ref_seq.len();
 
-        // #2: dedup diagonals. Several SMEMs on the same reference can project to
-        // the same ref_pos; the ungapped rescore is deterministic per ref_pos, so
-        // score each distinct diagonal exactly once instead of re-scanning and
-        // overwriting. The resulting map is identical to scoring every SMEM.
         let mut scored: HashSet<usize> = HashSet::new();
         for mem in positions.iter() {
             let read_pos = mem.read_start;
@@ -588,7 +578,6 @@ impl CsrLikelihood {
     /// Build the CSR view from a DoK [`SparseArray`]. Reads are gathered in
     /// parallel, then flattened into contiguous CSR arrays.
     fn build(ll_array: &SparseArray<EMProb>) -> Self {
-        // Deterministic, compact reference ordering.
         let mut refs: Vec<SeqId> = ll_array.get_ref_idxs().into_iter().collect();
         refs.sort_unstable_by_key(|r| r.0);
         let ref_compact: HashMap<SeqId, u32> = refs
@@ -744,7 +733,6 @@ impl CsrLikelihood {
                         .entry(ref_idx)
                         .or_default()
                         .insert(read_idx);
-                    // MAP assignment: argmax posterior == argmax(lik*pi) (denom is per-read constant).
                     let cur = self.lik[k] * pi[self.col[k] as usize];
                     let best = self.lik[best_k] * pi[self.col[best_k] as usize];
                     if EMProb::total_cmp(&cur, &best).is_gt() {
@@ -1034,8 +1022,6 @@ pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
         return Err(anyhow::anyhow!("No sequences found in FASTA file"));
     }
 
-    // Headers must be unique: they are the index's `SeqId` labels, and a collision would
-    // otherwise surface as an opaque error from deep inside index construction.
     let mut seen: HashMap<&str, usize> = HashMap::new();
     for (idx, header) in headers.iter().enumerate() {
         if let Some(first) = seen.insert(header.as_str(), idx) {
@@ -1609,10 +1595,6 @@ fn run_query(
         }
     }
 
-    // References retained by EM (i.e. written to .props with non-zero abundance).
-    // A read whose MAP assignment falls on a reference EM pruned to zero is not
-    // supported by the estimated profile, so it is reclassified as unclassified
-    // in the matches output below (leaves .props/abundance untouched).
     let props_refs: HashSet<SeqId> = props
         .iter()
         .filter(|(_, prop)| **prop > 0.0)
@@ -2320,11 +2302,9 @@ pub fn run() -> Result<()> {
             })?;
             let fmidx = load_index(&file_bytes, index_file)?;
 
-            // Ids are dense and already ordered, so iterate the range directly.
             let mut out = String::new();
             for ref_idx in (0..fmidx.num_sequences()).map(SeqId::new) {
                 let header = fmidx.seq_header(ref_idx).unwrap_or("");
-                // The index stores bases as alphabet codes; decode back to IUPAC ASCII.
                 let seq: String = fmidx
                     .sequence(ref_idx)
                     .unwrap_or(&[])
@@ -2471,8 +2451,6 @@ mod tests {
     const TEST_FASTA: &[u8] =
         b">ref_A\nAGCTAGCTAGCTAGCTTACGATCGATCGAATCGAATCGATCGATCGATCGATCGATCGAATCGATCGATCGAATCGATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAATCGATCGATCGAAT\n";
 
-    // ─── helpers ────────────────────────────────────────────────────────────────
-
     fn build_test_index(fasta: &[u8]) -> RefIndex {
         let (bytes, _) =
             build_index_from_bytes(fasta).expect("build_index_from_bytes failed in test");
@@ -2482,8 +2460,6 @@ mod tests {
     fn make_record(id: &str, seq: &[u8]) -> fastq::Record {
         fastq::Record::with_attrs(id, None, seq, &vec![b'I'; seq.len()])
     }
-
-    // ─── Regression: no N characters ────────────────────────────────────────────
 
     /// Baseline: exact-prefix read must produce at least one MEM at offset 0
     /// (ref_start == read_start), which is the correct alignment position.
@@ -2542,8 +2518,6 @@ mod tests {
         );
     }
 
-    // ─── Bug tests: N-kmer filtering shifts enumerate() positions ────────────────
-
     /// BUG: N at position 15, kmer_size=16.
     ///
     /// All kmers at positions 0-15 contain N and are filtered.  The first valid
@@ -2556,7 +2530,6 @@ mod tests {
     #[test]
     fn query_read_n_at_15_produces_alignment_at_position_0() {
         let fmidx = build_test_index(TEST_FASTA);
-        // N replaces 'T' at position 15 of ref_A[0..50]
         let record = make_record("r", b"AGCTAGCTAGCTAGCNTACGATCGATCGAATCGAATCGATCGATCGATCG");
         let hits = query_read(&fmidx, &record, 5, false).expect("query_read failed");
 
@@ -2585,7 +2558,6 @@ mod tests {
     #[test]
     fn query_read_n_at_25_produces_alignment_at_position_0() {
         let fmidx = build_test_index(TEST_FASTA);
-        // N replaces 'T' at position 25 of ref_A[0..50]
         let record = make_record("r", b"AGCTAGCTAGCTAGCTTACGATCGANCGAATCGAATCGATCGATCGATCG");
         let hits = query_read(&fmidx, &record, 5, false).expect("query_read failed");
 
@@ -2646,8 +2618,6 @@ mod tests {
                 .collect::<Vec<_>>()
         );
     }
-
-    // ─── Complement path ─────────────────────────────────────────────────────────
 
     /// BUG: the same enumerate() shift affects complement=true.
     ///
