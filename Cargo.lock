@@ -886,7 +886,8 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 [[package]]
 name = "haystackfm"
 version = "0.3.0"
-source = "git+https://github.com/sriram98v/haystackfm#f0085f51e847c05b2df162e2aa5f9da3eb8d5aa0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "affabbd32eb9bc06c7ab3752c7a1873bc5b11406b7d773da58543caf0b521c33"
 dependencies = [
  "bincode",
  "log",
