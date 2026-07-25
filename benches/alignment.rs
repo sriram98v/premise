@@ -1,27 +1,9 @@
-//! Criterion benchmarks for the PREMISE alignment stages (seed -> align).
-//!
-//! EM benches are intentionally out of scope (future work). All inputs are
-//! synthetic and generated deterministically in-process (no disk, no RNG that
-//! would vary run-to-run), so baselines are reproducible.
-//!
-//! Stages covered:
-//!   scorer/compute_match_log_prob  pure per-base ungapped rescore (LUT win lands here)
-//!   scorer/error_prob              isolates the Phred->error-prob transform (the powf)
-//!   seed/clean_mem_matches         SMEM seeding + locate against the FM-index
-//!   rescore/query_read             seed -> project -> ungapped rescore for one read
-//!   merge/merge_read_pairs         FR position-map cross-product
-//!   phase/process_read_pairs       full rayon-parallel align phase over many pairs
-//!
-//! Profiling: run with `--profile-time=<secs>` to emit an in-process pprof
-//! profile (no `perf`/sudo needed). `PPROF_OUT=pb` writes a pprof protobuf
-//! (`profile.pb`); otherwise a flamegraph SVG is written under
-//! `target/criterion/<group>/<bench>/profile/`.
-
 use bio::io::fastq;
 use bio::stats::LogProb;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use haystackfm::alphabet;
 use haystackfm::alphabet::encode_byte;
+#[cfg(unix)]
 use pprof::criterion::{Output, PProfProfiler};
 use premise::{
     build_index_from_bytes, build_sparse_array, clean_mem_matches, load_index, merge_read_pairs,
@@ -29,16 +11,14 @@ use premise::{
 };
 use std::collections::HashMap;
 
-// ─── deterministic synthetic data ────────────────────────────────────────────
 
 const READ_LEN: usize = 150;
-const SEED_LEN: usize = 20; // representative --mem for 150 bp reads
+const SEED_LEN: usize = 20;
 const N_REFS: usize = 4;
 const REF_LEN: usize = 2000;
 const N_PAIRS: usize = 200;
-const INSERT: usize = 200; // gap between R1 start and R2 start on the reference
+const INSERT: usize = 200;
 
-/// Tiny LCG (Numerical Recipes constants) — deterministic, no external RNG.
 fn lcg(state: &mut u64) -> u64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -53,9 +33,6 @@ fn random_dna(len: usize, state: &mut u64) -> Vec<u8> {
         .collect()
 }
 
-/// A `>refN`-headed FASTA of `N_REFS` pseudo-random references that all share a
-/// single conserved block, so some seeds locate to multiple references (the
-/// realistic metagenomic case that drives the locate cost).
 fn synthetic_fasta() -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut state = 0x9E3779B97F4A7C15u64; // fixed seed
     let conserved = random_dna(300, &mut state);
@@ -63,7 +40,7 @@ fn synthetic_fasta() -> (Vec<u8>, Vec<Vec<u8>>) {
     let mut refs = Vec::with_capacity(N_REFS);
     for i in 0..N_REFS {
         let mut seq = random_dna(REF_LEN, &mut state);
-        // splice the shared conserved block into each reference at a fixed offset
+
         seq[500..800].copy_from_slice(&conserved);
         fasta.extend_from_slice(format!(">ref{i}\n").as_bytes());
         fasta.extend_from_slice(&seq);
@@ -83,8 +60,6 @@ fn main_index() -> (RefIndex, Vec<Vec<u8>>) {
     (load_index(&bytes, "<bench>").expect("load index"), refs)
 }
 
-/// `N_PAIRS` FR read pairs sampled from ref0: R1 forward at offset o, R2 the
-/// reverse-complement of the window `INSERT` bp downstream.
 fn synthetic_pairs(ref0: &[u8]) -> Vec<ReadPair> {
     let max_off = REF_LEN - INSERT - READ_LEN;
     (0..N_PAIRS)
@@ -97,14 +72,10 @@ fn synthetic_pairs(ref0: &[u8]) -> Vec<ReadPair> {
         .collect()
 }
 
-// ─── benches ──────────────────────────────────────────────────────────────────
-
 fn bench_alignment(c: &mut Criterion) {
     let (idx, refs) = main_index();
     let ref0 = refs[0].clone();
 
-    // A representative 150 bp read taken verbatim from a reference (with 2 SNPs),
-    // plus its raw + encoded forms and quality string.
     let mut read = ref0[100..100 + READ_LEN].to_vec();
     read[40] ^= 0b0000_0110; // flip a couple of bases so it isn't a perfect match
     read[110] ^= 0b0000_0110;
@@ -143,14 +114,12 @@ fn bench_alignment(c: &mut Criterion) {
     });
     g.finish();
 
-    // seed/clean_mem_matches ────────────────────────────────────────────────────
     let mut g = c.benchmark_group("seed");
     g.bench_function("clean_mem_matches", |b| {
         b.iter(|| clean_mem_matches(black_box(&idx), black_box(&q_enc), black_box(SEED_LEN)))
     });
     g.finish();
 
-    // rescore/query_read ────────────────────────────────────────────────────────
     let mut g = c.benchmark_group("rescore");
     g.bench_function("query_read", |b| {
         b.iter(|| {
@@ -165,8 +134,6 @@ fn bench_alignment(c: &mut Criterion) {
     });
     g.finish();
 
-    // merge/merge_read_pairs ─────────────────────────────────────────────────────
-    // Representative position maps (a handful of diagonals per mate).
     let fwd: HashMap<usize, LogProb> = (0..4)
         .map(|k| (100 + k * 10, LogProb(-(k as f64) - 1.0)))
         .collect();
@@ -179,7 +146,6 @@ fn bench_alignment(c: &mut Criterion) {
     });
     g.finish();
 
-    // phase/process_read_pairs ───────────────────────────────────────────────────
     let pairs = synthetic_pairs(&ref0);
     let eps_1 = LogProb((1e-64f64).ln());
     let eps_2 = LogProb((1e-10f64).ln());
@@ -205,9 +171,6 @@ fn bench_alignment(c: &mut Criterion) {
     );
     g.finish();
 
-    // build/sparse_from_alignments ──────────────────────────────────────────────
-    // The DoK SparseArray build that sits between the parallel align and parallel
-    // EM phases. Uses a larger read set (where the serial->parallel win matters).
     const BUILD_PAIRS: usize = 2000;
     let big_pairs: Vec<ReadPair> = (0..BUILD_PAIRS)
         .map(|i| {
@@ -232,13 +195,18 @@ fn bench_alignment(c: &mut Criterion) {
     g.finish();
 }
 
-// pprof profiler: Output chosen via PPROF_OUT (svg default, "pb" = protobuf).
+#[cfg(unix)]
 fn profiled() -> Criterion {
     let output = match std::env::var("PPROF_OUT").as_deref() {
         Ok("pb") => Output::Protobuf,
         _ => Output::Flamegraph(None),
     };
     Criterion::default().with_profiler(PProfProfiler::new(100, output))
+}
+
+#[cfg(not(unix))]
+fn profiled() -> Criterion {
+    Criterion::default()
 }
 
 criterion_group! {

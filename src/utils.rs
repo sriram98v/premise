@@ -29,7 +29,6 @@ pub fn compute_match_log_prob(
         izip!(q_seq.iter(), aligned_ref_seq.iter(), quality_score_vec)
     {
         if *read_char == alphabet::N || *reference_char == alphabet::N {
-            // N is ambiguous — skip this position (multiply likelihood by 1.0)
             continue;
         }
         match read_char == reference_char {
@@ -91,7 +90,6 @@ pub fn get_extension_from_filename(filename: &str) -> Option<&str> {
 mod tests {
     use super::*;
 
-    // Quality byte for Phred 40 ('I' = 73 in ASCII, Q = 73 - 33 = 40)
     const Q40: u8 = b'I';
 
     /// Bases in the alphabet's code space, which is what `compute_match_log_prob` compares.
@@ -105,15 +103,12 @@ mod tests {
 
     #[test]
     fn n_in_read_skipped_contributes_zero_to_log_prob() {
-        // A read that is identical to the reference except position 0 is N
-        // should score the same as if that position were absent.
         let read = bases("NACGT");
         let reference = bases("AACGT");
         let quals = [Q40; 5];
 
         let with_n = compute_match_log_prob(&read, &quals, &reference);
 
-        // Expected: only the 4 non-N positions contribute, all matches
         let expected = compute_match_log_prob(&bases("ACGT"), &[Q40; 4], &bases("ACGT"));
 
         assert!(
@@ -152,13 +147,11 @@ mod tests {
 
     #[test]
     fn no_n_read_behavior_unchanged() {
-        // Regression: reads without N should behave identically to before.
         let read = bases("AACGT");
         let reference = bases("AACGT");
         let quals = [Q40; 5];
 
         let result = compute_match_log_prob(&read, &quals, &reference);
-        // All matches at Q40: each position contributes ln(1 - 10^-4) ≈ -1e-4
         assert!(
             *result < 0.0 && *result > -1.0,
             "Perfect match log-prob should be slightly negative: {result:?}"
