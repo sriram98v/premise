@@ -14,13 +14,6 @@ use haystackfm::alphabet;
 use haystackfm::alphabet::{decode_char, encode_byte};
 pub use haystackfm::BidirFmIndex as RefIndex;
 use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
-
-/// Dense integer identifier for a reference sequence, assigned by the FM-index in FASTA
-/// order and stable across serialization.
-///
-/// This is haystackfm's own id type, reported directly by `find_smems`, so seeding never
-/// hashes a header string. It is the key for every reference-indexed map in the alignment
-/// and EM stages; headers are resolved only at output time via `RefIndex::seq_header`.
 pub use haystackfm::SeqId;
 use indicatif::ProgressStyle;
 use indicatif::{ProgressBar, ProgressDrawTarget};
@@ -29,7 +22,7 @@ use num::{Float, Zero};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp;
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1586,15 +1579,8 @@ fn run_query(
         get_proportions_par_sparse(&ll_array, num_iter, progress.clone())
     };
 
-    // Build props TSV (no header — just ref_id \t proportion)
-    let mut props_tsv = String::new();
-    for (ref_idx, prop) in &props {
-        if *prop > 0.0 {
-            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-            props_tsv.push_str(&format!("{}\t{:.5e}\n", ref_id, prop));
-        }
-    }
-
+    // References surviving EM. A read whose MAP reference was pruned (proportion driven to 0)
+    // is reported as unclassified in .matches below rather than assigned a zero-abundance ref.
     let props_refs: HashSet<SeqId> = props
         .iter()
         .filter(|(_, prop)| **prop > 0.0)
@@ -1627,7 +1613,9 @@ fn run_query(
         }
     }
 
-    // Build matches TSV
+    // Build matches TSV. Counts of the reads actually reported as classified are accumulated
+    // here so .props can be derived from them below (BTreeMap keeps the output deterministic).
+    let mut assigned_counts: BTreeMap<SeqId, u64> = BTreeMap::new();
     let mut matches_tsv =
         String::from("ReadID\tRefID\tPosterior\tForward Position\tReverse Position\n");
     for read_id in all_read_ids.iter() {
@@ -1674,7 +1662,19 @@ fn run_query(
                 alignment.get_pos().0,
                 alignment.get_pos().1,
             ));
+            *assigned_counts.entry(*ref_idx).or_insert(0) += 1;
         }
+    }
+
+    let total_assigned: u64 = assigned_counts.values().sum();
+    let mut props_tsv = String::new();
+    for (ref_idx, count) in &assigned_counts {
+        let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
+        props_tsv.push_str(&format!(
+            "{}\t{:.5e}\n",
+            ref_id,
+            *count as f64 / total_assigned as f64
+        ));
     }
 
     // Build aligns TSV — same format as run_alignment output
@@ -2098,12 +2098,13 @@ pub fn run() -> Result<()> {
         )
         .subcommand(
             Command::new("align")
+                .about("Align paired-end reads to an index and write per-reference alignment likelihoods")
                 .arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
                 .arg(arg!(-m --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
-                    .required(true)
+                    .default_value("11")
                     .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
@@ -2129,12 +2130,13 @@ pub fn run() -> Result<()> {
         )
         .subcommand(
             Command::new("query")
+                .about("Classify paired-end reads: align, then estimate reference abundances by EM")
                 .arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
                     .required(true)
                     .value_parser(clap::value_parser!(String))
                     )
-                .arg(arg!(-p --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
-                    .required(true)
+                .arg(arg!(-m --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
+                    .default_value("11")
                     .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(--eps_1 <EPS_1>"Cutoff likelihood for dropping alignments")

@@ -57,11 +57,11 @@ premise query \
   -s <reference.fmidx>     \  # FM-index built in Step 1
   -1 <R1.fastq.gz> \
   -2 <R2.fastq.gz> \
-  -p <min_seed_length>     \  # minimum MEM seed length, e.g. 22
+  -m <min_seed_length>     \  # minimum MEM seed length (default 11)
   --eps_1 <float>          \  # alignment likelihood cutoff (default 1e-64)
   --eps_2 <float>          \  # minimum match log-probability (default 1e-18)
-  --rho   <float>          \  # EM penalty weight ρ (default 20)
-  --omega <float>          \  # EM penalty weight ω (default 1e-20)
+  --rho   <float>          \  # EM penalty weight ρ (default 150)
+  --omega <float>          \  # EM penalty weight ω (default 1e-10)
   --iter  <int>            \  # EM iterations (default 100)
   --em_threshold <float>   \  # EM convergence threshold (default 1e-6)
   --no-penalty             \  # disable the L1 penalty (plain EM)
@@ -89,7 +89,7 @@ Opens a browser UI at `http://localhost:8080` with drag-and-drop file upload, in
 
 ## Algorithm
 
-PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then rescored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-p`/`--mem` sets the minimum seed length.
+PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then rescored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-m`/`--mem` sets the minimum seed length.
 
 The EM step solves a penalized likelihood maximization:
 
