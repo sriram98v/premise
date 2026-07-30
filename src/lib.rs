@@ -14,13 +14,6 @@ use haystackfm::alphabet;
 use haystackfm::alphabet::{decode_char, encode_byte};
 pub use haystackfm::BidirFmIndex as RefIndex;
 use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
-
-/// Dense integer identifier for a reference sequence, assigned by the FM-index in FASTA
-/// order and stable across serialization.
-///
-/// This is haystackfm's own id type, reported directly by `find_smems`, so seeding never
-/// hashes a header string. It is the key for every reference-indexed map in the alignment
-/// and EM stages; headers are resolved only at output time via `RefIndex::seq_header`.
 pub use haystackfm::SeqId;
 use indicatif::ProgressStyle;
 use indicatif::{ProgressBar, ProgressDrawTarget};
