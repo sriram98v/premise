@@ -1,0 +1,4 @@
+# pprof profile dumps are binary data, not PureBasic source. Without this, GitHub
+# Linguist classes *.pb as PureBasic and — ranking by byte count — reports it as
+# the repository's primary language ahead of Rust.
+*.pb binary linguist-generated=true
