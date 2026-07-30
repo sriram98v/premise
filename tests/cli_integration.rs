@@ -253,7 +253,7 @@ fn query_end_to_end_produces_output_files() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         outprefix.to_str().unwrap(),
@@ -310,7 +310,7 @@ fn query_props_file_exists_after_query() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         outprefix.to_str().unwrap(),
@@ -360,7 +360,7 @@ fn query_matches_file_has_data_rows() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         outprefix.to_str().unwrap(),
@@ -397,7 +397,7 @@ fn query_posteriors_file_has_data_rows() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         outprefix.to_str().unwrap(),
@@ -433,7 +433,7 @@ fn query_stdout_reports_output_path() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         outprefix.to_str().unwrap(),
@@ -465,7 +465,7 @@ fn query_nonexistent_index_fails() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         tmpdir.path().join("out").to_str().unwrap(),
@@ -491,7 +491,7 @@ fn query_nonexistent_r1_fails() {
         "/nonexistent/r1.fastq",
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         tmpdir.path().join("out").to_str().unwrap(),
@@ -520,7 +520,7 @@ fn query_no_penalty_flag_succeeds() {
         r1.to_str().unwrap(),
         "-2",
         r2.to_str().unwrap(),
-        "-p",
+        "-m",
         "5",
         "-o",
         outprefix.to_str().unwrap(),
@@ -654,6 +654,90 @@ fn server_returns_404_for_unknown_route() {
         }
         Err(e) => {
             panic!("unexpected error from server: {}", e);
+        }
+    }
+}
+
+/// `.props` must be derived from the corrected `.matches`, so the two files always agree.
+#[test]
+fn query_props_agree_with_corrected_matches() {
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let index = build_index(tmpdir.path());
+    let r1 = fixtures().join("r1.fastq");
+    let r2 = fixtures().join("r2.fastq");
+    let outprefix = tmpdir.path().join("agree");
+
+    let output = run(&[
+        "query",
+        "-s",
+        index.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+        "-m",
+        "5",
+        "-o",
+        outprefix.to_str().unwrap(),
+        "-t",
+        "1",
+        "-i",
+        "5",
+    ]);
+    assert_success(&output);
+
+    let matches = fs::read_to_string(tmpdir.path().join("agree.matches"))
+        .expect("could not read agree.matches");
+    let props =
+        fs::read_to_string(tmpdir.path().join("agree.props")).expect("could not read agree.props");
+
+    // Reference -> number of classified reads, straight from .matches (skipping the header).
+    let mut matched: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for line in matches.lines().skip(1) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() >= 2 && cols[1] != "unclassified" {
+            *matched.entry(cols[1]).or_insert(0) += 1;
+        }
+    }
+
+    let mut listed: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
+    for line in props.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 2, "malformed props row: {}", line);
+        listed.insert(
+            cols[0],
+            cols[1].parse::<f64>().expect("non-numeric proportion"),
+        );
+    }
+
+    let in_props: Vec<&&str> = listed.keys().collect();
+    let in_matches: Vec<&&str> = matched.keys().collect();
+    assert_eq!(
+        in_props, in_matches,
+        "props references must match the classified references in .matches"
+    );
+
+    let total: u64 = matched.values().sum();
+    if total > 0 {
+        let sum: f64 = listed.values().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "props proportions must sum to 1, got {}",
+            sum
+        );
+        // Each proportion must equal that reference's share of the classified reads.
+        for (ref_id, count) in &matched {
+            let expected = *count as f64 / total as f64;
+            let got = listed[ref_id];
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "props for {} = {}, expected {} ({}/{})",
+                ref_id,
+                got,
+                expected,
+                count,
+                total
+            );
         }
     }
 }
