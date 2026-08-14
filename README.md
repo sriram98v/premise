@@ -57,11 +57,11 @@ premise query \
   -s <reference.fmidx>     \  # FM-index built in Step 1
   -1 <R1.fastq.gz> \
   -2 <R2.fastq.gz> \
-  -m <min_seed_length>     \  # minimum MEM seed length (default 11)
-  --eps_1 <float>          \  # alignment likelihood cutoff (default 1e-64)
+  -m <min_seed_length>     \  # minimum MEM seed length (default 22)
+  --eps_1 <float>          \  # alignment likelihood cutoff (default 0 = disabled)
   --eps_2 <float>          \  # minimum match log-probability (default 1e-18)
-  --rho   <float>          \  # EM penalty weight ρ (default 150)
-  --omega <float>          \  # EM penalty weight ω (default 1e-10)
+  --rho   <float>          \  # EM penalty weight $\rho$ (default 150)
+  --omega <float>          \  # EM penalty weight $\omega$ (default 1e-10)
   --iter  <int>            \  # EM iterations (default 100)
   --em_threshold <float>   \  # EM convergence threshold (default 1e-6)
   --no-penalty             \  # disable the L1 penalty (plain EM)
@@ -89,15 +89,15 @@ Opens a browser UI at `http://localhost:8080` with drag-and-drop file upload, in
 
 ## Algorithm
 
-PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then rescored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-m`/`--mem` sets the minimum seed length.
+PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then scored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-m`/`--mem` sets the minimum seed length.
 
 The EM step solves a penalized likelihood maximization:
 
-- **ρ** controls an L1-style sparsity penalty on the proportion vector.
-- **ω** is a small regularization floor.
+- $\rho$ controls an L1-style sparsity penalty on the proportion vector.
+- $\omega$ is a small regularization floor.
 - Convergence is tracked by the total data log-likelihood across iterations.
 
-Parameters **ε₁** and **ε₂** control alignment filtering: ε₁ is a minimum alignment likelihood threshold (linear space); ε₂ is a minimum match log-probability per read.
+Parameters $\eps_1$ and **$\eps_2$** control alignment filtering: $\eps_1$ is a minimum alignment likelihood threshold (linear space); $\eps_2$ is a minimum match log-probability per read. The default $\eps_1 = 0$ disables the cutoff entirely.
 
 ## Project Structure
 
@@ -132,6 +132,8 @@ Full posterior probability matrix: one row per read, one column per reference.
 |--------|-------------|
 | `ref_id` | Reference sequence ID |
 | `proportion` | Estimated relative abundance |
+
+Proportions are not derived by normalizing the read counts in `.matches`. After reads whose reference was pruned by EM are reclassified as unclassified, the likelihood matrix is restricted to the remaining reads and one further E-step and M-step are run; `.props` reports that result. The M-step solves for the Lagrange multiplier enforcing $\sum \pi = 1$, so the column sums to one without any post-hoc renormalization.
 
 ## Citation
 

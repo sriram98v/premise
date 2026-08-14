@@ -1,16 +1,32 @@
 /target
-/.venv
+/graphify-out
+/.claude
+/.eval
+CLAUDE.md
+
+# Python bytecode / tool caches.
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# Stray premise output
 *.fastq
 *.fasta
 *.treefile
 *.matches
 *.aligns
-.eval
 *.posteriors
 *.out
 *.txt
 *.props
-/graphify-out
-/.claude
-/datasets
-CLAUDE.md
+
+# Comparative analysis files
+/comparative-analysis/indexes
+/comparative-analysis/samples
+/comparative-analysis/results
+/comparative-analysis/truth
+/comparative-analysis/ablation/figs
+/comparative-analysis/tools
+/comparative-analysis/bin
+/comparative-analysis/db_build.csv

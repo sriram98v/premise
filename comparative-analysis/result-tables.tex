@@ -1,0 +1,165 @@
+\begin{table}[t]
+\caption{Comparative analysis of custom database construction. Each database is built from the same 5,149-reference collection on 12 threads; size is the final index (excluding regenerable intermediates), reported in GB ($10^9$ bytes).\label{tab:database-comp}}
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Method} & \textbf{Size (GB)} & \textbf{Time (s)} \\ \midrule
+\premise         & 0.098              & 1.6                            \\
+Centrifuger     & 0.043              & 10.4                           \\
+KMCP            & 0.026              & 301                            \\
+KrakenUniq      & 9.4                & 139                            \\
+MORA            & 0.016              & 5.3                            \\
+Karp            & 0.070              & 4.1                            \\
+Ganon           & 0.010              & 47                             \\
+Sylph           & 0.0018             & 2.3                            \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table*}[t]
+\caption{Comparative analysis of source prediction and abundance estimation on synthetic datasets.\label{tab:class-comp-syn-perf-abun}}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccccc@{\extracolsep\fill}}
+\hline
+& \multicolumn{2}{@{}c@{}}{\textbf{Dataset 1}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 2}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 3}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 4}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 5}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}\cline{10-11}%
+\textbf{Method} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} \\ \midrule
+\premise     & \textbf{0.001} & \textbf{0.385} & \textbf{0.001} & \textbf{0.385} & \textbf{0.001} & \textbf{0.385} & \textbf{0.001} & \textbf{0.273} & \textbf{0.001} & \textbf{0.200} \\
+Centrifuger & 0.216          & 0.692          & 0.090          & 0.789         & 0.220          & 0.810          & 0.192          & 0.680          & 0.187          & 0.814         \\
+KrakenUniq  & 1.000          & 1.000          & 1.000          & 1.000         & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000         \\
+MORA        & 0.192          & 0.742          & \textbf{0.041} & 0.750         & 0.168          & 0.784          & 0.128          & 0.724          & 0.106          & 0.467         \\
+Ganon       & 0.012          & 0.429          & 0.065          & 0.429         & 0.048          & 0.429          & \textbf{0.003} & 0.500          & 0.005          & 0.200         \\
+Sylph       & 0.439          & 0.887          & 0.599          & 0.904         & 0.711          & 0.921          & 0.523          & 0.906          & 0.272          & 0.877         \\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Comparative analysis of precision-recall on synthetic datasets.\label{tab:class-comp-syn-prec-rec}}
+\centering
+\tabcolsep=1pt%%
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccccc@{\extracolsep\fill}}
+\hline
+& \multicolumn{2}{@{}c@{}}{\textbf{Dataset 1}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 2}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 3}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 4}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 5}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}\cline{10-11}%
+\textbf{Method} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} \\ \midrule
+\premise         & \textbf{0.999} & \textbf{0.989} & 0.980          & \textbf{0.988} & \textbf{0.989} & \textbf{0.989} & \textbf{1.000} & \textbf{0.989} & \textbf{1.000} & \textbf{0.989} \\
+Centrifuger    & 0.988          & 0.875          & 0.993          & 0.937          & 0.987          & 0.853          & 0.988          & 0.897          & 0.990          & 0.907          \\
+KrakenUniq     & 0.853          & 0.354          & 0.927          & 0.342          & 0.872          & 0.351          & 0.894          & 0.347          & 0.911          & 0.345          \\
+MORA           & 0.944          & 0.654          & 0.974          & 0.661          & 0.944          & 0.654          & 0.966          & 0.659          & 0.972          & 0.660          \\
+Ganon          & 0.525          & 0.333          & 0.526          & 0.333          & 0.525          & 0.333          & 0.525          & 0.333          & 0.526          & 0.333          \\
+Sylph          & ---            & ---            & ---            & ---            & ---            & ---            & ---            & ---            & ---            & ---            \\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+
+\begin{table*}
+\caption{Comparative analysis of source prediction and abundance estimation on real datasets.\label{tab:class-comp-real-perf-abun}}
+\tabcolsep=1pt%%
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccc@{\extracolsep{\fill}}}
+\toprule%
+& \multicolumn{2}{@{}c@{}}{\textbf{SRR31013463}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013465}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013467}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013473}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}%
+\textbf{Method} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} \\ \midrule
+\premise     & \textbf{0.008} & 0.200          & \textbf{0.012} & \textbf{0.467} & \textbf{0.012} & \textbf{0.385} & \textbf{0.009} & 0.200          \\
+Centrifuger  & 0.010          & 0.884          & 0.129          & 0.979          & 0.014          & 0.960          & 0.023          & 0.953          \\
+KMCP         & 0.217          & \textbf{0.000} & 0.634          & 0.500          & 0.798          & 0.600          & 0.288          & \textbf{0.000} \\
+KrakenUniq   & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          \\
+MORA         & 0.029          & 0.975          & 0.138          & 0.995          & 0.205          & 0.992          & 0.035          & 0.991          \\
+Karp         & 0.795          & 0.969          & 0.821          & 0.957          & 0.874          & 0.988          & 0.853          & 0.987          \\
+Ganon        & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 0.957          & 0.980          \\
+Sylph        & 0.168          & 0.900          & 0.155          & 0.900          & 0.237          & 0.900          & 0.212          & 0.900          \\
+\hline
+\end{tabular*}
+\end{table*}
+%
+\begin{table*}
+\caption{Comparative analysis of precision-recall on real datasets.\label{tab:class-comp-real-perf-prec}}
+\tabcolsep=1pt%%
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccc@{\extracolsep{\fill}}}
+\toprule%
+& \multicolumn{2}{@{}c@{}}{\textbf{SRR31013463}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013465}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013467}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013473}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}%
+\textbf{Method} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} \\ \midrule
+\premise        & \textbf{1.000}    & 0.860          & \textbf{0.998}            & 0.881           & \textbf{0.999}    & 0.838          & \textbf{1.000}    & 0.875           \\
+Centrifuger     & \textbf{1.000}             & 0.991          & 0.991            & 0.912           & 0.998             & 0.978          & 0.999             & 0.986           \\
+KMCP            & 0.976             & 0.990          & 0.979            & \textbf{0.973}  & 0.961             & \textbf{0.983} & 0.982             & 0.980           \\
+MORA            & 0.977             & \textbf{0.995} & 0.978            & 0.931           & 0.959             & \textbf{0.983} & 0.980             & \textbf{0.988}  \\
+KrakenUniq      & -                 & 0.000          & -                & 0.000           & -                 & 0.000          & -                 & 0.000           \\
+Karp            & 0.973             & 0.003          & 0.973            & 0.035           & 0.950             & 0.005          & 0.960             & 0.005           \\
+Ganon           & -                 & 0.000          & -                & 0.000           & -                 & 0.000          & 0.000             & 0.000           \\
+Sylph           & ---               & ---            & ---              & ---             & ---               & ---            & ---               & ---             \\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+\begin{table*}
+\caption{Comparative analysis of runtime and peak memory usage on synthetic datasets.\label{tab:class-comp-syn-perf-prec}}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccccc@{\extracolsep\fill}}
+\hline
+& \multicolumn{2}{@{}c@{}}{\textbf{Dataset 1}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 2}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 3}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 4}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 5}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}\cline{10-11}%
+\textbf{Method} & \textbf{Time} & \textbf{Mem} & \textbf{Time} & \textbf{Mem} & \textbf{Time} & \textbf{Mem} & \textbf{Time} & \textbf{Mem} & \textbf{Time} & \textbf{Mem} \\ \midrule
+\premise  & 3m20s & 1.97 GB & 3m20s & 1.98 GB & 3m18s & 1.99 GB & 3m19s & 1.93 GB & 3m23s & 1.90 GB & \\
+Centrifuger & \textbf{3.73s} & \textbf{0.24 GB} & \textbf{4.39s} & \textbf{0.24 GB} & \textbf{3.88s} & \textbf{0.24 GB} & \textbf{3.83s} & \textbf{0.24 GB} & \textbf{3.37s} & \textbf{0.24 GB}\\
+KrakenUniq  & 32.78s & 16.69 GB & 31.62s & 16.69 GB & 32.05s & 16.69 GB & 31.89s & 16.69 GB & 33.27s & 16.69 GB \\
+MORA        & 2m15s  & 2.17 GB  & 2m34s  & 2.17 GB  & 2m18s  & 2.18 GB  & 2m14s  & 2.18 GB  & 1m56s  & 2.16 GB  \\
+Karp        & 17.90s & 0.19 GB  & 17.21s & 0.19 GB  & 16.08s & 0.19 GB  & 16.50s & 0.19 GB  & 15.96s & 0.19 GB  \\
+Ganon       & 8.40s  & 0.19 GB  & 8.15s  & 0.19 GB  & 8.71s  & 0.19 GB  & 8.11s  & 0.19 GB  & 8.07s  & 0.19 GB  \\ \hline
+\end{tabular*}
+\end{table*}
+
+\begin{table*}
+\caption{Comparative analysis of runtime and peak memory usage on real datasets.\label{tab:class-comp-real-time}}
+\tabcolsep=1pt%%
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccc@{\extracolsep\fill}}
+\toprule%
+& \multicolumn{2}{@{}c@{}}{\textbf{SRR31013463}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013465}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013467}} & \multicolumn{2}{@{}c@{}}{\textbf{SRR31013473}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}%
+\textbf{Method} & \textbf{Runtime} & \textbf{Mem} & \textbf{Runtime} & \textbf{Mem} & \textbf{Runtime} & \textbf{Mem} & \textbf{Runtime} & \textbf{Mem} \\ \midrule
+\premise                                      & 188.63s        & 2.09GB          & 166.61s        & 2.11GB         & 148.38s        & 1.53GB          & 138.37s        & 1.55GB          \\
+Centrifuger                                  & \textbf{5.12s} & \textbf{0.41GB} & \textbf{8.34s} & \textbf{0.4GB} & \textbf{9.47s} & \textbf{0.35GB} & \textbf{5.12s} & \textbf{0.34GB} \\
+KMCP                                         & 46m24s         & 0.41GB          & 45m09s         & 1.15GB         & 5m15s          & 0.37GB          & 11m10s         & 1.33GB          \\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Comparative analysis of source prediction and abundance estimation on mixed-infection synthetic datasets (24 true sources each).\label{tab:class-comp-mixed-perf-abun}}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccccc@{\extracolsep\fill}}
+\hline
+& \multicolumn{2}{@{}c@{}}{\textbf{Dataset 1}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 2}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 3}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 4}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 5}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}\cline{10-11}%
+\textbf{Method} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} & \textbf{Ruzicka} & \textbf{Jaccard} \\ \midrule
+\premise     & 0.182          & \textbf{0.273} & 0.290          & \textbf{0.400} & 0.412          & \textbf{0.489} & \textbf{0.400} & \textbf{0.566} & \textbf{0.332} & \textbf{0.521} \\
+Centrifuger & 0.577          & 0.950          & 0.434          & 0.948          & 0.590          & 0.965          & 0.611          & 0.964          & 0.604          & 0.958          \\
+KMCP        & 0.885          & 0.792          & 0.736          & 0.583          & 0.807          & 0.667          & 0.832          & 0.708          & 0.778          & 0.625          \\
+KrakenUniq  & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          & 1.000          \\
+MORA        & 0.602          & 0.958          & 0.459          & 0.966          & 0.622          & 0.970          & 0.628          & 0.967          & 0.552          & 0.966          \\
+Karp        & 0.911          & 0.979          & 0.882          & 0.983          & 0.887          & 0.981          & 0.888          & 0.981          & 0.947          & 0.980          \\
+Ganon       & \textbf{0.154} & 0.919          & \textbf{0.233} & 0.901          & \textbf{0.373} & 0.930          & 0.407          & 0.933          & 0.361          & 0.917          \\
+Sylph       & 0.806          & 0.891          & 0.742          & 0.824          & 0.801          & 0.844          & 0.762          & 0.853          & 0.783          & 0.852          \\
+\bottomrule
+\end{tabular*}
+\end{table*}
+
+\begin{table*}[t]
+\caption{Comparative analysis of precision-recall on mixed-infection synthetic datasets (24 true sources each).\label{tab:class-comp-mixed-prec-rec}}
+\centering
+\tabcolsep=1pt%%
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lcccccccccccc@{\extracolsep\fill}}
+\hline
+& \multicolumn{2}{@{}c@{}}{\textbf{Dataset 1}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 2}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 3}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 4}} & \multicolumn{2}{@{}c@{}}{\textbf{Dataset 5}}\\
+\cline{2-3}\cline{4-5}\cline{6-7}\cline{8-9}\cline{10-11}%
+\textbf{Method} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} & \textbf{Precision} & \textbf{Recall} \\ \midrule
+\premise         & 0.923          & 0.980          & 0.832          & 0.977          & 0.827          & 0.979          & 0.864          & 0.977          & 0.877          & 0.979          \\
+Centrifuger    & \textbf{0.981} & 0.468          & \textbf{0.987} & 0.631          & \textbf{0.965} & 0.467          & \textbf{0.966} & 0.439          & \textbf{0.976} & 0.509          \\
+KMCP           & 0.537          & \textbf{1.000} & 0.707          & \textbf{1.000} & 0.551          & \textbf{1.000} & 0.532          & \textbf{1.000} & 0.615          & \textbf{1.000} \\
+KrakenUniq     & 0.000          & 0.000          & 0.000          & 0.000          & 0.000          & 0.000          & 0.000          & 0.000          & 0.000          & 0.000          \\
+MORA           & 0.568          & \textbf{1.000} & 0.702          & \textbf{1.000} & 0.548          & \textbf{1.000} & 0.541          & \textbf{1.000} & 0.619          & \textbf{1.000} \\
+Karp           & 0.035          & 0.038          & 0.015          & 0.009          & 0.020          & 0.024          & 0.029          & 0.035          & 0.044          & 0.040          \\
+Ganon          & 0.917          & 0.977          & 0.868          & 0.975          & 0.771          & 0.973          & 0.744          & 0.971          & 0.780          & 0.973          \\
+Sylph          & ---            & ---            & ---            & ---            & ---            & ---            & ---            & ---            & ---            & ---            \\
+\bottomrule
+\end{tabular*}
+\end{table*}

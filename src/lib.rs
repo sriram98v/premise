@@ -614,6 +614,36 @@ impl CsrLikelihood {
         }
     }
 
+    /// Drop every row whose read is not in `keep`, preserving the reference id space.
+    ///
+    /// `refs` is copied verbatim rather than recompacted so proportion vectors indexed
+    /// against the original CSR remain valid. References left with no rows simply take
+    /// an expected count of zero in the next E-step.
+    fn retain_reads(&self, keep: &HashSet<ReadIdx>) -> Self {
+        let mut reads = Vec::with_capacity(keep.len());
+        let mut row_ptr = Vec::with_capacity(keep.len() + 1);
+        let mut col = Vec::new();
+        let mut lik = Vec::new();
+        row_ptr.push(0);
+        for (r, read_idx) in self.reads.iter().enumerate() {
+            if !keep.contains(read_idx) {
+                continue;
+            }
+            let (s, e) = (self.row_ptr[r], self.row_ptr[r + 1]);
+            col.extend_from_slice(&self.col[s..e]);
+            lik.extend_from_slice(&self.lik[s..e]);
+            reads.push(*read_idx);
+            row_ptr.push(col.len());
+        }
+        Self {
+            refs: self.refs.clone(),
+            reads,
+            row_ptr,
+            col,
+            lik,
+        }
+    }
+
     fn n_reads(&self) -> usize {
         self.reads.len()
     }
@@ -739,6 +769,11 @@ impl CsrLikelihood {
     }
 }
 
+/// Penalty weight used by the "unpenalized" EM path's closed-form M-step.
+const UNPENALIZED_RHO: EMProb = 20.0;
+/// Proportion floor used by the "unpenalized" EM path's closed-form M-step.
+const UNPENALIZED_OMEGA: EMProb = 1e-20;
+
 /// Run the unpenalized EM algorithm to estimate reference proportions.
 ///
 /// Initializes proportions by plurality vote, then iterates the E- and M-steps
@@ -777,23 +812,25 @@ fn get_proportions_par_sparse(
     let (mut prev_data_loglikelihood, _) = csr.e_step(&pi);
     data_likelihoods.push(prev_data_loglikelihood);
 
-    // Proportions used by the last executed E-step (posteriors are built from these).
-    let mut last_pi = pi.clone();
-
     for i in 0..num_iter {
-        last_pi = pi.clone();
         let (data_loglikelihood, ej) = csr.e_step(&pi);
 
-        // M-step: unpenalized closed-form update (rho = 20, omega = 1e-20).
+        // M-step: unpenalized closed-form update.
         let lambda_init = ej
             .iter()
-            .map(|x| x - 20.0)
+            .map(|x| x - UNPENALIZED_RHO)
             .max_by(|f1, f2| EMProb::total_cmp(f1, f2))
             .unwrap();
-        let lambda = _update_lambda(20.0, 1e-20, &ej, lambda_init, num_iter);
+        let lambda = _update_lambda(
+            UNPENALIZED_RHO,
+            UNPENALIZED_OMEGA,
+            &ej,
+            lambda_init,
+            num_iter,
+        );
         pi = (0..n_refs)
             .map(|j| {
-                let tmp_pi = _update_pi(20.0, 1e-20, ej[j], lambda);
+                let tmp_pi = _update_pi(UNPENALIZED_RHO, UNPENALIZED_OMEGA, ej[j], lambda);
                 if tmp_pi > 0.0 {
                     tmp_pi
                 } else {
@@ -819,7 +856,9 @@ fn get_proportions_par_sparse(
     }
     pb.finish_with_message(format!("Final data LL: {prev_data_loglikelihood}"));
 
-    let (results, w) = csr.finalize(&last_pi);
+    // Posteriors are built from the proportions produced by the final M-step, so they
+    // are consistent with the `props` reported below rather than one M-step behind.
+    let (results, w) = csr.finalize(&pi);
 
     let props: HashMap<SeqId, EMProb> = (0..n_refs)
         .filter(|&j| pi[j] * (num_reads as EMProb) > 1.0)
@@ -827,6 +866,56 @@ fn get_proportions_par_sparse(
         .collect();
 
     (results, props, w, data_likelihoods)
+}
+
+/// Re-estimate proportions over the classified reads alone, after reclassification.
+///
+/// Reads reported as unclassified (those whose MAP reference was pruned by EM) still
+/// contributed expected counts to the proportions EM converged on. This runs one further
+/// E-step and M-step over the submatrix restricted to `classified_reads`, so the reported
+/// abundances describe exactly the reads that were actually assigned. Because the M-step
+/// solves for the Lagrange multiplier enforcing $\sum\pi_j=1$, the returned proportions sum to
+/// one without any post-hoc renormalization.
+///
+/// `prev_props` seeds the E-step; references absent from it start at zero and stay there,
+/// which is what keeps EM-pruned references out of the refit.
+fn refit_proportions_on_classified(
+    ll_array: &SparseArray<EMProb>,
+    classified_reads: &HashSet<ReadIdx>,
+    prev_props: &HashMap<SeqId, EMProb>,
+    rho: EMProb,
+    omega: EMProb,
+    num_iter: usize,
+) -> HashMap<SeqId, EMProb> {
+    if classified_reads.is_empty() || ll_array.get_ref_idxs().is_empty() {
+        return HashMap::new();
+    }
+    let csr = CsrLikelihood::build(ll_array).retain_reads(classified_reads);
+    if csr.n_reads() == 0 {
+        return HashMap::new();
+    }
+
+    let pi: Vec<EMProb> = csr
+        .refs
+        .iter()
+        .map(|r| *prev_props.get(r).unwrap_or(&0.0))
+        .collect();
+
+    let (_, ej) = csr.e_step(&pi);
+
+    let lambda_init = ej.iter().map(|x| x - rho).max_by(EMProb::total_cmp).unwrap();
+    let lambda = _update_lambda(rho, omega, &ej, lambda_init, num_iter);
+
+    (0..csr.n_refs())
+        .filter_map(|j| {
+            let p = _update_pi(rho, omega, ej[j], lambda);
+            if p > 0.0 {
+                Some((csr.refs[j], p))
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// M-step update for a single reference proportion under the L1-regularized objective.
@@ -838,7 +927,7 @@ fn _update_pi(rho: EMProb, omega: EMProb, ej: EMProb, lambda: EMProb) -> EMProb 
     (-phi + (phi * phi + 4.0 * lambda * ej * omega).sqrt()) / (2.0 * lambda)
 }
 
-/// Find the Lagrange multiplier λ that enforces the simplex constraint Σπ_j = 1.
+/// Find the Lagrange multiplier λ that enforces the simplex constraint $\sum\pi_j=1$.
 ///
 /// Uses Newton-Raphson starting from `lambda_init`, iterating for up to
 /// `iterations` steps or until the constraint function equals zero.
@@ -939,11 +1028,7 @@ fn get_proportions_par_sparse_l1_reg(
     let (mut prev_data_loglikelihood, _) = csr.e_step(&pi);
     data_likelihoods.push(prev_data_loglikelihood);
 
-    // Proportions used by the last executed E-step (posteriors are built from these).
-    let mut last_pi = pi.clone();
-
     for i in 0..num_iter {
-        last_pi = pi.clone();
         let (data_loglikelihood, ej) = csr.e_step(&pi);
 
         let data_loglikelihood_diff = data_loglikelihood - prev_data_loglikelihood;
@@ -981,7 +1066,9 @@ fn get_proportions_par_sparse_l1_reg(
     }
     pb.finish_with_message(format!("Final data LL: {prev_data_loglikelihood}"));
 
-    let (results, w) = csr.finalize(&last_pi);
+    // Posteriors are built from the proportions produced by the final M-step, so they
+    // are consistent with the `props` reported below rather than one M-step behind.
+    let (results, w) = csr.finalize(&pi);
 
     let props: HashMap<SeqId, EMProb> = (0..n_refs)
         .filter(|&j| pi[j] * (num_reads as EMProb) > 1.0)
@@ -1613,9 +1700,9 @@ fn run_query(
         }
     }
 
-    // Build matches TSV. Counts of the reads actually reported as classified are accumulated
-    // here so .props can be derived from them below (BTreeMap keeps the output deterministic).
-    let mut assigned_counts: BTreeMap<SeqId, u64> = BTreeMap::new();
+    // Build matches TSV. The reads that come out of it classified are collected so the
+    // proportions can be refit over exactly that subset below.
+    let mut classified_reads: HashSet<ReadIdx> = HashSet::new();
     let mut matches_tsv =
         String::from("ReadID\tRefID\tPosterior\tForward Position\tReverse Position\n");
     for read_id in all_read_ids.iter() {
@@ -1662,19 +1749,29 @@ fn run_query(
                 alignment.get_pos().0,
                 alignment.get_pos().1,
             ));
-            *assigned_counts.entry(*ref_idx).or_insert(0) += 1;
+            classified_reads.insert(*read_idx.unwrap());
         }
     }
 
-    let total_assigned: u64 = assigned_counts.values().sum();
+    // .props reports proportions refit over the classified reads by one final E-step and
+    // M-step, rather than proportions re-derived by normalizing the classified-read counts.
+    // The M-step's simplex constraint makes these sum to one.
+    // (BTreeMap only to keep the output order deterministic.)
+    let final_props = refit_proportions_on_classified(
+        &ll_array,
+        &classified_reads,
+        &props,
+        if use_penalty { rho } else { UNPENALIZED_RHO },
+        if use_penalty { omega } else { UNPENALIZED_OMEGA },
+        num_iter,
+    );
+    // Printed at higher precision than the other TSVs: at {:.5e} the per-row rounding error
+    // accumulates to ~1e-6 across a few references, which is enough to make the column
+    // visibly miss the sum-to-one property the refit establishes.
     let mut props_tsv = String::new();
-    for (ref_idx, count) in &assigned_counts {
+    for (ref_idx, prop) in final_props.iter().collect::<BTreeMap<_, _>>() {
         let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-        props_tsv.push_str(&format!(
-            "{}\t{:.5e}\n",
-            ref_id,
-            *count as f64 / total_assigned as f64
-        ));
+        props_tsv.push_str(&format!("{}\t{:.10e}\n", ref_id, prop));
     }
 
     // Build aligns TSV — same format as run_alignment output
@@ -1941,10 +2038,7 @@ fn handle_query_run(
         .get("mem_seed_length")
         .and_then(|s| s.parse().ok())
         .unwrap_or(22);
-    let eps_1: EMProb = qs
-        .get("eps_1")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1e-64);
+    let eps_1: EMProb = qs.get("eps_1").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let eps_2: EMProb = qs
         .get("eps_2")
         .and_then(|s| s.parse().ok())
@@ -2104,7 +2198,7 @@ pub fn run() -> Result<()> {
                     .value_parser(clap::value_parser!(String))
                     )
                 .arg(arg!(-m --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
-                    .default_value("11")
+                    .default_value("22")
                     .value_parser(clap::value_parser!(usize))
                     )
                 .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")
@@ -2136,11 +2230,11 @@ pub fn run() -> Result<()> {
                     .value_parser(clap::value_parser!(String))
                     )
                 .arg(arg!(-m --mem <MEM_SEED_LENGTH> "Minimum seed length for MEM")
-                    .default_value("11")
+                    .default_value("22")
                     .value_parser(clap::value_parser!(usize))
                     )
-                .arg(arg!(--eps_1 <EPS_1>"Cutoff likelihood for dropping alignments")
-                    .default_value("1e-64")
+                .arg(arg!(--eps_1 <EPS_1>"Cutoff likelihood for dropping alignments (0 disables the cutoff)")
+                    .default_value("0")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-'1' --r1 <READS1>"Source file with forward read sequences(fastq or fastq.gz)")

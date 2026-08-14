@@ -1,0 +1,53 @@
+# Parameters for the PREMISE comparative benchmark
+[run]
+# Where indexes/, samples/, results/ and truth/ live; Empty means the comparative-ananlysis directory itself
+bench_data = "/home/sriramv/Datasets/premise-benchmark/hpc"
+
+threads = "12"
+classify_timeout = "2400"
+
+methods = "pre kmp cen mor kap gan syl"
+
+splits = "syn-iso syn-mix syn-mix-subtype real-iso real-mix"
+max_ds_per_split = "0"    # 0 = every dataset in a split; 1 for a smoke test
+skip_build = "0"          # 1 = reuse existing indexes/ and db_build.csv instead of rebuilding. "0" = existing indexes will be overwritten.
+
+kmcp_threads = "4"          # kmcp search -j. kmcp's own docs say "4-threads is fast enough"
+
+kmcp_allow_synthetic = "0"  # 1 = run kmcp on the synthetic splits anyway
+
+[pre]
+threads = "0"           # premise -t 0 = use all available cores
+mem = "22"              # -m, minimum SMEM seed length
+iters = "200"           # -i, EM iterations (all splits except real; see iters_real)
+iters_real = "100"      # -i on the real+isolate split
+eps_1 = "0"             # pre-EM alignment likelihood cutoff; 0 disables the floor entirely
+eps_2 = "1e-18"         # minimum per-alignment match log-probability (alignment stage)
+em_threshold = "1e-6"   # EM convergence threshold on the data log-likelihood
+rho = "150"             # L1 penalty weight (EM stage)
+omega = "1e-10"         # L1 penalty floor; must stay <= 1e-6 or the penalty stops sparsifying
+
+[kmp]
+k = "21"                  # kmcp compute -k
+f = "0.3"                 # kmcp index -f, false-positive rate
+n = "1"                   # kmcp index -n, number of hash functions
+profile_level = "strain"  # kmcp profile --level
+profile_m = "3"           # kmcp profile -m, minimum number of matched k-mer groups
+
+[kap]
+k = "31"                # karp -c index -k
+min_freq = "0"          # karp -c quantify --min_freq; 0 keeps every reference in the output
+
+[gan]
+rel_cutoff = "0.01"     # ganon classify --rel-cutoff
+fpr_query = "1"         # ganon classify --fpr-query
+
+[syl]
+c = "100"               # -c, subsampling rate
+min_kmers = "10"        # sylph profile --min-number-kmers
+
+[iss]
+cpus = "12"
+seed_syn_iso = "20260806"
+seed_syn_mix = "20260727"
+seed_syn_mix_subtype = "20260805"
