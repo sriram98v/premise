@@ -2,7 +2,7 @@
   # premise, plus the pinned toolchain for its comparative benchmark.
   #
   #     nix develop                    # dev shell: build and hack on premise
-  #     nix develop .#benchmark        # study shell: every tool comparative-analysis/run-all.sh needs
+  #     nix develop .#benchmark        # study shell: every tool comparative-analysis/run-analysis.py needs
   #
   description = "premise — paired-end metagenomic read classifier, and its benchmark toolchain";
 

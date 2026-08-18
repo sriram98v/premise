@@ -3,18 +3,15 @@
 """
 from __future__ import annotations
 
-from pathlib import Path
-
 import argparse
 import re
 import sys
 from collections import OrderedDict
+from pathlib import Path
 
 import utils
 
 
-# Resolved per call, not at import: a constant would bind to whatever $BENCH_DATA held when this
-# module was first imported.
 def syn() -> "Path":
     return utils.samples() / "synthetic"
 

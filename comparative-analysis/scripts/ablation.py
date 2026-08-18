@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Ablation study for PREMISE across all four benchmark splits.
+"""Sensitivity analysis for PREMISE across all four benchmark splits.
 
-Sweeps each tunable parameter in isolation around the benchmark's production configuration and records, per setting.
+Sweeps each tunable parameter per setting.
 
 Parameters swept (see `GRID`):
     mem    (-m)      minimum SMEM seed length -- seeding stage
@@ -39,7 +39,15 @@ from pathlib import Path
 import load_params
 import utils
 from bench_metrics import precision_recall, profile_distances
-from utils import count_pairs, open_maybe_gz, parse_timemem, strain_of, strip_version
+from utils import (
+    count_pairs,
+    is_unclassified,
+    iss_source,
+    open_maybe_gz,
+    parse_timemem,
+    strain_of,
+    strip_version,
+)
 
 
 def _pre() -> dict[str, str]:
@@ -99,12 +107,11 @@ def BASELINE() -> dict[str, str]:
     }
 
 GRID = {
-    "mem":   [str(v) for v in range(6, 41)],
-    "eps_2": ["0", "1e-36", "1e-27", "1e-18", "1e-12", "1e-9", "1e-6", "1e-3"],
-    "eps_1": ["0", "1e-256", "1e-200", "1e-160", "1e-128", "1e-96", "1e-64",
-              "1e-32", "1e-16", "1e-8", "1e-4"],
-    "rho":   ["0", "10", "20", "30", "50", "150", "300", "600", "1200"],
-    "omega": ["1e-30", "1e-20", "1e-10", "1e-8", "1e-6", "1e-4"],
+    "mem":   ["20", "21", "22", "23", "24"],
+    "eps_2": ["1e-36", "1e-27", "1e-18", "1e-12", "1e-9"],
+    "eps_1": ["0", "1e-256", "1e-200", "1e-160", "1e-128"],
+    "rho":   ["30", "50", "150", "300", "600"],
+    "omega": ["1e-30", "1e-20", "1e-10", "1e-8", "1e-6"],
 }
 
 PARAM_ORDER = ["mem", "eps_2", "eps_1", "rho", "omega"]
@@ -200,7 +207,7 @@ def load_context(t: Target) -> dict:
                 if i % 4:
                     continue
                 rid = line[1:].rstrip("\n").rsplit("/", 1)[0]
-                truth[rid] = strip_version(rid.split("_")[0])
+                truth[rid] = iss_source(rid)
         return dict(truth_reads=truth, truth_counts=dict(Counter(truth.values())),
                     n_reads=len(truth), n_input=len(truth))
 
@@ -265,7 +272,7 @@ def load_output(d: Path, base: str):
             for line in f:
                 p = line.rstrip("\n").split("\t")
                 if len(p) >= 2:
-                    assign[p[0]] = None if p[1] == "unclassified" else strip_version(p[1])
+                    assign[p[0]] = None if is_unclassified(p[1]) else strip_version(p[1])
     abund = None
     props = d / f"{base}.props"
     if props.exists() and props.stat().st_size:

@@ -34,9 +34,8 @@ import normalize_karp
 import normalize_mora
 import normalize_sylph
 import prepare_real_samples
-from utils import die, nonempty
+from utils import SPLIT_INPUTS, die, nonempty
 
-TIME = "/usr/bin/time"
 KILL_GRACE = "30"
 DB_BUILD_CSV = "db_build.csv"
 DB_BUILD_HEADER = "method,size_before_bytes,size_after_bytes,build_seconds,exit"
@@ -101,22 +100,59 @@ def run_cmd(ctx: Ctx, argv: list[str], *, out: str | None = None, err: str | Non
         return 0
 
     with contextlib.ExitStack() as stack:
-        fh_out = stack.enter_context(open(ctx.root / out, "w")) if out else None
-        fh_err = None
-        if err_to_out:
-            fh_err = subprocess.STDOUT
-        elif err:
-            fh_err = stack.enter_context(open(ctx.root / err, "a" if err_append else "w"))
-        elif err_null:
-            fh_err = subprocess.DEVNULL
+        fh_out, fh_err = _redirect(ctx, stack, out, err, err_append, err_to_out, err_null)
         return subprocess.call(argv, cwd=ctx.root, stdout=fh_out, stderr=fh_err)
 
 
+def _redirect(ctx: Ctx, stack: contextlib.ExitStack, out, err, err_append, err_to_out, err_null):
+    """The shell's redirections, as (stdout, stderr) handles."""
+    fh_out = stack.enter_context(open(ctx.root / out, "w")) if out else None
+    fh_err = None
+    if err_to_out:
+        fh_err = subprocess.STDOUT
+    elif err:
+        fh_err = stack.enter_context(open(ctx.root / err, "a" if err_append else "w"))
+    elif err_null:
+        fh_err = subprocess.DEVNULL
+    return fh_out, fh_err
+
+
 def timed(ctx: Ctx, tm: str, argv: list[str], **redir) -> int:
-    """The shell's TW(): cap the wall clock and record /usr/bin/time -v to <tm>.
+    """Cap the wall clock, and record the child's resource usage to <tm>.
+
+    The numbers come from os.wait4 -- the same kernel counters /usr/bin/time reports, since that is
+    where it reads them from too -- so this drops a binary from the chain rather than approximating
+    anything. os.wait4 scopes the rusage to THIS child; resource.getrusage(RUSAGE_CHILDREN) would
+    not, as it returns a running maximum over every child reaped so far and never decreases.
+
+    The `timeout` wrapper stays: it forks and waits, so its rusage still carries the method's peak,
+    and the -k grace period keeps working as before.
+
+    <tm> keeps /usr/bin/time -v's field names so utils.parse_timemem reads new and old files alike.
     """
-    return run_cmd(ctx, ["timeout", "-k", KILL_GRACE, ctx.timeout,
-                         TIME, "-v", "-o", tm] + argv, **redir)
+    full = ["timeout", "-k", KILL_GRACE, ctx.timeout] + argv
+    if ctx.dry_run:
+        return run_cmd(ctx, full, **redir)
+
+    with contextlib.ExitStack() as stack:
+        fh_out, fh_err = _redirect(ctx, stack, redir.get("out"), redir.get("err"),
+                                   redir.get("err_append", False), redir.get("err_to_out", False),
+                                   redir.get("err_null", False))
+        t0 = os.times().elapsed
+        proc = subprocess.Popen(full, cwd=ctx.root, stdout=fh_out, stderr=fh_err)
+        _, status, ru = os.wait4(proc.pid, 0)
+        wall = os.times().elapsed - t0
+
+    rc = os.waitstatus_to_exitcode(status)
+    proc.returncode = rc          # the child is already reaped; stop Popen waiting on it again
+    (ctx.root / tm).write_text(
+        f'\tCommand being timed: "{" ".join(argv)}"\n'
+        f"\tUser time (seconds): {ru.ru_utime:.2f}\n"
+        f"\tSystem time (seconds): {ru.ru_stime:.2f}\n"
+        f"\tElapsed (wall clock) time (h:mm:ss or m:ss): {wall:.2f}\n"
+        f"\tMaximum resident set size (kbytes): {ru.ru_maxrss}\n"
+        f"\tExit status: {rc}\n")
+    return rc
 
 
 def require_tools(tools: tuple[str, ...] | list[str]) -> None:
@@ -145,12 +181,12 @@ class Split:
         return self.sample_dir.startswith("samples/synthetic/")
 
 
-SPLITS = (
-    Split("syn-iso", "samples/synthetic/isolate", "reads_R{n}.fastq"),
-    Split("syn-mix", "samples/synthetic/mixed", "reads_R{n}.fastq"),
-    Split("syn-mix-subtype", "samples/synthetic/mixed-subtype", "reads_R{n}.fastq"),
-    Split("real-iso", "samples/real/isolate", "{base}_{n}-filtered.ca.fastq"),
-    Split("real-mix", "samples/real/mixed", "{base}_{n}-filtered.ca.fastq"),
+# Built from utils.SPLIT_INPUTS so the files classified here and the files counted as the coverage
+# denominator in analyze.py can never drift apart again -- they did, and it silently deflated every
+# real-split coverage number.
+SPLITS = tuple(
+    Split(code, sample_dir, reads)
+    for code, (sample_dir, reads) in SPLIT_INPUTS.items()
 )
 SPLIT_BY_CODE = {s.code: s for s in SPLITS}
 

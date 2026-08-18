@@ -4,7 +4,7 @@
 Both real splits run the same pipeline.
 
 Usage:
-  python3 scripts/prepare_real_samples.py                          # both splits, skipping finished
+  python3 scripts/prepare_real_samples.py
   python3 scripts/prepare_real_samples.py --split real-iso
   python3 scripts/prepare_real_samples.py --threads 16 --force
   python3 scripts/prepare_real_samples.py --samples SRR31013463 SRR31013465
@@ -41,10 +41,8 @@ def tmpidx_str() -> str:
 
 SRC_FASTA = "true_sources.fasta"
 
-# Both real splits run the identical pipeline to the identical names, so these are properties of
-# the pipeline rather than of a split. They were per-split fields until the two converged.
-TRIM_SFX = ("_1.ca.fastq", "_2.ca.fastq")                      # cutadapt output, fed to bwa
-OUT_SFX = ("_1-filtered.ca.fastq", "_2-filtered.ca.fastq")     # analysis-ready, what the drivers read
+TRIM_SFX = ("_1.ca.fastq", "_2.ca.fastq")
+OUT_SFX = ("_1-filtered.ca.fastq", "_2-filtered.ca.fastq")
 TRUTH_TSV = read_truth.TRUTH_NAME
 UNCL_TXT = read_truth.UNCL_NAME
 
@@ -59,8 +57,8 @@ class Split:
     """Everything that differs between the two real splits.
     """
     name: str
-    sub: str                        # relative to the data root
-    cutadapt: tuple[str, ...]       # the only thing that still differs between the two
+    sub: str
+    cutadapt: tuple[str, ...]
 
 
 SPLITS: dict[str, Split] = {
@@ -164,12 +162,8 @@ def run_cutadapt(spec: Split, s: Sample, threads: int, dry: bool) -> None:
 def align_and_derive_truth(s: Sample, idx: str, threads: int) -> read_truth.TruthResult:
     cmd = [BWA, "mem", "-t", str(threads), idx, rel(s.tr1), rel(s.tr2)]
     with open(s.dir / f"{s.base}.bwa.log", "w") as errlog:
-        # Binary, not text=True: pysam reads the raw stream. stderr must be a real file and
-        # never PIPE -- two pipes with only one drained deadlocks.
         proc = subprocess.Popen(cmd, cwd=root_str(), stdout=subprocess.PIPE, stderr=errlog)
         try:
-            # Drain to EOF before wait(): waiting first deadlocks as soon as bwa's output
-            # exceeds the pipe buffer, which is immediately.
             result = read_truth.run(proc.stdout, s.dir, collect_ids=True)
         except BaseException:
             proc.stdout.close()

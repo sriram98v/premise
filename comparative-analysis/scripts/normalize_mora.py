@@ -10,6 +10,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from utils import is_unclassified
+
 NAME = "normalize_mora"
 
 
@@ -28,12 +30,14 @@ def normalize(inp: Path, out: Path) -> int:
             if len(parts) < 2:
                 continue
             read_id, ref_id = parts[0], parts[1]
-            # skip header line if present
+            
             if not header_skipped and read_id.lower() in ('read_id', 'query_id', 'readid'):
                 header_skipped = True
                 continue
             header_skipped = True
-            if not ref_id or ref_id == '*':
+
+            # "NOT ALIGNED" is an unclassified read
+            if is_unclassified(ref_id):
                 ref_id = 'unclassified'
             fout.write(f'{read_id}\t{ref_id}\n')
             rows += 1

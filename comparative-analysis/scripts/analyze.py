@@ -14,8 +14,20 @@ from collections import Counter
 from pathlib import Path
 
 from bench_metrics import precision_recall, profile_distances
-from utils import data_root, parse_timemem, results, strain_of, strip_version
+from utils import (
+    code_root,
+    count_pairs,
+    data_root,
+    is_unclassified,
+    iss_source,
+    parse_timemem,
+    results,
+    split_read_path,
+    strain_of,
+    strip_version,
+)
 
+CODE = code_root()
 SYNTH_DS = ["Dataset-1", "Dataset-2", "Dataset-3", "Dataset-4"]
 REAL_DS = ["SRR31013463", "SRR31013465", "SRR31013467", "SRR31013473"]
 REALMIXED_DS = ["SRR3360139", "SRR3360140", "SRR3360145", "SRR3360146"]
@@ -124,29 +136,23 @@ def load_truth(split: str, ds: str):
         for line in f:
             p = line.rstrip("\n").split("\t")
             if len(p) >= 1 and p[0]:
-                truth[p[0]] = strip_version(p[0].split("_")[0])
+                truth[p[0]] = iss_source(p[0])
     return truth, dict(Counter(truth.values())), len(truth)
 
 
-_R1_PATH = {
-    "syn-iso":         lambda ds: data_root() / "samples" / "synthetic" / "isolate" / ds / "reads_R1.fastq",
-    "syn-mix":         lambda ds: data_root() / "samples" / "synthetic" / "mixed"   / ds / "reads_R1.fastq",
-    "syn-mix-subtype": lambda ds: data_root() / "samples" / "synthetic" / "mixed-subtype" / ds / "reads_R1.fastq",
-    "real-iso":        lambda ds: data_root() / "samples" / "real" / "isolate" / ds / f"{ds}_1-filtered.ca.fastq",
-    "real-mix":        lambda ds: data_root() / "samples" / "real" / "mixed"   / ds / f"{ds}_1-filtered.ca.fastq",
-}
-
-
 def input_read_count(split: str, ds: str):
-    """Total read (pair) count in the dataset's R1 input fastq, or None if unavailable."""
-    p = _R1_PATH[split](ds)
-    opener = (lambda: gzip.open(p, "rt")) if p.suffix == ".gz" else (lambda: open(p))
+    """Total read (pair) count in the dataset's R1 input fastq, or None if unavailable.
+
+    The path comes from `utils.SPLIT_INPUTS`, the same table `run-analysis.py` classifies from,
+    so the denominator is always counted over the file the methods actually read.
+    """
     try:
+        p = split_read_path(split, ds, mate=1)
         if not p.exists() or p.stat().st_size == 0:
             return None
-        with opener() as f:
-            return sum(1 for _ in f) // 4
-    except (OSError, EOFError):
+        return count_pairs(p)
+    except (OSError, EOFError, KeyError):
+        # Coverage degrades to a dash rather than taking the whole table down with it.
         return None
 
 
@@ -163,7 +169,7 @@ def _read_2col_tsv(path: Path, strip_mate=False):
                 continue
             rid = p[0].split("/", 1)[0] if strip_mate else p[0]
             ref = p[1].strip()
-            out[rid] = strip_version(ref) if ref and ref != "unclassified" else None
+            out[rid] = None if is_unclassified(ref) else strip_version(ref)
     return out
 
 
@@ -178,7 +184,7 @@ def load_premise(d: Path, base: str):
                 p = line.rstrip("\n").split("\t")
                 if len(p) < 2:
                     continue
-                assign[p[0]] = None if p[1] == "unclassified" else strip_version(p[1])
+                assign[p[0]] = None if is_unclassified(p[1]) else strip_version(p[1])
     props = d / f"{base}.props"
     abund = None
     if props.exists() and props.stat().st_size:
@@ -208,7 +214,7 @@ def load_centrifuger(d: Path, base: str):
             if len(p) < 2:
                 continue
             ref = strip_version(p[1])
-            if ref in ("no rank", "species"):
+            if is_unclassified(ref) or ref in ("no rank", "species"):
                 ref = None
             assign[p[0]] = ref
             if ref:
@@ -347,6 +353,28 @@ def load_method(code: str, split: str, ds: str):
     return None, None
 
 
+# Methods that emit exactly one row per input read
+_COMPLETE_OUTPUT = {"pre", "cen", "mor"}
+
+
+def _check_read_counts(code: str, split: str, ds: str, assign: dict, denom: int | None) -> None:
+    """Warn when a method's per-read output and the coverage denominator disagree.
+
+    Never raises: a mismatch makes the number untrustworthy, not uncomputable, and one bad
+    dataset must not take the whole table down.
+    """
+    if denom is None:
+        return
+    n = len(assign)
+    if n > denom:
+        print(f"WARNING: {code} {split}/{ds}: {n} reads in output exceeds denominator {denom} "
+              f"-- results and input FASTQ disagree; coverage is meaningless", file=sys.stderr)
+    elif code in _COMPLETE_OUTPUT and n != denom:
+        print(f"WARNING: {code} {split}/{ds}: {n} reads in output vs denominator {denom} "
+              f"(delta {n - denom:+d}); {code} emits one row per read, so these should match",
+              file=sys.stderr)
+
+
 def compute_dataset(split: str, ds: str):
     info = SPLITS[split]
     truth_reads, truth_counts, n_reads = load_truth(split, ds)
@@ -359,6 +387,7 @@ def compute_dataset(split: str, ds: str):
         if assign is not None:
             classified = sum(1 for v in assign.values() if v is not None)
             denom = input_read_count(split, ds)
+            _check_read_counts(m["code"], split, ds, assign, denom)
             if denom:
                 cr = 100.0 * classified / denom
         dist = profile_distances(truth_counts, n_reads, abund,
@@ -371,6 +400,16 @@ def compute_dataset(split: str, ds: str):
 
 def abund_cell(row):
     return row["dist"]["ruz.uc"], row["dist"]["jac.uc"]
+
+
+def fpfn_cell(row):
+    """(false positives, false negatives) at the reference level, or (None, None) to dash.
+
+    Complements Jaccard in the abundance table: Jaccard collapses both errors into one number,
+    these say which direction a method errs in.
+    """
+    dist = row["dist"]
+    return (dist.get("fp.tx"), dist.get("fn.tx"))
 
 
 def pr_cell(row, real):
@@ -388,7 +427,14 @@ def _isnum(x):
 
 
 def _numstr(x, sig=None):
-    """Format a number: `sig` significant digits (%g) when given, else 2 decimal places."""
+    """Format a number: `sig` significant digits (%g), "int" for a whole number, else 2 decimals.
+
+    The "int" mode exists for counts. Neither other mode renders them: the default gives "3.00",
+    and %g switches to scientific notation past 4 significant digits, so a reference count of
+    12345 would print as "1.234e+04".
+    """
+    if sig == "int":
+        return f"{x:.0f}"
     return f"{x:.{sig}g}" if sig else f"{x:.2f}"
 
 
@@ -439,16 +485,20 @@ def render(split_title, datasets, method_rows, col_labels, lower_better, dash,
     best = _best_per_column(matrix, lower_better, k, sig)
     nds = len(datasets)
 
+    widest = max([len(fmt(v, dash, sg[j])) for _, _, cells in method_rows
+                  for cell in cells for j, v in enumerate(cell)] +
+                 [len(cl) for cl in col_labels] + [8])
+    w = widest + 1
     out = [f"\n=== {split_title} ({'/'.join(col_labels)}) ==="]
-    head = f"{'Method':13}" + "".join(f"{ds[:9 * k]:>{9 * k}}" for ds in datasets)
+    head = f"{'Method':13}" + "".join(f"{ds[:w * k]:>{w * k}}" for ds in datasets)
     out.append(head)
-    sub = f"{'':13}" + "".join("".join(f"{cl[:8]:>9}" for cl in col_labels) for _ in datasets)
+    sub = f"{'':13}" + "".join("".join(f"{cl[:w - 1]:>{w}}" for cl in col_labels) for _ in datasets)
     out.append(sub)
     for _, name, cells in method_rows:
         line = f"{name:13}"
         for cell in cells:
             for j, v in enumerate(cell):
-                line += f"{fmt(v, dash, sg[j]):>9}"
+                line += f"{fmt(v, dash, sg[j]):>{w}}"
         out.append(line)
 
     colspec = "l" + "c" * (k * nds)
@@ -558,8 +608,6 @@ def build_tables(splits, datasets_filter):
         dss = [d for d in dss if d in per_ds]
         if not dss:
             continue
-        # The \label tag IS the split code — tab:class-comp-real-mix-time, etc. No separate
-        # tag table: a second vocabulary for the same five things is what this rename removed.
         cap, tag = SPLIT_CAPTION[split], split
         disp = _display_datasets(split, dss)
 
@@ -595,6 +643,19 @@ def build_tables(splits, datasets_filter):
                         ("Ruzicka", "Jaccard"), True, "-",
                         caption=f"Comparative analysis of source prediction and abundance estimation on {cap} datasets",
                         label=f"class-comp-{tag}-perf-abun", sig=4)
+        stdout_blocks.append(so); latex_blocks.append(la)
+
+        fpfn_rows = []
+        for m in METHODS:
+            tex = "\\premise" if m["code"] == "pre" else m["name"]
+            fpfn_rows.append((tex, m["name"], [fpfn_cell(per_ds[ds][m["code"]]) for ds in dss]))
+        so, la = render(f"{split.capitalize()} reference detection", disp, fpfn_rows,
+                        ("FP", "FN"), True, "-",
+                        caption=f"Reference-level false positives and false negatives on {cap} "
+                                f"datasets. FP counts references a method reported that are absent "
+                                f"from the sample; FN counts references present in the sample that "
+                                f"it failed to report",
+                        label=f"class-comp-{tag}-refdet", sig="int")
         stdout_blocks.append(so); latex_blocks.append(la)
     return "\n".join(stdout_blocks), "\n".join(latex_blocks)
 

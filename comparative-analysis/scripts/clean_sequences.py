@@ -30,7 +30,7 @@ def read_fasta(path: Path):
     ids, headers, seqs = [], [], []
     for rec in fastapy.parse(path):
         ids.append(rec.id)
-        headers.append(rec.description[1:])   # description is ">id desc"; headers omit the '>'
+        headers.append(rec.description[1:])
         seqs.append(rec.seq.upper())
     return ids, headers, seqs
 

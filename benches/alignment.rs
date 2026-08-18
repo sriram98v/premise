@@ -11,7 +11,6 @@ use premise::{
 };
 use std::collections::HashMap;
 
-
 const READ_LEN: usize = 150;
 const SEED_LEN: usize = 20;
 const N_REFS: usize = 4;

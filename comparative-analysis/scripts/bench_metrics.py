@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+SYNTHETIC_BINS = frozenset({'other', 'unclassified'})
+
 
 def jaccard_distance(set_a, set_b) -> float:
     inter = len(set_a & set_b)
@@ -93,7 +95,9 @@ def profile_distances(truth_counts: dict, n_reads: int, method_abund: dict | Non
     """
     if method_abund is None:
         nan = float('nan')
-        return {k: nan for k in ('cos', 'ruz', 'jac', 'cos.uc', 'ruz.uc', 'jac.uc')}
+        out = {k: nan for k in ('cos', 'ruz', 'jac', 'cos.uc', 'ruz.uc', 'jac.uc')}
+        out['fp.tx'] = out['fn.tx'] = None
+        return out
     bwa, bwa_uc = truth_proportions(truth_counts, n_reads)
     truth_refs = set(truth_counts)
     prof, prof_uc = build_method_profile(method_abund, truth_refs, uncl_frac, has_uc, add_other)
@@ -101,6 +105,7 @@ def profile_distances(truth_counts: dict, n_reads: int, method_abund: dict | Non
     bwa_uc_set = {k for k, v in bwa_uc.items() if v > 0}
     prof_set = {k for k, v in prof.items() if v > 0}
     prof_uc_set = {k for k, v in prof_uc.items() if v > 0}
+    detected = prof_uc_set - SYNTHETIC_BINS
     return {
         'cos': cosine_distance(bwa, prof),
         'ruz': ruzicka_distance(bwa, prof),
@@ -108,6 +113,8 @@ def profile_distances(truth_counts: dict, n_reads: int, method_abund: dict | Non
         'cos.uc': cosine_distance(bwa_uc, prof_uc),
         'ruz.uc': ruzicka_distance(bwa_uc, prof_uc),
         'jac.uc': jaccard_distance(bwa_uc_set, prof_uc_set),
+        'fp.tx': len(detected - truth_refs),
+        'fn.tx': len(truth_refs - detected),
     }
 
 

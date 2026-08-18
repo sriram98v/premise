@@ -40,9 +40,22 @@ cd premise
 cargo install --path .
 ```
 
+Or with [Nix](https://nixos.org/download/) (flakes enabled), which pins the whole toolchain:
+
+```bash
+# run without installing
+nix run github:sriram98v/premise -- --help
+
+# install into your profile
+nix profile install github:sriram98v/premise
+
+# or a dev shell with the pinned Rust toolchain (from a clone)
+nix develop
+```
+
 ## Usage
 
-### Step 1 — Build an FM-index
+**Step 1:** Build a bidirectional FM-index
 
 ```bash
 premise build -s <reference.fasta>
@@ -50,7 +63,7 @@ premise build -s <reference.fasta>
 
 Produces `<reference>.fmidx`. This index is required for both the CLI and GUI query steps.
 
-### Step 2 — Classify reads (CLI)
+**Step 2:** Analyze the reads in sample
 
 ```bash
 premise query \
@@ -79,17 +92,17 @@ Outputs:
 
 Run `premise query -h` for the full option list.
 
-### Step 3 — Interactive GUI (optional)
+### Interactive GUI (optional)
 
 ```bash
 premise server
 ```
 
-Opens a browser UI at `http://localhost:8080` with drag-and-drop file upload, interactive results tables, pie chart, and EM convergence plot. Supports light/dark mode.
+Opens a browser UI at `http://localhost:8080` with drag-and-drop file upload, interactive results tables, pie chart, and EM convergence plot.
 
 ## Algorithm
 
-PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then scored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-m`/`--mem` sets the minimum seed length.
+PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then scored **ungapped** against that offset --- there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-m`/`--mem` sets the minimum seed length.
 
 The EM step solves a penalized likelihood maximization:
 
@@ -116,6 +129,7 @@ premise/
 ```
 
 ## Output Format
+PREMISE produced four files: The final per-read assignments in ```*.matches```, the read-reference alignment probabilities for all read-reference matches founf prior to EM in ```*.aligns```, the posterior probabilities of all read matches found after EM in ```*.posteriors```, and the proportions of detected references after EM in ```*.props```. Below are the schemas of each output.
 
 ### `.matches` (TSV)
 | Column | Description |
@@ -124,8 +138,21 @@ premise/
 | `ref_id` | Assigned reference sequence ID |
 | `posterior` | Posterior probability of assignment |
 
+
+### `.aligns` (TSV)
+| Column | Description |
+|--------|-------------|
+| `read_id` | Read identifier |
+| `ref_id` | Assigned reference sequence ID |
+| `probability` | Probability of read-reference alignment|
+
 ### `.posteriors` (TSV)
-Full posterior probability matrix: one row per read, one column per reference.
+| Column | Description |
+|--------|-------------|
+| `read_id` | Read identifier |
+| `ref_id` | Assigned reference sequence ID |
+| `posterior` | Posterior probability of assignment |
+
 
 ### `.props` (TSV)
 | Column | Description |
@@ -133,7 +160,21 @@ Full posterior probability matrix: one row per read, one column per reference.
 | `ref_id` | Reference sequence ID |
 | `proportion` | Estimated relative abundance |
 
-Proportions are not derived by normalizing the read counts in `.matches`. After reads whose reference was pruned by EM are reclassified as unclassified, the likelihood matrix is restricted to the remaining reads and one further E-step and M-step are run; `.props` reports that result. The M-step solves for the Lagrange multiplier enforcing $\sum \pi = 1$, so the column sums to one without any post-hoc renormalization.
+The reported proportions are those inferred by EM, not normalizing the read counts in `.matches`. After reads whose reference was pruned by EM are reclassified as unclassified, the likelihood matrix is restricted to the remaining reads and one last E-step and M-step are run; `.props` reports that result.
+
+## Comparative Analysis
+
+PREMISE is evaluated against six other read-classification tools --- [Centrifuger](https://github.com/mourisl/centrifuger), [Ganon](https://github.com/pirovc/ganon), [Karp](https://github.com/mreppell/Karp), [KMCP](https://github.com/shenwei356/kmcp), [MORA](https://github.com/AlgoLab/MORA), and [Sylph](https://github.com/bluenote-1577/sylph) --- across five dataset splits: three of which are simulated (synthetic isolate, synthetic mixed, synthetic same-subtype mixed) and two are real samples acquired from NCBI SRA (real isolate and real mixed-infection samples). Every method is evaluated on runtime, peak memory, per-read precision, coverage, Ruzicka distance, and Jaccard distance. A separate abaltion study that sweeps over the parameters `-m`, `--eps_1`, `--eps_2`, `--rho` and `--omega` is also implemented.
+
+The toolchain for every competing method is pinned in `flake.nix`:
+
+```bash
+nix develop .#benchmark              # creates a temporary shell environment with all binaries needed for the comparative analysis on PATH
+cd comparative-analysis
+python3 run-analysis.py --threads <n>
+```
+
+See [comparative-analysis/README.md](comparative-analysis/README.md) for data preparation, configuration (`params.toml`), directory layout, and the full ablation procedure.
 
 ## Citation
 

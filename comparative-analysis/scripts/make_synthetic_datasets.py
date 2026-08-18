@@ -17,7 +17,7 @@ Usage:
     python3 scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate
     python3 scripts/make_synthetic_datasets.py syn-mix samples/synthetic/mixed
     python3 scripts/make_synthetic_datasets.py syn-mix-subtype samples/synthetic/mixed-subtype
-    python3 scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate --datasets 5 --only 5
+    python3 scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate --only 3
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message
 
 SEGMENTS = list(range(1, 9))
 N_GENOMES = 3
+N_DATASETS = 4
 K = 21
 
 SEG_RE = re.compile(r"segment (\d)")
@@ -88,12 +89,12 @@ def dataset_rng(seed: int, index: int) -> random.Random:
     return random.Random(f"{seed}:{index}")
 
 
-def indices(datasets: int, only: int | None) -> list[int]:
+def indices(only: int | None) -> list[int]:
     """Which dataset numbers this run writes."""
     if only is None:
-        return list(range(1, datasets + 1))
-    if not 1 <= only <= datasets:
-        sys.exit(f"ERROR: --only {only} is outside --datasets {datasets}")
+        return list(range(1, N_DATASETS + 1))
+    if not 1 <= only <= N_DATASETS:
+        sys.exit(f"ERROR: --only {only} is outside the {N_DATASETS} datasets in a split")
     return [only]
 
 
@@ -263,14 +264,14 @@ def write_mixed_dataset(out_dir: Path, rng: random.Random, headers, by_seg,
 
 
 def isolate(out_root: Path, seed: int, reads: str, cpus: int,
-            datasets: int = 4, only: int | None = None) -> None:
+            only: int | None = None) -> None:
     """syn-iso: one chimeric genome of eight segments at uniform abundance, per dataset."""
     out_root = Path(out_root)
     headers = read_headers(db())
     by_seg = segment_pools(headers, 1)
 
     seeds: dict[int, int] = {}
-    for i in indices(datasets, only):
+    for i in indices(only):
         seeds[i] = write_isolate_dataset(
             out_root / f"Dataset-{i}", dataset_rng(seed, i), headers, by_seg, reads, cpus)
 
@@ -279,14 +280,14 @@ def isolate(out_root: Path, seed: int, reads: str, cpus: int,
 
 
 def mixed(out_root: Path, seed: int, reads: str, cpus: int,
-          datasets: int = 4, only: int | None = None) -> None:
+          only: int | None = None) -> None:
     """syn-mix: three chimeric genomes with Dirichlet-drawn shares, per dataset."""
     out_root = Path(out_root)
     headers = read_headers(db())
     by_seg = segment_pools(headers, N_GENOMES)
 
     seeds: dict[int, int] = {}
-    for i in indices(datasets, only):
+    for i in indices(only):
         seeds[i] = write_mixed_dataset(
             out_root / f"Dataset-{i}", dataset_rng(seed, i), headers, by_seg, reads, cpus)
 
@@ -382,8 +383,6 @@ def write_subtype_dataset(out_dir: Path, group, complete, order, rng,
         for strain, s, acc, share in table:
             f.write(f"{sub}\t{lo:.4f}\t{strain}\t{share:.6f}\t{s}\t{acc}\n")
 
-    # Drawn before the dry-run exit so the recorded seed does not depend on whether reads were
-    # actually simulated.
     iss_seed = rng.randint(1, 2**31 - 1)
 
     print(f"{out_dir.name}: {sub}  min pairwise Jaccard {lo:.3f}")
@@ -395,7 +394,7 @@ def write_subtype_dataset(out_dir: Path, group, complete, order, rng,
     return iss_seed
 
 
-def subtype(out_root: Path, seed: int, reads: str, cpus: int, datasets: int = 4,
+def subtype(out_root: Path, seed: int, reads: str, cpus: int,
             min_jaccard: float = 0.7, dry: bool = False, only: int | None = None) -> None:
     """Three real same-subtype strains per dataset, similarity-filtered."""
     strains, seqs, order = load_db()
@@ -405,16 +404,14 @@ def subtype(out_root: Path, seed: int, reads: str, cpus: int, datasets: int = 4,
           f"at Jaccard >= {min_jaccard}:")
     for sub, lo, _ in groups:
         print(f"  {sub:6} min pairwise {lo:.3f}")
-    if len(groups) < datasets:
-        sys.exit(f"ERROR: need {datasets} distinct subtypes, only {len(groups)} qualify. "
+    if len(groups) < N_DATASETS:
+        sys.exit(f"ERROR: need {N_DATASETS} distinct subtypes, only {len(groups)} qualify. "
                  f"Lower --min-jaccard.")
     print()
 
     out_root = Path(out_root)
     seeds: dict[int, int] = {}
-    for i in indices(datasets, only):
-        # groups is sorted deterministically by candidate_groups, so group i belongs to
-        # Dataset-i whether or not its siblings are being written this run.
+    for i in indices(only):
         seeds[i] = write_subtype_dataset(
             out_root / f"Dataset-{i}", groups[i - 1], complete, order,
             dataset_rng(seed, i), reads, cpus, dry)
@@ -432,10 +429,6 @@ def main() -> int:
     common.add_argument("--reads", default="1M", help="total reads (ISS -n); 1M = 500k pairs")
     common.add_argument("--cpus", type=int, default=_iss_int("cpus"),
                         help="(default: params.toml [iss].cpus)")
-    # Every mode writes Dataset-1..N under a split root, and every dataset's RNG comes from
-    # (parent seed, index) alone -- so --only rebuilds one dataset to the same bytes it would
-    # have had in a full run, and cannot disturb its siblings.
-    common.add_argument("--datasets", type=int, default=4, help="datasets in the split")
     common.add_argument("--only", type=int, default=None, metavar="I",
                         help="write only Dataset-I (identical to its slot in a full run)")
 
@@ -463,13 +456,11 @@ def main() -> int:
 
     args = ap.parse_args()
     if args.mode == "syn-iso":
-        isolate(Path(args.out_root), args.seed, args.reads, args.cpus,
-                args.datasets, args.only)
+        isolate(Path(args.out_root), args.seed, args.reads, args.cpus, args.only)
     elif args.mode == "syn-mix":
-        mixed(Path(args.out_root), args.seed, args.reads, args.cpus,
-              args.datasets, args.only)
+        mixed(Path(args.out_root), args.seed, args.reads, args.cpus, args.only)
     else:
-        subtype(Path(args.out_root), args.seed, args.reads, args.cpus, args.datasets,
+        subtype(Path(args.out_root), args.seed, args.reads, args.cpus,
                 args.min_jaccard, args.dry_run, args.only)
     return 0
 

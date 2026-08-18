@@ -1,20 +1,18 @@
 # PREMISE Comparative Analysis
 
-This directory holds the **code** for the comparative evaluation of PREMISE against [KMCP](https://github.com/shenwei356/kmcp), [Centrifuger](https://github.com/mourisl/centrifuger), [MORA](https://github.com/AlgoLab/MORA), [Karp](https://github.com/mreppell/Karp), [Ganon](https://github.com/pirovc/ganon) and [Sylph](https://github.com/bluenote-1577/sylph).
+This directory holds the **code** for the comparative evaluation of PREMISE against [Centrifuger](https://github.com/mourisl/centrifuger), [Ganon](https://github.com/pirovc/ganon), [Karp](https://github.com/mreppell/Karp), [KMCP](https://github.com/shenwei356/kmcp), [MORA](https://github.com/AlgoLab/MORA), and [Sylph](https://github.com/bluenote-1577/sylph).
 
 ## Dependencies
 
 All dependencies are managed via ```flake.nix```.
 
 ```bash
-nix develop ..#benchmark          # temporary shell with everything on PATH
-nix build ..#benchmarkTools      # or a result/bin to prepend to PATH
+nix develop .#benchmark              # creates a temporary shell environment with all binaries needed for the comparative analysis on PATH
 ```
 
 ## Data
 
-Every data path in the benchmark resolves under `[run] bench_data` in `params.toml`; leaving it empty defaults to the `premise/comparative-analysis/`.
-All scripts read it from the environment, so the driver exports it for them. Point it at a data disk to keep the checkout small:
+Every data path in the benchmark resolves under `[run] bench_data` in `params.toml`; leaving it empty defaults to the `premise/comparative-analysis/`. All scripts read it from the environment, so the driver exports it for them. Point it at a data disk to keep the checkout small:
 
 ```toml
 [run]
@@ -40,35 +38,22 @@ tar -xf premise-benchmark-data.tar.gz -C "$BENCH_DATA"
 Verify the layout before going further — every later step assumes it:
 
 ```
-$BENCH_DATA/indexes/sequences.fasta              # all 6,524 records; see Reference database
-$BENCH_DATA/indexes/accessions.txt
+$BENCH_DATA/indexes/sequences.fasta              # all reference sequences
 $BENCH_DATA/indexes/{names.dmp,nodes.dmp,seqid2taxid.map,sequences.tax}   # taxonomy, complete
 $BENCH_DATA/indexes/refs/
-$BENCH_DATA/indexes/all-real-truths.fasta        # provenance only, no longer read (40 segments)
-$BENCH_DATA/indexes/mccrone/pr8_wsn33.fasta      # provenance only, no longer read (16 segments)
-$BENCH_DATA/indexes/real-isolate-sources.tsv     # provenance: which 8 segments each real-iso sample has
-$BENCH_DATA/indexes/real-mixed-sources.tsv
-$BENCH_DATA/samples/synthetic/{isolate,mixed}/Dataset-<N>/
-$BENCH_DATA/samples/real/mixed/<SRR>/true_sources.fasta      # the sample's 16 reference segments
+$BENCH_DATA/samples/synthetic/{isolate,mixed,mixed-subtype}/Dataset-<N>/
+$BENCH_DATA/samples/real/{isolate,mixed}/<SRR>/true_sources.fasta      # the sample's 16 reference segments
 ```
 
 **Step 2:** Preprocess the real samples
 
 ```bash
-python3 scripts/fetch_real_samples.py     # 8 runs from NCBI SRA by accession
-python3 scripts/prepare_real_samples.py   # trim + filter both splits, and derive their truth
+./scripts/fetch_real_samples.py     # fetch the 8 runs from NCBI SRA by accession
+./scripts/prepare_real_samples.py   # trim + filter both splits, and derive their truth
+./scripts/read_truth.py             # Assign truth sources to the preprocessed reads using true_sources.fasta as the reference.
+
 ```
-
-### Preprocessing
-
-The two real splits are not classified as they arrive from SRA. `scripts/prepare_real_samples.py` handles both, and emits the reads **and** the per-read truth in one pass, because the reads a method is scored on and the reads truth covers must be the same set.
-
-```bash
-python3 scripts/prepare_real_samples.py                   # both splits, skipping finished samples
-python3 scripts/prepare_real_samples.py --split real-iso  # or: --split real-mix
-python3 scripts/prepare_real_samples.py --threads 16 --force
-```
-
+The two real splits are not classified as they arrive from SRA. `scripts/prepare_real_samples.py` handles both, and emits the reads **and** the per-read truth in one pass, because the reads a method is scored on and the reads truth covers must be the same set. ```scripts/prepare_real_samples.py``` also includes additional options for split/sample specific steps; see ```scripts/prepare_real_samples.py --help``` for the full list of options.
 
 Every read path is relative to the sample's own directory, `samples/real/{isolate,mixed}/<SRR>/`
 
@@ -79,26 +64,25 @@ Every read path is relative to the sample's own directory, `samples/real/{isolat
 
 Both are written by `scripts/read_truth.py` in a single pass, piped straight from the aligner.
 
-`run-analysis.py` runs this itself, for **both** real splits, whenever a sample's filtered reads or truth are missing. Running it by hand is only needed to force a rebuild (`--force`) or to prepare ahead of time. The `true_sources.fasta` for each file holds the references present in the sample; preprocessing scripts index`true_sources.fasta` for each sample separately to ensure a read is only ever assigned within the genome the sample actually contains.
+> **Note:** `run-analysis.py` runs this itself, for **both** real splits, whenever a sample's filtered reads or truth are missing. Running it by hand is only needed to force a rebuild (`--force`) or to prepare ahead of time. The `true_sources.fasta` for each file holds the references present in the sample; preprocessing scripts index`true_sources.fasta` for each sample separately to ensure a read is only ever assigned within the genome the sample actually contains.
 
 ## Running the analysis
 
 ```bash
-nix develop ..#benchmark                    # required: supplies every binary
-python3 run-analysis.py --threads <n>       # full run: build indexes + all methods + all splits
-python3 run-analysis.py --dry-run           # print every command it would run, run nothing
+./run-analysis.py --threads <n>       # full run: build indexes + all methods + all splits
+./run-analysis.py --dry-run           # print every command it would run, run nothing
 ```
 
 > **Warning:** by default this deletes and rebuilds every index under `indexes/<method>/` and overwrites `db_build.csv`.
 > Pass `--skip-build` to reuse existing indexes.
 
-Method codes: `pre` PREMISE, `kmp` KMCP, `cen` Centrifuger, `mor` MORA, `kap` Karp, `gan` Ganon, `syl` Sylph.
+Method codes: `pre` PREMISE, `cen` Centrifuger, `gan` Ganon, `kap` Karp, `kmp` KMCP, `mor` MORA, `syl` Sylph.
 
 A failed index build aborts the run, and each build begins by deleting its own index directory.
 
 ## Configuration
 
-Everything lives in `params.toml`: the `[run]` section holds the driver's own knobs, one `[<code>]` section per method holds its parameters, and `[iss]` holds the simulation cpu count and per-mode RNG seeds. `scripts/ablation.py` reads the same file, so its sweep baseline cannot drift from the configuration published here.
+Everything lives in `params.toml`: the `[run]` section holds the driver-specific paramters, one `[<code>]` section for method-specific parameters, and `[iss]` holds the simulation parameters. `scripts/ablation.py` reads the same file, so its sweep baseline cannot drift from the configuration published here.
 
 | Section | Holds | Read by |
 |---|---|---|
@@ -130,7 +114,7 @@ The benchmark is organised into five splits, all of which `RUN_SPLITS` runs by d
 
 ## Directory structure
 
-All scripts and parameter files are git tracked, while data files are not.
+All scripts and parameter files are git tracked, while data files are not. The directory tree after the full comparative analysis pipeline is written below.
 
 ```
 comparative-analysis/
@@ -152,8 +136,6 @@ comparative-analysis/
 ├── ablation/figs/          # Ablation figures (see Parameter ablation, below)
 │
 ├── indexes/                # Reference data and tool-specific indexes
-│   ├── accessions.txt           # The 6,508 NCBI accessions the reference set is built from
-│   ├── real-mixed-sources.tsv   # Sequence-level identity of the 16 local PR8_/WSN33_ segments
 │   ├── sequences.fasta          # Combined reference FASTA, as obtained
 │   ├── sequences-cleaned.fasta  # Non-redundant subset — THIS is what every index is built from
 │   ├── sequences-dropped.tsv    # Every dropped record, its reason, and what superseded it
@@ -170,22 +152,20 @@ comparative-analysis/
 │   │   │                           #   truth_assignments.tsv    read_id -> segment (classified)
 │   │   │                           #   unclassified_reads.txt   read_ids with no truth
 │   │   │                           #   <SRR>.{cutadapt,bwa,truth}.log
-│   │   ├── isolate/<SRR>/          # <SRR>_{1,2}.fastq raw, *_{1,2}.pt.fastq primer-trimmed,
-│   │   │                           #   *_{1,2}-filtered.ca.fastq analysis-ready (what runs)
-│   │   └── mixed/<SRR>/            # plus *.ca.fastq adapter-trimmed and
-│   │                               #   *-filtered.ca.fastq chimera-filtered (what runs)
+│   │   ├── isolate/<SRR>/          # <SRR>_{1,2}.fastq raw, *_{1,2}.ca.fastq (primer-trimmed),
+│   │   │                           #   *_{1,2}-filtered.ca.fastq (analysis-ready reads)
+│   │   └── mixed/<SRR>/            # <SRR>_{1,2}.fastq raw, *_{1,2}.ca.fastq (adapter-trimmed),
+│   │                               #   *-filtered.ca.fastq (analysis-ready reads)
 │   └── synthetic/
-│       ├── isolate/Dataset-<N>/
-│       └── mixed/Dataset-<N>/
-│           ├── reads_R{1,2}.fastq  # Simulated reads (InSilicoSeq, MiSeq model, 301 bp)
-│           ├── src.fasta           # Source sequences used for simulation
-│           ├── src-abundance.txt   # True per-source abundance (ref_id \t proportion)
-│           └── all-abundances.txt  # True abundance for all references (incl. zeros)
+│       └── {isolate,mixed,mixed-subtype}/
+│           ├── seeds.tsv               # conatains random seeds for simulation reproducibility
+│           └── Dataset-<N>/
+│               ├── src-abundance.txt   # True per-source abundance (ref_id \t proportion)
+│               └── all-abundances.txt  # True abundance for all references (incl. zeros)
 │
-└── results/<method>/{real,synthetic}/{isolate,mixed}/<sample>/
+└── results/<method>/{real,synthetic}/{isolate,mixed,mixed-subtype}/<sample>/   # Note: mixed-subtype will appear only in synthetic 
     ├── <sample>.*          # Method output (see below)
-    ├── <sample>.log        # Method stderr/stdout
-    └── time-mem            # /usr/bin/time -v resource usage
+    └── <sample>.log        # Method stderr/stdout
 ```
 
 
@@ -203,20 +183,19 @@ comparative-analysis/
 
 All simulated with [InSilicoSeq](https://github.com/HadrienG/InSilicoSeq) 2.0.1 using the `MiSeq` error model at 500,000 read pairs of 301 bp per sample. The simulated **`syn-iso`** and **`syn-mix`** samples are composed of reassortant-like chimeras: one sequence per influenza segment (1–8), each drawn from a *different* strain. The `syn-iso` samples have one genome per sample while `syn-mix` samples have three genomes each.
 
-Both ship in the Zenodo archive; `scripts/make_synthetic_datasets.py` is how they were built and can rebuild them. 
-It has three modes — sources are always drawn from `indexes/sequences-cleaned.fasta`, so no simulated read can come from a sequence the indexes lack, and truth is parsed from the ISS read names by `analyze.py` rather than written to a file:
+Both ship in the Zenodo archive; `scripts/make_synthetic_datasets.py` can be used to rebuild them. It has three modes and sources are always drawn from `indexes/sequences-cleaned.fasta`, so no simulated read can come from a sequence the indexes lack and truth is parsed from the ISS read names by `analyze.py` rather than written to a file:
 ```bash
-python3 scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate
-python3 scripts/make_synthetic_datasets.py syn-mix samples/synthetic/mixed
-python3 scripts/make_synthetic_datasets.py syn-mix-subtype samples/synthetic/mixed-subtype
+./scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate
+./scripts/make_synthetic_datasets.py syn-mix samples/synthetic/mixed
+./scripts/make_synthetic_datasets.py syn-mix-subtype samples/synthetic/mixed-subtype
 
-# one dataset, byte-identical to its slot in the full run; a 5th leaves 1-4 untouched
-python3 scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate --datasets 5 --only 5
+# one dataset using the corresponding random seed
+./scripts/make_synthetic_datasets.py syn-iso samples/synthetic/isolate --only 3
 ```
 
 For `syn-mix-subtype` samples, instead of chimeras it uses three **real** same-subtype strains per dataset, each contributed as its own complete 8-segment set.
 
-> Reproducibility: both knobs live in `params.toml` under `[iss]` — `cpus`, and the parent seeds `seed_syn_iso` / `seed_syn_mix` / `seed_syn_mix_subtype`. Each dataset's RNG is derived from its parent seed and its index alone, so a whole split is a pure function of that seed, `--cpus`, and `indexes/sequences-cleaned.fasta`; nothing depends on what is already in the output tree, and `--only I` rebuilds one dataset to exactly the bytes it would have had in a full run. The simulation seed each dataset used is recorded in `seeds.tsv` at the split root, so the archive can be audited without re-running anything. The `--cpus` and `--seed` flags override the defaults for one-off regenerations. ISS is deterministic only at a **fixed `--cpus`**: both the work partition and the per-worker seeding depend on it, and synthetic truth is parsed from ISS read names, so changing it changes the truth as well as the reads. It is not a performance knob.
+> Reproducibility: all parameters used in simulation live in `params.toml` under `[iss]` — `cpus`, and the parent seeds `seed_syn_iso` / `seed_syn_mix` / `seed_syn_mix_subtype`. Each dataset's RNG is derived from its parent seed and its index alone, so a whole split is a pure function of that seed, `--cpus`, and `indexes/sequences-cleaned.fasta`; nothing depends on what is already in the output tree The simulation seed each dataset used is recorded in `seeds.tsv` at the split root, so the archive can be audited without re-running anything. The `--cpus` and `--seed` flags override the defaults for one-off regenerations. ISS is deterministic only at a **fixed `--cpus`**: both the work partition and the per-worker seeding depend on it, and synthetic truth is parsed from ISS read names, so changing it changes the truth as well as the reads. It is not a performance knob.
 
 ### Datasets and truth
 
@@ -226,12 +205,11 @@ All four splits, four samples each:
 |---|---|---|---|
 | `syn-isolate` | synthetic/isolate | Dataset-1…4 | `reads_R{1,2}.fastq` |
 | `syn-mixed` | synthetic/mixed | Dataset-1…4 | `reads_R{1,2}.fastq` |
+| `syn-mixed-subtype` | synthetic/mixed-subtype | Dataset-1…4 | `reads_R{1,2}.fastq` |
 | `real-isolate` | real/isolate | SRR31013463/65/67/73 | `<SRR>_{1,2}-filtered.ca.fastq` |
 | `real-mix` | real/mixed | SRR3360139/40/45/46 | `<SRR>_{1,2}-filtered.ca.fastq` |
 
 Truth comes from ISS read names on the synthetic splits (exact, no aligner in the loop) and from the sample's own `truth_assignments.tsv` on both real splits. There the per-read truth and the abundance truth are derived from that one file in a single pass, so they cannot disagree.
-
----
 
 ## Reference database
 
@@ -242,60 +220,29 @@ The reference set is 6,524 influenza records: **6,508 GenBank/RefSeq accessions*
 The sequences are cleaned by removing duplicate entries with different accessions, entries with long consecutive subsequences of ambiguous characters (N's), and entries that are contained in another longer entry.
 
 ```bash
-python3 scripts/clean_sequences.py     # ~1 min
+./scripts/clean_sequences.py     # ~1 min
 ```
 
 This reads `indexes/sequences.fasta` and writes `indexes/sequences-cleaned.fasta` (5,264 records) plus `indexes/sequences-dropped.tsv`, a manifest naming every dropped record, why it was dropped, and the record that superseded it. Indexes are then built from `indexes/sequences-cleaned.fasta`.
 
 ## Parameter ablation
 
-A separate study from the method comparison above: a one-at-a-time sweep of PREMISE's five tunable parameters, measuring how each trades off runtime, peak memory, precision, coverage, Ruzicka distance and Jaccard distance. It shares this directory's `scripts/`, `params.toml` and `$BENCH_DATA`.
-
-### What is measured
-
-| Metric | Definition |
-|---|---|
-| **Runtime** | wall-clock seconds, from `/usr/bin/time -v` |
-| **Memory** | peak RSS in GB, from `/usr/bin/time -v` |
-| **Precision** | per-read, over reads PREMISE assigned a reference |
-| **Coverage** | % of input read pairs that received a (non-`unclassified`) label |
-| **Ruzicka** | abundance-profile distance vs truth, `.uc` variant |
-| **Jaccard** | reference-set distance vs truth, `.uc` variant — 0 means the exact reference set was recovered |
-
-
-```
-ablation/figs/<split>/
-    ablation-{mem,eps2,eps1,rho,omega}[-rel].{pdf,png}
-
-results/ablation/<sub>/                           (written by ablation.py)
-├── ablation.csv                  one row per (dataset, parameter, value) for the whole split
-└── <dataset>/
-    ├── baseline/                 the production setting, run once and shared by all 5 sweeps
-    │   ├── metrics.json          the six metrics + n_refs + the exact parameters used
-    │   ├── time-mem              raw /usr/bin/time -v output
-    │   ├── run.log               PREMISE stdout/stderr
-    │   └── out.props             abundance profile
-    ├── mem-14/ ... mem-40/       one directory per non-baseline grid point
-    └── eps_1-1e-32/ ...
-
-results/ablation/.sweep.lock                      global: one sweep at a time, any split
-results/ablation-tables.generated.tex             (written by ablation_report.py)
-```
-
+A separate study from the method comparison above: a one-at-a-time sweep of PREMISE's five tunable parameters, measuring how each trades off runtime, peak memory, precision, coverage, Ruzicka distance and Jaccard distance. It shares this directory's `scripts/`, `params.toml` and `$BENCH_DATA`. To run the ablation study:
 
 ```bash
-python3 scripts/ablation.py --dry-run                   # print the plan
-python3 scripts/ablation.py                             # all 4 splits, 16 datasets
-python3 scripts/ablation.py --split syn-mix            # one split
-python3 scripts/ablation.py --split syn-mix --dataset Dataset-3
-python3 scripts/ablation.py --only mem                  # one parameter
-python3 scripts/ablation.py --force                     # ignore cached points
-python3 scripts/ablation.py --keep-large                # keep .aligns/.posteriors/.matches
+./scripts/ablation.py --dry-run                   # print the plan
+./scripts/ablation.py                             # all 4 splits, 16 datasets
+./scripts/ablation.py --split syn-mix            # one split
+./scripts/ablation.py --split syn-mix --dataset Dataset-3
+./scripts/ablation.py --only mem                  # one parameter
+./scripts/ablation.py --force                     # ignore cached points
+./scripts/ablation.py --keep-large                # keep .aligns/.posteriors/.matches
 ```
 
+To aggregate and visualize the results of the ablation study:
 ```bash
-python3 scripts/ablation_report.py                      # text + results/ablation-tables.generated.tex
-python3 scripts/ablation_figures.py                     # ablation/figs/<split>/*.{pdf,png}
-python3 scripts/ablation_figures.py --split syn-mix --only mem,rho --formats pdf,png,svg
-python3 scripts/ablation_figures.py --no-relative
+./scripts/ablation_report.py                      # text + results/ablation-tables.generated.tex
+./scripts/ablation_figures.py                     # ablation/figs/<split>/*.{pdf,png}
+./scripts/ablation_figures.py --split syn-mix --only mem,rho --formats pdf,png,svg
+./scripts/ablation_figures.py --no-relative
 ```
