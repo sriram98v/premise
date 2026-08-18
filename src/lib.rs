@@ -13,8 +13,8 @@ use flate2::read::GzDecoder;
 use haystackfm::alphabet;
 use haystackfm::alphabet::{decode_char, encode_byte};
 pub use haystackfm::BidirFmIndex as RefIndex;
-use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
 pub use haystackfm::SeqId;
+use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
 use indicatif::ProgressStyle;
 use indicatif::{ProgressBar, ProgressDrawTarget};
 use itertools::Itertools;
@@ -272,7 +272,6 @@ pub fn clean_mem_matches(
         let q_end = i.query_end;
         let q_len = q_end - q_start;
         for j in &i.positions {
-
             let ref_idx = j.0;
             let pos = j.1 as usize;
             mems.entry(ref_idx).or_default().push(MEMPos {
@@ -903,7 +902,11 @@ fn refit_proportions_on_classified(
 
     let (_, ej) = csr.e_step(&pi);
 
-    let lambda_init = ej.iter().map(|x| x - rho).max_by(EMProb::total_cmp).unwrap();
+    let lambda_init = ej
+        .iter()
+        .map(|x| x - rho)
+        .max_by(EMProb::total_cmp)
+        .unwrap();
     let lambda = _update_lambda(rho, omega, &ej, lambda_init, num_iter);
 
     (0..csr.n_refs())
@@ -1130,9 +1133,16 @@ pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
                     anyhow::anyhow!("FASTA sequence for record {} is not valid UTF-8: {}", i, e)
                 })?
                 .chars()
-                .map(|c| match c.to_ascii_uppercase() {
-                    'A' | 'C' | 'G' | 'T' | 'N' => c.to_ascii_uppercase(),
-                    _ => 'N',
+                // Keep every IUPAC symbol the alphabet recognises, ambiguity codes
+                // included -- the scorer conditions on them. Anything else (gaps,
+                // the sentinel, junk) becomes N, which `DnaSequence::from_str` would
+                // otherwise reject outright.
+                .map(|c| {
+                    let upper = c.to_ascii_uppercase();
+                    match upper.is_ascii().then(|| encode_byte(upper as u8)).flatten() {
+                        Some(code) if code != alphabet::SENTINEL => upper,
+                        _ => 'N',
+                    }
                 })
                 .collect();
             DnaSequence::from_str_with_header(&seq_str, header).map_err(|e| {
@@ -1762,7 +1772,11 @@ fn run_query(
         &classified_reads,
         &props,
         if use_penalty { rho } else { UNPENALIZED_RHO },
-        if use_penalty { omega } else { UNPENALIZED_OMEGA },
+        if use_penalty {
+            omega
+        } else {
+            UNPENALIZED_OMEGA
+        },
         num_iter,
     );
     // Printed at higher precision than the other TSVs: at {:.5e} the per-row rounding error
