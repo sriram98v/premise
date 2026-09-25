@@ -16,7 +16,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Floating-point type used for all EM probabilities and log-probabilities in linear space.
 pub type EMProb = f64;
 
-
 /// Newtype wrapper around a raw read identifier string.
 #[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReadID(pub(crate) String);

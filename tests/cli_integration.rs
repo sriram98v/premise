@@ -805,3 +805,69 @@ fn build_preserves_iupac_ambiguity_codes_in_index() {
         );
     }
 }
+
+/// `--sa_sample_rate` thins the suffix array, which changes how occurrences are located
+/// but not which ones exist: a sampled index is smaller and classifies the reads exactly
+/// as the full one does.
+#[test]
+fn build_sa_sample_rate_gives_same_query_results() {
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let fasta = fixtures().join("ref.fasta");
+    let full = build_index(tmpdir.path());
+    let sampled = tmpdir.path().join("ref-sa4");
+    assert_success(&run(&[
+        "build",
+        "-s",
+        fasta.to_str().unwrap(),
+        "-o",
+        sampled.to_str().unwrap(),
+        "--sa_sample_rate",
+        "4",
+    ]));
+    assert!(
+        fs::metadata(&sampled).unwrap().len() < fs::metadata(&full).unwrap().len(),
+        "a sampled suffix array should make the index smaller"
+    );
+
+    let r1 = fixtures().join("r1.fastq");
+    let r2 = fixtures().join("r2.fastq");
+    let query = |index: &Path, tag: &str| -> String {
+        let out = tmpdir.path().join(tag);
+        assert_success(&run(&[
+            "query",
+            "-s",
+            index.to_str().unwrap(),
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+            "-m",
+            "5",
+            "-o",
+            out.to_str().unwrap(),
+            "-t",
+            "1",
+            "-i",
+            "5",
+        ]));
+        fs::read_to_string(tmpdir.path().join(format!("{tag}.matches"))).unwrap()
+    };
+    assert_eq!(query(&full, "full"), query(&sampled, "sampled"));
+}
+
+/// A sampling rate of zero is meaningless and must be rejected.
+#[test]
+fn build_rejects_zero_sa_sample_rate() {
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let fasta = fixtures().join("ref.fasta");
+    let out = tmpdir.path().join("ref");
+    assert_failure(&run(&[
+        "build",
+        "-s",
+        fasta.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--sa_sample_rate",
+        "0",
+    ]));
+}

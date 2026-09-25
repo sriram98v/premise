@@ -16,8 +16,21 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
 
-/// Build a serialized FM-index from raw FASTA bytes.
+/// Build a serialized FM-index from raw FASTA bytes, keeping every suffix-array entry.
 pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
+    build_index_from_bytes_with(fasta_data, 1)
+}
+
+/// Build a serialized FM-index from raw FASTA bytes, keeping one suffix-array entry in
+/// every `sa_sample_rate` (1 = the full suffix array). Larger rates shrink the index and
+/// slow down locating occurrences.
+pub fn build_index_from_bytes_with(
+    fasta_data: &[u8],
+    sa_sample_rate: u32,
+) -> Result<(Vec<u8>, String)> {
+    if sa_sample_rate == 0 {
+        anyhow::bail!("sa_sample_rate must be at least 1");
+    }
     let cursor = Cursor::new(fasta_data);
     let reader = BufReader::new(cursor);
     let records = fasta::Reader::new(reader).records();
@@ -82,7 +95,7 @@ pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
         .collect::<anyhow::Result<Vec<DnaSequence>>>()?;
 
     let config = RefIndexConfig {
-        sa_sample_rate: 1,
+        sa_sample_rate,
         use_gpu: false,
         occ_encoding: OccEncoding::OneHot,
         build_lcp: false,

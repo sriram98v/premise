@@ -9,7 +9,7 @@ pub use align::{merge_read_pairs, query_fastq, query_read, query_smems};
 pub use em::CsrLikelihood;
 pub use haystackfm::BidirFmIndex as RefIndex;
 pub use haystackfm::SeqId;
-pub use io::{build_index_from_bytes, load_index, QueryWriters};
+pub use io::{build_index_from_bytes, build_index_from_bytes_with, load_index, QueryWriters};
 pub use utils::{EMProb, QueryProgress, ReadPair};
 
 use anyhow::{Context, Result};
@@ -224,6 +224,10 @@ pub fn run() -> Result<()> {
                     .default_value("")
                     .value_parser(clap::value_parser!(String))
                 )
+                .arg(arg!(--sa_sample_rate <RATE> "Keep one suffix-array entry in every RATE (1 = full suffix array)")
+                    .default_value("1")
+                    .value_parser(clap::value_parser!(u32).range(1..))
+                )
 
         )
         .subcommand(
@@ -359,10 +363,11 @@ pub fn run() -> Result<()> {
                 .expect("required")
                 .as_str();
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
+            let sa_sample_rate = *sub_m.get_one::<u32>("sa_sample_rate").expect("defaulted");
 
             let fasta_data = std::fs::read(src_file)
                 .with_context(|| format!("failed to read reference FASTA '{}'", src_file))?;
-            let (idx_bytes, _) = build_index_from_bytes(&fasta_data)?;
+            let (idx_bytes, _) = build_index_from_bytes_with(&fasta_data, sa_sample_rate)?;
 
             let out_path = match outfile {
                 "" => format!("{}.fmidx", src_file),
