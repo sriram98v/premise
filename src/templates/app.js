@@ -1196,7 +1196,7 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     setQueryProgress(30, 'Starting query…');
 
     const mismatch  = document.getElementById('query-seed-length').value  || '22';
-    const eps1      = document.getElementById('query-eps1').value      || '1e-32';
+    const eps1      = document.getElementById('query-eps1').value      || '0';
     const iter      = document.getElementById('query-iter').value      || '100';
     const threads   = document.getElementById('query-threads').value   || '0';
     const rho       = document.getElementById('query-rho').value       || '150';

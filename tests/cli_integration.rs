@@ -588,9 +588,9 @@ fn server_serves_html_on_root() {
     // Read the response body BEFORE killing the server — killing it first
     // closes the TCP connection and causes into_string() to return empty.
     let (status, body) = match response {
-        Ok(resp) => {
+        Ok(mut resp) => {
             let status = resp.status();
-            let body = resp.into_string().unwrap_or_default();
+            let body = resp.body_mut().read_to_string().unwrap_or_default();
             (status, body)
         }
         Err(e) => {
@@ -649,7 +649,7 @@ fn server_returns_404_for_unknown_route() {
         Ok(resp) => {
             assert_eq!(resp.status(), 404, "expected HTTP 404 for unknown route");
         }
-        Err(ureq::Error::Status(404, _)) => {
+        Err(ureq::Error::StatusCode(404)) => {
             // ureq treats 4xx as errors — 404 is the expected outcome
         }
         Err(e) => {
@@ -658,7 +658,9 @@ fn server_returns_404_for_unknown_route() {
     }
 }
 
-/// `.props` must be derived from the corrected `.matches`, so the two files always agree.
+/// `.props` reports EM's final M-step proportions directly. It is not re-derived from the
+/// classified read counts, so it only has to be a consistent superset of `.matches`: every
+/// reference classified in `.matches` appears in `.props`, and the proportions are valid.
 #[test]
 fn query_props_agree_with_corrected_matches() {
     let tmpdir = tempfile::tempdir().expect("could not create temp dir");
@@ -710,34 +712,96 @@ fn query_props_agree_with_corrected_matches() {
         );
     }
 
-    let in_props: Vec<&&str> = listed.keys().collect();
-    let in_matches: Vec<&&str> = matched.keys().collect();
-    assert_eq!(
-        in_props, in_matches,
-        "props references must match the classified references in .matches"
-    );
+    // A reference can survive EM without winning any read's MAP assignment, so .props is a
+    // superset of the references classified in .matches — never the other way round.
+    for ref_id in matched.keys() {
+        assert!(
+            listed.contains_key(ref_id),
+            "{} is classified in .matches but absent from .props",
+            ref_id
+        );
+    }
 
-    let total: u64 = matched.values().sum();
-    if total > 0 {
+    // Proportions are refit over the classified reads by a final E/M step whose M-step
+    // enforces the simplex constraint, so they must sum to one without renormalization.
+    for (ref_id, prop) in &listed {
+        assert!(
+            *prop > 0.0 && *prop <= 1.0 + 1e-6,
+            "props for {} = {} is outside (0, 1]",
+            ref_id,
+            prop
+        );
+    }
+    if !matched.is_empty() {
         let sum: f64 = listed.values().sum();
         assert!(
             (sum - 1.0).abs() < 1e-6,
             "props proportions must sum to 1, got {}",
             sum
         );
-        // Each proportion must equal that reference's share of the classified reads.
-        for (ref_id, count) in &matched {
-            let expected = *count as f64 / total as f64;
-            let got = listed[ref_id];
-            assert!(
-                (got - expected).abs() < 1e-6,
-                "props for {} = {}, expected {} ({}/{})",
-                ref_id,
-                got,
-                expected,
-                count,
-                total
-            );
-        }
+    }
+}
+
+/// IUPAC ambiguity codes must survive `premise build` into the index.
+///
+/// The scorer conditions on them (reference `R` against read `A` is half a match,
+/// not a full mismatch), so collapsing them to `N` at build time would silently
+/// discard the information. Characters the alphabet does not recognise still have
+/// to become `N`, since `DnaSequence::from_str` rejects them outright.
+#[test]
+fn build_preserves_iupac_ambiguity_codes_in_index() {
+    use haystackfm::alphabet;
+
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let fasta = tmpdir.path().join("ambig.fasta");
+    // R Y S W K M B D H V N, then a lowercase run, then two characters the
+    // alphabet rejects (`-` gap and `*`), padded with plain bases.
+    fs::write(
+        &fasta,
+        ">ambig\nACGTRYSWKMBDHVNacgt-*ACGTACGTACGTACGTACGT\n",
+    )
+    .expect("could not write fixture FASTA");
+
+    let outpath = tmpdir.path().join("ambig.fmidx");
+    assert_success(&run(&[
+        "build",
+        "-s",
+        fasta.to_str().unwrap(),
+        "-o",
+        outpath.to_str().unwrap(),
+    ]));
+
+    let bytes = fs::read(&outpath).expect("could not read built index");
+    let fmidx = premise::load_index(&bytes, outpath.to_str().unwrap()).expect("could not load");
+    let seq = fmidx
+        .sequence(premise::SeqId(0))
+        .expect("index has no sequence 0");
+
+    let expected = [
+        (0, alphabet::A),
+        (4, alphabet::R),
+        (5, alphabet::Y),
+        (6, alphabet::S),
+        (7, alphabet::W),
+        (8, alphabet::K),
+        (9, alphabet::M),
+        (10, alphabet::B),
+        (11, alphabet::D),
+        (12, alphabet::H),
+        (13, alphabet::V),
+        (14, alphabet::N),
+        // lowercase acgt is uppercased, not discarded
+        (15, alphabet::A),
+        (18, alphabet::T),
+        // `-` and `*` are outside the alphabet and must fall back to N
+        (19, alphabet::N),
+        (20, alphabet::N),
+    ];
+    for (pos, code) in expected {
+        assert_eq!(
+            seq[pos], code,
+            "position {} should hold alphabet code {}, got {}",
+            pos, code, seq[pos]
+        );
     }
 }
