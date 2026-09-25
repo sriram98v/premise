@@ -40,6 +40,19 @@ cd premise
 cargo install --path .
 ```
 
+Or with [Nix](https://nixos.org/download/) (flakes enabled), which pins the whole toolchain:
+
+```bash
+# run without installing
+nix run github:sriram98v/premise -- --help
+
+# install into your profile
+nix profile install github:sriram98v/premise
+
+# or a dev shell with the pinned Rust toolchain (from a clone)
+nix develop
+```
+
 ## Usage
 
 ### Step 1 — Build an FM-index
