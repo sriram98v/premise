@@ -1,0 +1,65 @@
+# Parameters for the PREMISE comparative benchmark
+[run]
+# Where indexes/, samples/, results/ and truth/ live; Empty means the comparative-ananlysis directory itself
+bench_data = "/home/sriramv/Datasets/premise-benchmark/hpc"
+
+threads = "40"
+classify_timeout = "2400" # Measures in secs
+
+methods = "pre kmp cen mor kap gan syl sal"
+
+splits = "syn-iso syn-mix-sub syn-mix-strain real-iso real-mix"
+max_ds_per_split = "0"    # 0 = every dataset in a split; 1 for a smoke test
+skip_build = "0"          # 1 = reuse existing indexes/ and db_build.csv instead of rebuilding.
+
+kmcp_threads = "4"          # kmcp search -j. kmcp's own docs say "4-threads is fast enough"
+
+kmcp_allow_synthetic = "0"  # 1 = run kmcp on the synthetic splits anyway
+
+[pre]
+threads = "0"           # premise -t 0 = use all available cores
+mem = "22"              # -m, minimum SMEM seed length
+iters = "200"           # -i, EM iterations (all splits except real; see iters_real)
+iters_real = "100"      # -i on the real+isolate split
+eps_1 = "0"             # pre-EM alignment likelihood cutoff
+eps_2 = "1e-18"         # minimum per-alignment match log-probability (alignment stage)
+em_threshold = "1e-6"   # EM convergence threshold on the data log-likelihood
+sa_sample_rate = "1"    # FM-index suffix-array sampling rate (build stage)
+rho = "150"             # L1 penalty weight (EM stage)
+omega = "1e-10"         # L1 penalty floor
+
+[kmp]
+k = "21"                  # kmcp compute -k
+f = "0.3"                 # kmcp index -f, false-positive rate
+n = "1"                   # kmcp index -n, number of hash functions
+profile_level = "strain"  # kmcp profile --level
+profile_m = "3"           # kmcp profile -m, minimum number of matched k-mer groups
+
+[kap]
+k = "31"                # karp -c index -k
+min_freq = "0"          # karp -c quantify --min_freq
+
+[gan]
+rel_cutoff = "0.01"     # ganon classify --rel-cutoff
+fpr_query = "1"         # ganon classify --fpr-query
+
+[syl]
+c = "100"               # -c, subsampling rate
+min_kmers = "10"        # sylph profile --min-number-kmers
+
+[sal]
+k = "31"                # salmon index -k
+libtype = "A"           # salmon quant -l
+
+[decoy]
+seed = "20260905"       # RNG seed
+per_source = "2"        # decoys per real true segment (2 = the other two strains of a syn-mix-strain triple)
+
+ti_frac = "0.6"         # transition fraction among substitutions
+k = "31"                # k-mer size for the containment used to set and check similarity
+
+[iss]
+cpus = "12"
+seed_syn_iso = "20260806"
+seed_syn_mix_sub = "20260727"
+seed_syn_mix_strain = "20260805"

@@ -1,7 +1,7 @@
 {
   #
   #     nix develop                    # dev shell: build and hack on premise
-  #     nix develop .#benchmark        # study shell: every tool comparative-analysis/run-analysis.py needs
+  #     nix develop .#benchmark        # study shell: every tool `python3 -m premise_bench` (comparative-analysis/) needs
   #
   description = "premise — paired-end metagenomic read classifier, and its benchmark toolchain";
 
@@ -114,7 +114,6 @@
         ps.matplotlib
         ps.pandas
         ps.pysam
-        ps.scipy
         fastapy
         (py.toPythonModule insilicoseq)
       ]);
