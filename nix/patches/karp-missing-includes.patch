@@ -1,0 +1,23 @@
+diff --git a/src/MinCollector.cpp b/src/MinCollector.cpp
+index 9ca69ac..8e46b0d 100644
+--- a/src/MinCollector.cpp
++++ b/src/MinCollector.cpp
+@@ -1,5 +1,6 @@
+ #include "MinCollector.h"
+ #include <algorithm>
++#include <limits>
+ 
+ // utility functions
+ 
+diff --git a/src/fastaIndex.h b/src/fastaIndex.h
+index df89ffc..c4d0037 100644
+--- a/src/fastaIndex.h
++++ b/src/fastaIndex.h
+@@ -1,6 +1,7 @@
+ #ifndef KARP_FASTAINDEX
+ #define KARP_FASTAINDEX
+ 
++#include <cstdint>
+ #include <iostream>
+ #include <fstream>
+ #include <vector>

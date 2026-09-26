@@ -40,6 +40,19 @@ cd premise
 cargo install --path .
 ```
 
+Or with [Nix](https://nixos.org/download/) (flakes enabled), which pins the whole toolchain:
+
+```bash
+# run without installing
+nix run github:sriram98v/premise -- --help
+
+# install into your profile
+nix profile install github:sriram98v/premise
+
+# or a dev shell with the pinned Rust toolchain (from a clone)
+nix develop
+```
+
 ## Usage
 
 ### Step 1 — Build an FM-index
@@ -48,7 +61,7 @@ cargo install --path .
 premise build -s <reference.fasta>
 ```
 
-Produces `<reference>.fmidx`. This index is required for both the CLI and GUI query steps.
+Produces `<reference>.fmidx`.
 
 ### Step 2 — Classify reads (CLI)
 
@@ -104,13 +117,18 @@ Parameters **ε₁** and **ε₂** control alignment filtering: ε₁ is a minim
 ```
 premise/
 ├── src/
-│   ├── main.rs          # CLI, HTTP server, EM algorithm, alignment logic
-│   ├── utils.rs         # Quality-score utilities, match log-probability
-│   └── templates/
-│       ├── index.html   # Browser GUI markup (embedded at compile time)
-│       ├── styles.css   # Pico.css overrides (embedded at compile time)
-│       └── app.js       # Frontend logic — D3 charts, dropzones, dark mode
-├── tests/               # Integration tests (CLI + local server)
+│   ├── main.rs          # binary entry point
+│   ├── lib.rs           # the query pipeline (align -> EM -> tables) and the CLI
+│   ├── align.rs         # SMEM seeding and ungapped extension: query_smems, query_read, query_fastq
+│   ├── em.rs            # sparse likelihood matrix and the (L1-penalized) EM
+│   ├── io.rs            # index build/load, FASTQ loading, output tables
+│   ├── server.rs        # local HTTP server for the browser GUI
+│   ├── utils.rs         # shared types and the per-base likelihood model
+│   └── templates/       # browser GUI (embedded at compile time)
+├── tests/               # integration tests (CLI + local server)
+├── benches/             # Criterion benchmarks
+├── comparative-analysis/  # benchmark against other classifiers + parameter ablation
+├── flake.nix, nix/      # pinned toolchains: premise and the benchmark
 ├── Cargo.toml
 └── README.md
 ```
@@ -132,6 +150,20 @@ Full posterior probability matrix: one row per read, one column per reference.
 |--------|-------------|
 | `ref_id` | Reference sequence ID |
 | `proportion` | Estimated relative abundance |
+
+## Comparative Analysis
+
+PREMISE is evaluated against seven other read-classification and quantification tools --- [Centrifuger](https://github.com/mourisl/centrifuger), [Ganon](https://github.com/pirovc/ganon), [Karp](https://github.com/mreppell/Karp), [KMCP](https://github.com/shenwei356/kmcp), [MORA](https://github.com/AlgoLab/MORA), [Salmon](https://github.com/COMBINE-lab/salmon), and [Sylph](https://github.com/bluenote-1577/sylph) --- across five dataset splits: three simulated (synthetic isolate, synthetic mixed, synthetic same-subtype mixed) and two real (isolate and mixed-infection samples from NCBI SRA). Every method is evaluated on runtime, peak memory, per-read precision, coverage, reference-level false positives and negatives, Ruzicka distance, and Jaccard distance. A separate ablation sweeps PREMISE's parameters `-m`, `--eps_1`, `--eps_2`, `--rho`, `--omega` and `--sa_sample_rate`.
+
+The toolchain for every competing method is pinned in `flake.nix`:
+
+```bash
+nix develop .#benchmark              # every binary the benchmark needs, on PATH
+cd comparative-analysis
+python3 -m premise_bench run --threads <n>
+```
+
+See [comparative-analysis/README.md](comparative-analysis/README.md) for data preparation, configuration (`params.toml`), the output CSVs, and the ablation.
 
 ## Citation
 

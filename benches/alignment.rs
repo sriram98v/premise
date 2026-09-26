@@ -6,11 +6,10 @@ use haystackfm::alphabet::encode_byte;
 #[cfg(unix)]
 use pprof::criterion::{Output, PProfProfiler};
 use premise::{
-    build_index_from_bytes, build_sparse_array, clean_mem_matches, load_index, merge_read_pairs,
-    process_read_pairs, query_read, ReadIdx, ReadPair, RefIndex,
+    build_index_from_bytes, load_index, merge_read_pairs, query_fastq, query_read, CsrLikelihood,
+    ReadPair, RefIndex,
 };
 use std::collections::HashMap;
-
 
 const READ_LEN: usize = 150;
 const SEED_LEN: usize = 20;
@@ -114,9 +113,16 @@ fn bench_alignment(c: &mut Criterion) {
     });
     g.finish();
 
-    let mut g = c.benchmark_group("seed");
-    g.bench_function("clean_mem_matches", |b| {
-        b.iter(|| clean_mem_matches(black_box(&idx), black_box(&q_enc), black_box(SEED_LEN)))
+    let mut g = c.benchmark_group("walk");
+    g.bench_function("score_read", |b| {
+        b.iter(|| {
+            premise::align::score_read(
+                black_box(&idx),
+                black_box(&q_enc),
+                black_box(&qual),
+                black_box(SEED_LEN),
+            )
+        })
     });
     g.finish();
 
@@ -125,7 +131,8 @@ fn bench_alignment(c: &mut Criterion) {
         b.iter(|| {
             query_read(
                 black_box(&idx),
-                black_box(&record),
+                black_box(record.seq()),
+                black_box(record.qual()),
                 black_box(SEED_LEN),
                 black_box(false),
             )
@@ -153,11 +160,11 @@ fn bench_alignment(c: &mut Criterion) {
     g.throughput(Throughput::Elements(N_PAIRS as u64));
     g.sample_size(10); // full parallel phase — keep wall-clock bounded
     g.bench_with_input(
-        BenchmarkId::new("process_read_pairs", N_PAIRS),
+        BenchmarkId::new("query_fastq", N_PAIRS),
         &pairs,
         |b, pairs| {
             b.iter(|| {
-                process_read_pairs(
+                query_fastq(
                     black_box(&idx),
                     black_box(pairs),
                     black_box(SEED_LEN),
@@ -181,16 +188,11 @@ fn bench_alignment(c: &mut Criterion) {
             ReadPair::new(&format!("r{i}"), rec("a", &r1), rec("b", &r2))
         })
         .collect();
-    let (big_aligns, _) =
-        process_read_pairs(&idx, &big_pairs, SEED_LEN, eps_1, eps_2, None).unwrap();
-    let mut read_ids = HashMap::new();
-    for (n, val) in big_aligns.iter().enumerate() {
-        read_ids.insert(*val.key(), ReadIdx::new(n));
-    }
+    let (big_aligns, _) = query_fastq(&idx, &big_pairs, SEED_LEN, eps_1, eps_2, None).unwrap();
     let mut g = c.benchmark_group("build");
     g.throughput(Throughput::Elements(BUILD_PAIRS as u64));
-    g.bench_function("sparse_from_alignments", |b| {
-        b.iter(|| build_sparse_array(black_box(&big_aligns), black_box(&read_ids)))
+    g.bench_function("csr_from_alignments", |b| {
+        b.iter(|| CsrLikelihood::build(black_box(&big_aligns)))
     });
     g.finish();
 }

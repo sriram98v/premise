@@ -14,3 +14,15 @@
 /.claude
 /datasets
 CLAUDE.md
+
+# Python bytecode / tool caches.
+__pycache__/
+*.py[cod]
+
+# Comparative analysis: data lives under $BENCH_DATA; these catch a run with bench_data unset.
+/comparative-analysis/indexes
+/comparative-analysis/samples
+/comparative-analysis/results
+/comparative-analysis/truth
+/comparative-analysis/db_build.csv
+/comparative-analysis/scratch
