@@ -320,14 +320,39 @@ fn extend_smems(
     walk.out
 }
 
+/// The cursor of the exact k-mer `p[at..at + k]` read straight from the index's lookup
+/// tables (`k = idx.lookup_depth()`), standing in for `k` exact extensions from the full
+/// interval. `None` when the index has no tables, the window runs past the read or holds
+/// an `N`, or the k-mer does not occur; the caller then extends one symbol at a time.
+#[inline]
+fn lookup(idx: &RefIndex, p: &[u8], at: usize) -> Option<BidirInterval> {
+    let k = idx.lookup_depth() as usize;
+    if k == 0 {
+        return None;
+    }
+    let kmer = p.get(at..at + k)?;
+    if kmer.contains(&N) {
+        return None;
+    }
+    idx.lookup_interval(kmer)
+}
+
 /// Finds all SMEM using pivot jumping of BWA-MEM
-/// Runs in `O(n + Σ overlaps)`
+/// Runs in `O(n + Σ overlaps)`. A run that starts from the full interval first tries the
+/// k-mer lookup tables, which give the same cursor as `k` successful exact extensions.
 fn smems(idx: &RefIndex, p: &[u8], k: usize) -> Vec<(usize, BidirInterval)> {
     let n = p.len();
     let full = idx.full_interval();
+    let depth = idx.lookup_depth() as usize;
     let mut out = Vec::new();
     let (mut i, mut e, mut x) = (0usize, 0usize, full);
     loop {
+        if e == i {
+            if let Some(y) = lookup(idx, p, e) {
+                x = y;
+                e += depth;
+            }
+        }
         while e < n && p[e] != N {
             count!(EXTENSIONS);
             match idx.extend_right(x, p[e]) {
@@ -350,10 +375,18 @@ fn smems(idx: &RefIndex, p: &[u8], k: usize) -> Vec<(usize, BidirInterval)> {
         let restart = p[e] == N;
         let mut next = None;
         if !restart {
-            count!(EXTENSIONS);
-            if let Some(mut y) = idx.extend_right(full, p[e]) {
-                // `y` spells `P[j..e+1)`; walk left while it keeps occurring.
-                let mut j = e;
+            // `y` spells `P[j..e+1)`; walk left while it keeps occurring. When the k-mer
+            // ending at `e + 1` occurs, so does each of its suffixes, and the walk would
+            // reach its start: take it from the tables and walk on from there.
+            let jumped = match (e + 1).checked_sub(depth) {
+                Some(j) if depth > 0 && j > i => lookup(idx, p, j).map(|y| (j, y)),
+                _ => None,
+            };
+            let seed = jumped.or_else(|| {
+                count!(EXTENSIONS);
+                idx.extend_right(full, p[e]).map(|y| (e, y))
+            });
+            if let Some((mut j, mut y)) = seed {
                 while j > i + 1 && p[j - 1] != N {
                     count!(EXTENSIONS);
                     match idx.extend_left(y, p[j - 1]) {
@@ -648,10 +681,16 @@ mod tests {
     }
 
     fn index_raw(refs: &[(&str, &str)]) -> RefIndex {
+        index_raw_depth(refs, 0)
+    }
+
+    /// [`index_raw`] with k-mer lookup tables of depth `lookup_depth`.
+    fn index_raw_depth(refs: &[(&str, &str)], lookup_depth: u32) -> RefIndex {
         use haystackfm::{DnaSequence, FmIndexConfig};
         let cfg = FmIndexConfig {
             sa_sample_rate: 1,
             use_gpu: false,
+            lookup_depth,
             ..Default::default()
         };
         let dna: Vec<DnaSequence> = refs
@@ -1577,6 +1616,35 @@ mod tests {
             );
             assert_smems_match_oracle(idx, read, &quals, k, &ctx);
         }
+    }
+
+    /// Seeding from the k-mer lookup tables yields exactly the SMEMs (starts, cursors and
+    /// lengths) of the symbol-by-symbol search, on IUPAC references and reads with `N`.
+    #[test]
+    fn lookup_seeding_matches_stepwise_smems() {
+        const WILD: [char; 11] = ['N', 'R', 'Y', 'S', 'W', 'K', 'M', 'B', 'D', 'H', 'V'];
+        let mut st = 0x100Cu64;
+        let mut jumps = 0usize;
+        for case in 0..200 {
+            let (refs, read, _, k) = random_case_with(&mut st, &WILD);
+            let borrowed: Vec<(&str, &str)> =
+                refs.iter().map(|(h, s)| (h.as_str(), s.as_str())).collect();
+            let plain = index_raw(&borrowed);
+            let want = smem_intervals(&plain, &read, k);
+            for depth in [1, 3, 5, 8] {
+                let tabled = index_raw_depth(&borrowed, depth);
+                assert_eq!(tabled.lookup_depth(), depth);
+                jumps += (0..read.len())
+                    .filter(|&at| lookup(&tabled, &read, at).is_some())
+                    .count();
+                assert_eq!(
+                    smem_intervals(&tabled, &read, k),
+                    want,
+                    "case {case}, depth {depth}: refs {refs:?} read {read:?} k {k}"
+                );
+            }
+        }
+        assert!(jumps > 0, "the lookup tables were never hit");
     }
 
     /// Random SMEM enumeration against the oracle, N-only and all-IUPAC references.

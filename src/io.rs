@@ -16,20 +16,35 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
 
-/// Build a serialized FM-index from raw FASTA bytes, keeping every suffix-array entry.
+/// Default depth of the k-mer lookup tables that seed the SMEM search: fastest in a
+/// depth sweep on the benchmark reference (deeper tables cost more cache misses than
+/// the extensions they save).
+pub const DEFAULT_LOOKUP_DEPTH: u32 = 8;
+
+/// Largest accepted lookup depth: each index half then holds about 12 × 4^13 bytes (~0.8 GB).
+pub const MAX_LOOKUP_DEPTH: u32 = 13;
+
+/// Build a serialized FM-index from raw FASTA bytes, keeping every suffix-array entry and
+/// the default k-mer lookup tables.
 pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
-    build_index_from_bytes_with(fasta_data, 1)
+    build_index_from_bytes_with(fasta_data, 1, DEFAULT_LOOKUP_DEPTH)
 }
 
 /// Build a serialized FM-index from raw FASTA bytes, keeping one suffix-array entry in
 /// every `sa_sample_rate` (1 = the full suffix array). Larger rates shrink the index and
-/// slow down locating occurrences.
+/// slow down locating occurrences. `lookup_depth` is the k of the k-mer tables that let
+/// the SMEM search skip its first k extensions (0 = no tables); each index half grows by
+/// about 12 × 4^k bytes.
 pub fn build_index_from_bytes_with(
     fasta_data: &[u8],
     sa_sample_rate: u32,
+    lookup_depth: u32,
 ) -> Result<(Vec<u8>, String)> {
     if sa_sample_rate == 0 {
         anyhow::bail!("sa_sample_rate must be at least 1");
+    }
+    if lookup_depth > MAX_LOOKUP_DEPTH {
+        anyhow::bail!("lookup_depth must be at most {MAX_LOOKUP_DEPTH}");
     }
     let cursor = Cursor::new(fasta_data);
     let reader = BufReader::new(cursor);
@@ -99,6 +114,7 @@ pub fn build_index_from_bytes_with(
         use_gpu: false,
         occ_encoding: OccEncoding::OneHot,
         build_lcp: false,
+        lookup_depth,
         ..Default::default()
     };
     let fmidx = RefIndex::build_cpu(&sequences, &config)

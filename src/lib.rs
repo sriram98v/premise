@@ -32,6 +32,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+/// `build --lookup_depth` default, as the `'static` string clap wants.
+static DEFAULT_LOOKUP_DEPTH_ARG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| io::DEFAULT_LOOKUP_DEPTH.to_string());
+
 /// Resolve the worker-thread count
 fn resolve_thread_count(threads: usize) -> usize {
     if threads != 0 {
@@ -228,6 +232,10 @@ pub fn run() -> Result<()> {
                     .default_value("1")
                     .value_parser(clap::value_parser!(u32).range(1..))
                 )
+                .arg(arg!(--lookup_depth <K> "k of the k-mer tables that seed the SMEM search (0 = none; each index half grows by ~12 x 4^K bytes)")
+                    .default_value(DEFAULT_LOOKUP_DEPTH_ARG.as_str())
+                    .value_parser(clap::value_parser!(u32).range(0..=i64::from(io::MAX_LOOKUP_DEPTH)))
+                )
 
         )
         .subcommand(
@@ -364,10 +372,12 @@ pub fn run() -> Result<()> {
                 .as_str();
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
             let sa_sample_rate = *sub_m.get_one::<u32>("sa_sample_rate").expect("defaulted");
+            let lookup_depth = *sub_m.get_one::<u32>("lookup_depth").expect("defaulted");
 
             let fasta_data = std::fs::read(src_file)
                 .with_context(|| format!("failed to read reference FASTA '{}'", src_file))?;
-            let (idx_bytes, _) = build_index_from_bytes_with(&fasta_data, sa_sample_rate)?;
+            let (idx_bytes, _) =
+                build_index_from_bytes_with(&fasta_data, sa_sample_rate, lookup_depth)?;
 
             let out_path = match outfile {
                 "" => format!("{}.fmidx", src_file),

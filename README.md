@@ -61,9 +61,7 @@ nix develop
 premise build -s <reference.fasta>
 ```
 
-Produces `<reference>.fmidx`. This index is required for both the CLI and GUI query steps.
-`--sa_sample_rate N` keeps one suffix-array entry in every `N` (default 1, the full suffix array):
-a smaller index that is slower to locate matches in, with identical results.
+Produces `<reference>.fmidx`.
 
 ### Step 2 — Classify reads (CLI)
 

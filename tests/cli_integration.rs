@@ -871,3 +871,71 @@ fn build_rejects_zero_sa_sample_rate() {
         "0",
     ]));
 }
+
+/// The k-mer lookup tables only skip extensions the SMEM search would make anyway, so an
+/// index without them (`--lookup_depth 0`) scores and classifies every read identically.
+#[test]
+fn build_lookup_depth_gives_same_query_results() {
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let fasta = fixtures().join("ref.fasta");
+    let tabled = build_index(tmpdir.path());
+    let plain = tmpdir.path().join("ref-nolookup");
+    assert_success(&run(&[
+        "build",
+        "-s",
+        fasta.to_str().unwrap(),
+        "-o",
+        plain.to_str().unwrap(),
+        "--lookup_depth",
+        "0",
+    ]));
+    assert!(
+        fs::metadata(&plain).unwrap().len() < fs::metadata(&tabled).unwrap().len(),
+        "the lookup tables should make the index larger"
+    );
+
+    let r1 = fixtures().join("r1.fastq");
+    let r2 = fixtures().join("r2.fastq");
+    let query = |index: &Path, tag: &str| -> Vec<String> {
+        let out = tmpdir.path().join(tag);
+        assert_success(&run(&[
+            "query",
+            "-s",
+            index.to_str().unwrap(),
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+            "-m",
+            "5",
+            "-o",
+            out.to_str().unwrap(),
+            "-t",
+            "1",
+            "-i",
+            "5",
+        ]));
+        ["matches", "props", "aligns"]
+            .iter()
+            .map(|ext| fs::read_to_string(tmpdir.path().join(format!("{tag}.{ext}"))).unwrap())
+            .collect()
+    };
+    assert_eq!(query(&tabled, "tabled"), query(&plain, "plain"));
+}
+
+/// Lookup tables grow as 4^k; a depth past the cap must be rejected, not attempted.
+#[test]
+fn build_rejects_oversized_lookup_depth() {
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let fasta = fixtures().join("ref.fasta");
+    let out = tmpdir.path().join("ref");
+    assert_failure(&run(&[
+        "build",
+        "-s",
+        fasta.to_str().unwrap(),
+        "-o",
+        out.to_str().unwrap(),
+        "--lookup_depth",
+        "14",
+    ]));
+}

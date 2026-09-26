@@ -982,8 +982,8 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "haystackfm"
-version = "0.4.0"
-source = "git+https://github.com/sriram98v/haystackfm?rev=0bffa7e#0bffa7eba7935415286286d2eae1edd9ca43381a"
+version = "0.5.0"
+source = "git+https://github.com/sriram98v/haystackfm?tag=v0.5.0#32e3febe94fbacff1113ca9889310e0a00fb24af"
 dependencies = [
  "bincode",
  "log",

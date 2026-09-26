@@ -4,7 +4,7 @@
 use crate::SeqId;
 use bio::io::fastq;
 use bio::stats::{LogProb, Prob};
-use haystackfm::alphabet;
+use haystackfm::{alphabet, SymbolSet};
 use itertools::izip;
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -309,31 +309,10 @@ impl QueryProgress {
     }
 }
 
-/// The `{A, C, G, T}` set an IUPAC symbol stands for, as a bitmask
-/// (bit 0 = A, bit 1 = C, bit 2 = G, bit 3 = T).
-const fn iupac_mask(code: u8) -> u8 {
-    const A: u8 = 0b0001;
-    const C: u8 = 0b0010;
-    const G: u8 = 0b0100;
-    const T: u8 = 0b1000;
-    match code {
-        alphabet::A => A,
-        alphabet::C => C,
-        alphabet::G => G,
-        alphabet::T => T,
-        alphabet::R => A | G,
-        alphabet::Y => C | T,
-        alphabet::S => G | C,
-        alphabet::W => A | T,
-        alphabet::K => G | T,
-        alphabet::M => A | C,
-        alphabet::B => C | G | T,
-        alphabet::D => A | G | T,
-        alphabet::H => A | C | T,
-        alphabet::V => A | C | G,
-        alphabet::N => A | C | G | T,
-        _ => 0,
-    }
+/// The `{A, C, G, T}` bases an IUPAC symbol stands for; empty for the sentinel and for
+/// codes outside the alphabet.
+fn iupac_set(code: u8) -> SymbolSet {
+    SymbolSet::from_codes(alphabet::iupac_bases(code))
 }
 
 /// Per-position mixture weights `(w_match, w_mismatch_scaled)` for every ordered
@@ -342,13 +321,13 @@ static AMBIG_WEIGHTS: LazyLock<[(f64, f64); 256]> = LazyLock::new(|| {
     let mut table = [(0.0f64, 0.0f64); 256];
     for read_code in 0..alphabet::ALPHABET_SIZE {
         for ref_code in 0..alphabet::ALPHABET_SIZE {
-            let read_mask = iupac_mask(read_code as u8);
-            let ref_mask = iupac_mask(ref_code as u8);
-            let n = read_mask.count_ones() * ref_mask.count_ones();
+            let read_set = iupac_set(read_code as u8);
+            let ref_set = iupac_set(ref_code as u8);
+            let n = read_set.len() * ref_set.len();
             if n == 0 {
                 continue;
             }
-            let m = (read_mask & ref_mask).count_ones();
+            let m = read_set.intersection(ref_set).len();
             let total = f64::from(n);
             table[read_code * alphabet::ALPHABET_SIZE + ref_code] = (
                 f64::from(m) / total,
@@ -563,15 +542,45 @@ mod tests {
     }
 
     #[test]
-    fn weights_match_haystackfm_iupac_bases() {
-        // Independent oracle: recompute the intersection from haystackfm's own table
-        // rather than from our bitmask, so a typo in `iupac_mask` cannot hide.
-        for read_code in 1..alphabet::ALPHABET_SIZE as u8 {
-            for ref_code in 1..alphabet::ALPHABET_SIZE as u8 {
-                let read_set = alphabet::iupac_bases(read_code);
-                let ref_set = alphabet::iupac_bases(ref_code);
-                let n = (read_set.len() * ref_set.len()) as u32;
-                let m = read_set.iter().filter(|b| ref_set.contains(b)).count() as u32;
+    fn weights_match_iupac_definition() {
+        // Independent oracle: the IUPAC code table written out by hand, so a change in
+        // haystackfm's `iupac_bases` cannot silently move the likelihood model.
+        const A: u8 = 0b0001;
+        const C: u8 = 0b0010;
+        const G: u8 = 0b0100;
+        const T: u8 = 0b1000;
+        let mask = |code: u8| match code {
+            alphabet::A => A,
+            alphabet::C => C,
+            alphabet::G => G,
+            alphabet::T => T,
+            alphabet::R => A | G,
+            alphabet::Y => C | T,
+            alphabet::S => G | C,
+            alphabet::W => A | T,
+            alphabet::K => G | T,
+            alphabet::M => A | C,
+            alphabet::B => C | G | T,
+            alphabet::D => A | G | T,
+            alphabet::H => A | C | T,
+            alphabet::V => A | C | G,
+            alphabet::N => A | C | G | T,
+            _ => 0,
+        };
+        for read_code in 0..alphabet::ALPHABET_SIZE as u8 {
+            for ref_code in 0..alphabet::ALPHABET_SIZE as u8 {
+                let (read_mask, ref_mask) = (mask(read_code), mask(ref_code));
+                let n = read_mask.count_ones() * ref_mask.count_ones();
+                let m = (read_mask & ref_mask).count_ones();
+                let idx = read_code as usize * alphabet::ALPHABET_SIZE + ref_code as usize;
+                if n == 0 {
+                    assert_eq!(
+                        AMBIG_WEIGHTS[idx],
+                        (0.0, 0.0),
+                        "read {read_code} vs ref {ref_code}"
+                    );
+                    continue;
+                }
 
                 let idx = read_code as usize * alphabet::ALPHABET_SIZE + ref_code as usize;
                 let (w_match, w_mismatch) = AMBIG_WEIGHTS[idx];
