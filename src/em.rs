@@ -127,28 +127,30 @@ impl CsrLikelihood {
         self.col[s..e].binary_search(&c).ok().map(|k| s + k)
     }
 
-    /// Initial proportions from each read's argmax emission likelihood
+    /// Initial proportions from each read's argmax emission likelihood. Contributions of each read
+    /// are split evenly among tied references.
     fn initial_pi(&self) -> Vec<EMProb> {
-        let counts: Vec<usize> = (0..self.n_reads())
+        let counts: Vec<EMProb> = (0..self.n_reads())
             .into_par_iter()
             .fold(
-                || vec![0usize; self.n_refs()],
+                || vec![0.0; self.n_refs()],
                 |mut acc, r| {
-                    let (s, e) = (self.row_ptr[r], self.row_ptr[r + 1]);
-                    if e > s {
-                        let mut best = s;
-                        for k in (s + 1)..e {
-                            if EMProb::total_cmp(&self.lik[k], &self.lik[best]).is_gt() {
-                                best = k;
-                            }
+                    let row = self.row_ptr[r]..self.row_ptr[r + 1];
+                    let best = self.lik[row.clone()]
+                        .iter()
+                        .copied()
+                        .fold(EMProb::NEG_INFINITY, EMProb::max);
+                    let tied = self.lik[row.clone()].iter().filter(|&&l| l == best).count();
+                    for k in row {
+                        if self.lik[k] == best {
+                            acc[self.col[k] as usize] += 1.0 / tied as EMProb;
                         }
-                        acc[self.col[best] as usize] += 1;
                     }
                     acc
                 },
             )
             .reduce(
-                || vec![0usize; self.n_refs()],
+                || vec![0.0; self.n_refs()],
                 |mut a, b| {
                     for j in 0..a.len() {
                         a[j] += b[j];
@@ -156,11 +158,8 @@ impl CsrLikelihood {
                     a
                 },
             );
-        let total: usize = counts.iter().sum();
-        counts
-            .iter()
-            .map(|&c| c as EMProb / total as EMProb)
-            .collect()
+        let total: EMProb = counts.iter().sum();
+        counts.iter().map(|&c| c / total).collect()
     }
 
     /// E-step
@@ -426,6 +425,23 @@ fn _compute_phi(lambda: EMProb, omega: EMProb, rho: EMProb, ej: EMProb) -> EMPro
     return lambda * omega + rho - ej;
 }
 
+/// Zero every reference whose expected read count `ej` is below `rho`, then renormalize
+fn prune_below_rho(pi: Vec<EMProb>, ej: &[EMProb], rho: EMProb) -> Vec<EMProb> {
+    let total: EMProb = pi
+        .iter()
+        .zip(ej)
+        .filter(|(_, &e)| e >= rho)
+        .map(|(&p, _)| p)
+        .sum();
+    if !(total.is_finite() && total > 0.0) {
+        return pi;
+    }
+    pi.iter()
+        .zip(ej)
+        .map(|(&p, &e)| if e >= rho { p / total } else { 0.0 })
+        .collect()
+}
+
 /// Run the L1-penalized EM algorithm to estimate reference proportions.
 pub fn get_proportions_par_sparse_l1_reg(
     csr: &CsrLikelihood,
@@ -485,6 +501,7 @@ pub fn get_proportions_par_sparse_l1_reg(
                 }
             })
             .collect();
+        pi = prune_below_rho(pi, &ej, rho);
 
         pb.set_message(format!("{data_loglikelihood_diff:.3e}"));
 
@@ -508,4 +525,105 @@ pub fn get_proportions_par_sparse_l1_reg(
         .collect();
 
     (results, props, w, data_likelihoods)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A CSR matrix from dense rows (0.0 = no entry); reference j is `SeqId(j)`.
+    fn csr(rows: &[&[EMProb]]) -> CsrLikelihood {
+        let n_refs = rows[0].len();
+        let refs: Vec<SeqId> = (0..n_refs as u32).map(SeqId).collect();
+        let ref_compact = refs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (*r, i as u32))
+            .collect();
+        let (mut row_ptr, mut col, mut lik) = (vec![0], Vec::new(), Vec::new());
+        for row in rows {
+            for (j, &l) in row.iter().enumerate() {
+                if l != 0.0 {
+                    col.push(j as u32);
+                    lik.push(l);
+                }
+            }
+            row_ptr.push(col.len());
+        }
+        CsrLikelihood {
+            refs,
+            ref_compact,
+            reads: (0..rows.len()).map(ReadIdx).collect(),
+            row_of: (0..rows.len() as u32).collect(),
+            row_ptr,
+            col,
+            lik,
+        }
+    }
+
+    #[test]
+    fn prune_zeroes_sub_rho_refs_and_renormalizes_survivors() {
+        let pi = prune_below_rho(vec![0.6, 0.3, 0.1], &[600.0, 300.0, 100.0], 150.0);
+        assert_eq!(pi[2], 0.0);
+        assert!((pi.iter().sum::<EMProb>() - 1.0).abs() < 1e-12);
+        assert!((pi[0] / pi[1] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prune_with_zero_rho_keeps_pi() {
+        let pi = prune_below_rho(vec![0.5, 0.25, 0.25], &[2.0, 1.0, 1.0], 0.0);
+        assert_eq!(pi, vec![0.5, 0.25, 0.25]);
+    }
+
+    #[test]
+    fn prune_keeps_pi_when_no_ref_survives() {
+        let pi = prune_below_rho(vec![0.7, 0.3], &[7.0, 3.0], 150.0);
+        assert_eq!(pi, vec![0.7, 0.3]);
+    }
+
+    #[test]
+    fn em_drops_ref_with_fewer_expected_reads_than_rho() {
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0, 0.0][..], 300));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0, 0.0][..], 300));
+        // Initially won by ref 2, but only 100 reads: below rho.
+        rows.extend(std::iter::repeat_n(&[0.0, 0.4, 0.6][..], 100));
+        let m = csr(&rows);
+
+        let (results, props, w, _) =
+            get_proportions_par_sparse_l1_reg(&m, 50, 150.0, 1e-10, 1e-6, None);
+
+        assert!(!props.contains_key(&SeqId(2)));
+        assert!((props.values().sum::<EMProb>() - 1.0).abs() < 1e-12);
+        for k in 0..m.col.len() {
+            if m.col[k] == 2 {
+                assert_eq!(w[k], 0.0);
+            }
+        }
+        assert!((600..700).all(|r| results[&ReadIdx(r)] == SeqId(1)));
+    }
+
+    #[test]
+    fn initial_pi_splits_exact_ties_evenly() {
+        // two identical references: every read ties, so neither may start at zero
+        let m = csr(&[&[0.5, 0.5], &[0.2, 0.2], &[0.9, 0.9]]);
+        assert_eq!(m.initial_pi(), vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn initial_pi_counts_strict_winners_and_shares_ties() {
+        // read 0 -> ref 0; read 1 tied between refs 1 and 2; read 2 tied three ways
+        let m = csr(&[&[0.9, 0.1, 0.0], &[0.1, 0.4, 0.4], &[0.3, 0.3, 0.3]]);
+        let pi = m.initial_pi();
+        let third = 1.0 / 3.0;
+        let want = [
+            (1.0 + third) / 3.0,
+            (0.5 + third) / 3.0,
+            (0.5 + third) / 3.0,
+        ];
+        for (p, w) in pi.iter().zip(want) {
+            assert!((p - w).abs() < 1e-12, "{pi:?} vs {want:?}");
+        }
+        assert!((pi.iter().sum::<EMProb>() - 1.0).abs() < 1e-12);
+    }
 }

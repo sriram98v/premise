@@ -13,6 +13,7 @@
 /graphify-out
 /.claude
 /datasets
+/scratch
 CLAUDE.md
 
 # Python bytecode / tool caches.
