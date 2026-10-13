@@ -313,7 +313,7 @@ fn run_summary(summary: &analyze::AnalyzeSummary, report_path: Option<&str>) -> 
 }
 
 pub fn run() -> Result<()> {
-    let matches = Command::new("Maximum Likelihood Metagenomic Classification")
+    let matches = Command::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
         .author("Sriram Vijendran <vijendran.sriram@gmail.com>")
         .subcommand(
