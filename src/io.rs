@@ -1,10 +1,15 @@
 //! File input and output
 
 use crate::em::Posteriors;
+use crate::group::Grouping;
+use crate::tree::{
+    conditional, count, is_synthetic_root, label, preorder, rank, Partition, SubtreeIndex, TaxTree,
+    NO_NODE,
+};
 use crate::utils::{
     get_extension_from_filename, EMProb, Read, ReadAlignments, ReadID, ReadIdx, ReadPair,
 };
-use crate::{RefIndex, SeqId};
+use crate::RefIndex;
 use anyhow::{Context, Result};
 use bio::io::{fasta, fastq};
 use chrono::Local;
@@ -12,7 +17,9 @@ use flate2::read::GzDecoder;
 use haystackfm::alphabet::{self, encode_byte};
 use haystackfm::occ::OccEncoding;
 use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use phylo::node::NodeID;
+use phylo::prelude::*;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
 
@@ -244,15 +251,17 @@ pub fn all_read_ids<'a>(pairs: &'a [ReadPair], unpaired: &'a [ReadID]) -> BTreeS
         .collect()
 }
 
-/// The four output tables of [`crate::run_query`], each streamed to its own writer:
-/// - `matches`: per-read MAP assignment table (TSV)
-/// - `posteriors`: full posterior probability matrix (TSV)
-/// - `props`: estimated reference abundance proportions (TSV)
+/// The output tables of [`crate::run_query`], each streamed to its own writer:
+/// - `matches`: per-read assignment table (TSV)
+/// - `posteriors`: per-read posterior over the tips (TSV)
+/// - `props`: estimated abundance proportions, one row per reported tip (TSV)
+/// - `nodes`: every vertex of the fitted taxonomy (TSV)
 /// - `aligns`: raw per-read alignment likelihoods (TSV, same format as `run_alignment`)
 pub struct QueryWriters<W: Write> {
     pub matches: W,
     pub posteriors: W,
     pub props: W,
+    pub nodes: W,
     pub aligns: W,
 }
 
@@ -290,73 +299,98 @@ pub fn write_alignments<W: Write>(
     Ok(())
 }
 
-/// `.posteriors` table
+/// Where each read ended up: the vertex and its subtree posterior.
+pub type Assignments = HashMap<ReadIdx, (NodeID, EMProb)>;
+
+/// `.posteriors` table: one row per (read, leaf): a sequence, or a collapsed taxon over
+/// its sequences.
+#[allow(clippy::too_many_arguments)]
 pub fn write_posteriors<W: Write>(
     out: &mut W,
-    fmidx: &RefIndex,
+    grouping: &Grouping,
+    tree: &TaxTree,
+    part: &Partition,
     read_ids: &BTreeSet<&ReadID>,
     aligns: &ReadAlignments<'_>,
-    read_assignments: &HashMap<ReadIdx, SeqId>,
+    assignments: &Assignments,
     posteriors: &Posteriors<'_>,
 ) -> Result<()> {
-    writeln!(out, "ReadID\tRefID\tPosterior")?;
+    writeln!(out, "ReadID\t{}\tPosterior", grouping.label_header())?;
     for read_id in read_ids.iter() {
-        let classified = aligns
+        let assigned = aligns
             .read_idx(read_id)
-            .filter(|read_idx| read_assignments.contains_key(read_idx));
-        let Some(read_idx) = classified else {
+            .filter(|read_idx| assignments.contains_key(read_idx));
+        let Some(read_idx) = assigned else {
             writeln!(out, "{}\tunclassified\t-", **read_id)?;
             continue;
         };
-        let (refs, _) = aligns.row(read_idx);
-        for ref_idx in refs {
-            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-            writeln!(
-                out,
-                "{}\t{}\t{:.5e}",
-                **read_id,
-                ref_id,
-                posteriors.get(read_idx, *ref_idx),
-            )?;
+        let mut rows: Vec<(&str, EMProb)> = posteriors
+            .per_leaf(read_idx, part)
+            .into_iter()
+            .map(|(leaf, p)| (label(tree, leaf), p))
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, p) in rows {
+            writeln!(out, "{}\t{}\t{:.5e}", **read_id, name, p)?;
         }
     }
     out.flush()?;
     Ok(())
 }
 
-/// `.matches` table
+/// `.matches` table: the vertex each read was assigned to (a sequence, a taxid, or `root`),
+/// its posterior there, and the position of the read's best-scoring sequence under that
+/// vertex. Reads that stopped at the synthetic root are unclassified. Returns the
+/// classified reads.
+#[allow(clippy::too_many_arguments)]
 pub fn write_matches<W: Write>(
     out: &mut W,
-    fmidx: &RefIndex,
+    grouping: &Grouping,
+    tree: &TaxTree,
+    part: &Partition,
     read_ids: &BTreeSet<&ReadID>,
     aligns: &ReadAlignments<'_>,
-    read_assignments: &HashMap<ReadIdx, SeqId>,
+    assignments: &Assignments,
     posteriors: &Posteriors<'_>,
-    props_refs: &HashSet<SeqId>,
 ) -> Result<HashSet<ReadIdx>> {
     let mut classified_reads: HashSet<ReadIdx> = HashSet::new();
+    let subtree = SubtreeIndex::new(tree);
     writeln!(
         out,
-        "ReadID\tRefID\tPosterior\tForward Position\tReverse Position"
+        "ReadID\t{}\tPosterior\tForward Position\tReverse Position",
+        grouping.label_header()
     )?;
     for read_id in read_ids.iter() {
         let assignment = aligns
             .read_idx(read_id)
-            .and_then(|read_idx| read_assignments.get(&read_idx).map(|r| (read_idx, *r)));
-        let Some((read_idx, ref_idx)) = assignment.filter(|(_, r)| props_refs.contains(r)) else {
+            .and_then(|read_idx| assignments.get(&read_idx).map(|a| (read_idx, *a)));
+        let Some((read_idx, (vertex, h))) =
+            assignment.filter(|(_, (v, _))| !is_synthetic_root(tree, *v))
+        else {
             writeln!(out, "{}\tunclassified\t-\t-\t-", **read_id)?;
             continue;
         };
-        let Some(alignment) = aligns.get(read_idx, ref_idx) else {
+        let (refs, als) = aligns.row(read_idx);
+        let best = refs
+            .iter()
+            .zip(als)
+            .filter(|(r, _)| {
+                let leaf = posteriors.leaf_of(**r, part);
+                leaf != NO_NODE && subtree.contains(vertex, leaf)
+            })
+            .max_by(|(_, a), (_, b)| {
+                EMProb::total_cmp(&a.get_full_match_ll().exp(), &b.get_full_match_ll().exp())
+            });
+        let Some((_, alignment)) = best else {
+            writeln!(out, "{}\tunclassified\t-\t-\t-", **read_id)?;
             continue;
         };
-        let ref_id = fmidx.seq_header(ref_idx).unwrap_or("");
         writeln!(
             out,
             "{}\t{}\t{:.5e}\t{}\t{}",
             **read_id,
-            ref_id,
-            posteriors.get(read_idx, ref_idx),
+            label(tree, vertex),
+            h,
             alignment.get_pos().0,
             alignment.get_pos().1,
         )?;
@@ -366,21 +400,62 @@ pub fn write_matches<W: Write>(
     Ok(classified_reads)
 }
 
-/// The `.props` table: one line per reference with its proportion, in reference order.
-pub fn write_props<W: Write>(
-    out: &mut W,
-    fmidx: &RefIndex,
-    props: &HashMap<SeqId, EMProb>,
-) -> Result<()> {
-    // BTreeMap only to keep the output order deterministic.
-    for (ref_idx, prop) in props.iter().collect::<BTreeMap<_, _>>() {
-        let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-        writeln!(out, "{}\t{:.10e}", ref_id, prop)?;
+/// `.props` table: one row per leaf with its proportion `π_ℓ`: a sequence header, or the
+/// taxid of a collapsed vertex. The leaves partition the mass, so the rows sum to one.
+pub fn write_props<W: Write>(out: &mut W, tree: &TaxTree, node_pi: &[EMProb]) -> Result<()> {
+    let mut rows: Vec<(&str, EMProb)> = tree
+        .get_leaf_ids()
+        .filter_map(|leaf| {
+            let p = node_pi.get(leaf).copied().unwrap_or(0.0);
+            (p > 0.0).then(|| (label(tree, leaf), p))
+        })
+        .collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, p) in rows {
+        writeln!(out, "{}\t{:.10e}", name, p)?;
     }
     out.flush()?;
     Ok(())
 }
 
+/// `.nodes` table: every vertex of the fitted taxonomy in pre-order. `Proportion` is the
+/// vertex's marginal `π_v` (nested: a parent's includes its children's), `Conditional` its
+/// share of its parent's mass, `Count` its expected reads, `Contigs` the sequences a leaf
+/// holds (1 for a sequence, the pooled set for a collapsed vertex, 0 for an internal
+/// vertex), `Rank` the taxonomic rank (`sequence` for an index record).
+pub fn write_nodes<W: Write>(
+    out: &mut W,
+    tree: &TaxTree,
+    part: &Partition,
+    node_pi: &[EMProb],
+) -> Result<()> {
+    writeln!(
+        out,
+        "TaxID\tParent\tRank\tContigs\tCount\tProportion\tConditional"
+    )?;
+    let root = tree.get_root_id();
+    for v in preorder(tree) {
+        let contigs = part.size_of(v);
+        let parent = if v == root {
+            "-"
+        } else {
+            tree.get_node_parent_id(v).map_or("-", |p| label(tree, p))
+        };
+        writeln!(
+            out,
+            "{}\t{}\t{}\t{}\t{:.3}\t{:.10e}\t{:.10e}",
+            label(tree, v),
+            parent,
+            rank(tree, v),
+            contigs,
+            count(tree, v),
+            node_pi.get(v).copied().unwrap_or(0.0),
+            conditional(tree, v),
+        )?;
+    }
+    out.flush()?;
+    Ok(())
+}
 /// The `.aligns` table
 pub fn write_aligns<W: Write>(
     out: &mut W,

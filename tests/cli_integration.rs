@@ -722,8 +722,8 @@ fn query_props_agree_with_corrected_matches() {
         );
     }
 
-    // Proportions are refit over the classified reads by a final E/M step whose M-step
-    // enforces the simplex constraint, so they must sum to one without renormalization.
+    // The leaves partition the mass (every vertex's conditionals sum to one), so the
+    // proportions must sum to one without renormalization.
     for (ref_id, prop) in &listed {
         assert!(
             *prop > 0.0 && *prop <= 1.0 + 1e-6,

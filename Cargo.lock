@@ -904,8 +904,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ff2abc00be7fca6ebc474524697ae276ad847ad0a6b3faa4bcb027e9a4614ad0"
 dependencies = [
  "cfg-if 1.0.4",
+ "js-sys",
  "libc",
  "wasi",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -1124,6 +1126,15 @@ name = "itertools"
 version = "0.10.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b0fd2260e829bddf4cb6ea802289de2f86d6a7a690192fbe91b3f46e0f2c8473"
+dependencies = [
+ "either",
+]
+
+[[package]]
+name = "itertools"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1c173a5686ce8bfa551b3563d0c2170bf24ca44da99c7ca4bfdab5418c3fe57"
 dependencies = [
  "either",
 ]
@@ -1514,6 +1525,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "phylo"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55a832f552f47e4e9a9bfb057c5c2bea79251c072966a7db2949fa486538892e"
+dependencies = [
+ "fxhash",
+ "getrandom 0.2.17",
+ "itertools 0.11.0",
+ "nalgebra",
+ "num",
+ "num-traits",
+ "rand",
+ "thiserror 1.0.69",
+ "vers-vecs",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1612,6 +1640,7 @@ dependencies = [
  "indicatif",
  "itertools 0.15.0",
  "num",
+ "phylo",
  "pprof",
  "rayon",
  "savefile",
@@ -2361,6 +2390,12 @@ checksum = "f1bddf1187be692e79c5ffeab891132dfb0f236ed36a43c7ed39f1165ee20191"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "vers-vecs"
+version = "1.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ab7f54690e244b9c886609bc08e12d0cf4738c3a780214642598674cffef6a9"
 
 [[package]]
 name = "version_check"

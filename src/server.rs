@@ -449,6 +449,7 @@ fn handle_query_run(
             matches: Vec::new(),
             posteriors: Vec::new(),
             props: Vec::new(),
+            nodes: Vec::new(),
             aligns: Vec::new(),
         };
         let result = run_query(
@@ -464,6 +465,9 @@ fn handle_query_run(
             em_threshold,
             use_penalty,
             threads,
+            None,
+            None,
+            0.6,
             Some(progress.clone()),
             &mut tables,
         );

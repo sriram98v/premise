@@ -1,36 +1,38 @@
 extern crate clap;
 pub mod align;
 pub mod em;
+pub mod group;
 pub mod io;
 pub mod server;
+pub mod tree;
 pub mod utils;
 
 pub use align::{merge_read_pairs, query_fastq, query_read, query_smems};
 pub use em::CsrLikelihood;
+pub use group::Grouping;
 pub use haystackfm::BidirFmIndex as RefIndex;
 pub use haystackfm::SeqId;
 pub use io::{build_index_from_bytes, build_index_from_bytes_with, load_index, QueryWriters};
+pub use tree::{Partition, TaxTree};
 pub use utils::{EMProb, QueryProgress, ReadPair};
 
 use anyhow::{Context, Result};
 use bio::stats::LogProb;
 use chrono::Local;
 use clap::{arg, Arg, ArgAction, Command};
-use em::{
-    get_proportions_par_sparse, get_proportions_par_sparse_l1_reg, refit_proportions_on_classified,
-    Posteriors, UNPENALIZED_OMEGA, UNPENALIZED_RHO,
-};
+use em::{assign_reads, estimate_proportions, EmParams, Posteriors};
 use haystackfm::alphabet::decode_char;
 use io::{
     all_read_ids, load_fastq_forward, load_fastq_reverse, pair_reads, read_index_file,
-    write_alignments, write_aligns, write_matches, write_posteriors, write_props,
+    write_alignments, write_aligns, write_matches, write_nodes, write_posteriors, write_props,
 };
-use std::collections::HashSet;
+use phylo::prelude::RootedTree;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
+use tree::{contract_to_observed, reference_tree, TaxNodes};
 
 /// `build --lookup_depth` default, as the `'static` string clap wants.
 static DEFAULT_LOOKUP_DEPTH_ARG: std::sync::LazyLock<String> =
@@ -103,7 +105,11 @@ pub fn run_alignment<W: Write>(
     Ok(log_str)
 }
 
-/// Full PREMISE query pipeline
+/// Full PREMISE query pipeline. `seq2taxid` is an optional `seqid<whitespace>taxid` map
+/// grouping sequences into taxa; `nodes` an optional taxonomy (`nodes.dmp`) over those
+/// taxids, which makes the EM hierarchical (see [`tree`]); `gamma` the confidence a
+/// read's subtree posterior must reach for the read to descend to a vertex.
+#[allow(clippy::too_many_arguments)]
 pub fn run_query<W: Write>(
     ref_file: &str,
     r1_file: &str,
@@ -117,9 +123,15 @@ pub fn run_query<W: Write>(
     em_threshold: EMProb,
     use_penalty: bool,
     threads: usize,
+    seq2taxid: Option<&str>,
+    nodes: Option<&str>,
+    gamma: EMProb,
     progress: Option<Arc<QueryProgress>>,
     out: &mut QueryWriters<W>,
 ) -> Result<(Vec<EMProb>, String)> {
+    if !(gamma > 0.5 && gamma <= 1.0) {
+        anyhow::bail!("gamma must be in (0.5, 1], got {}", gamma);
+    }
     let num_threads = resolve_thread_count(threads);
     let _ = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -131,8 +143,34 @@ pub fn run_query<W: Write>(
     let read_ids = all_read_ids(&all_reads, &unpaired);
 
     let fmidx = read_index_file(ref_file)?;
+    let grouping = match seq2taxid {
+        Some(path) => Grouping::from_map(&fmidx, path)?,
+        None => Grouping::identity(&fmidx),
+    };
+    // The taxonomy is built before the expensive alignment so bad input fails early.
+    let tax_nodes = nodes.map(TaxNodes::from_file).transpose()?;
+    let ref_tree = reference_tree(&grouping, tax_nodes.as_ref())?;
+    let tree_log = if tax_nodes.is_some() {
+        format!(
+            "\nTaxonomy: {} vertices, {} sequences at tips ({} taxids not in the nodes file, {} sequences without taxid)",
+            ref_tree.n_nodes(),
+            ref_tree.n_tips(),
+            ref_tree.n_unknown,
+            ref_tree.n_unmapped
+        )
+    } else if seq2taxid.is_some() {
+        format!(
+            "\nTaxonomy: {} vertices, {} sequences at tips under their taxids ({} sequences without taxid)",
+            ref_tree.n_nodes(),
+            ref_tree.n_tips(),
+            ref_tree.n_unmapped
+        )
+    } else {
+        String::new()
+    };
+    let rho_eff = if use_penalty { rho } else { 0.0 };
 
-    let log_str = format!("Timestamp: {}\nNum Threads: {}\nMin matching run: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}",
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nMin matching run: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}\nRho: {}\nOmega: {:e}\nGamma: {}{}{}",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         num_threads,
         mem_seed_length,
@@ -142,6 +180,11 @@ pub fn run_query<W: Write>(
         eps_2.ln(),
         num_iter,
         em_threshold,
+        rho_eff,
+        omega,
+        gamma,
+        grouping.log_suffix(),
+        tree_log,
     );
     println!("{}", log_str);
 
@@ -155,63 +198,73 @@ pub fn run_query<W: Write>(
     )?;
 
     let csr = CsrLikelihood::build(&out_aligns);
-    let (read_assignments, props, weights, em_data_likelihoods) = if use_penalty {
-        get_proportions_par_sparse_l1_reg(
-            &csr,
+    let (mut tree, mut part) = contract_to_observed(&ref_tree, csr.refs())?;
+    if !tree_log.is_empty() {
+        println!(
+            "Contracted taxonomy: {} vertices, {} tips with reads",
+            tree.num_nodes(),
+            tree.get_leaf_ids().count()
+        );
+    }
+    let fit = estimate_proportions(
+        &csr,
+        &mut tree,
+        &mut part,
+        &EmParams {
             num_iter,
-            rho,
+            rho: rho_eff,
             omega,
             em_threshold,
-            progress.clone(),
-        )
-    } else {
-        get_proportions_par_sparse(&csr, num_iter, progress.clone())
-    };
+        },
+        progress.clone(),
+    );
+    if fit.pruned + fit.collapsed > 0 {
+        println!(
+            "Pruned {} vertices and collapsed {} into tips; {} tips remain",
+            fit.pruned,
+            fit.collapsed,
+            tree.get_leaf_ids().count()
+        );
+    }
+    if fit.root_collapsed {
+        eprintln!(
+            "Warning: every child of the root fell below rho = {}; the sample collapsed into one tip (rho is too large for these data)",
+            rho_eff
+        );
+    }
     let posteriors = Posteriors {
         matrix: &csr,
-        weights,
+        pi: fit.pi_tilde,
+        d: fit.d,
     };
-
-    let props_refs: HashSet<SeqId> = props
-        .iter()
-        .filter(|(_, prop)| **prop > 0.0)
-        .map(|(ref_idx, _)| *ref_idx)
-        .collect();
+    let assignments = assign_reads(&csr, &tree, &part, &posteriors, gamma);
 
     write_posteriors(
         &mut out.posteriors,
-        &fmidx,
+        &grouping,
+        &tree,
+        &part,
         &read_ids,
         &out_aligns,
-        &read_assignments,
+        &assignments,
         &posteriors,
     )?;
-    let classified_reads = write_matches(
+    let _classified_reads = write_matches(
         &mut out.matches,
-        &fmidx,
+        &grouping,
+        &tree,
+        &part,
         &read_ids,
         &out_aligns,
-        &read_assignments,
+        &assignments,
         &posteriors,
-        &props_refs,
     )?;
 
-    let final_props = refit_proportions_on_classified(
-        &csr,
-        &classified_reads,
-        &props,
-        if use_penalty { rho } else { UNPENALIZED_RHO },
-        if use_penalty {
-            omega
-        } else {
-            UNPENALIZED_OMEGA
-        },
-        num_iter,
-    );
-    write_props(&mut out.props, &fmidx, &final_props)?;
+    write_props(&mut out.props, &tree, &fit.node_pi)?;
+    write_nodes(&mut out.nodes, &tree, &part, &fit.node_pi)?;
     write_aligns(&mut out.aligns, &fmidx, &read_ids, &out_aligns)?;
 
-    Ok((em_data_likelihoods, log_str))
+    Ok((fit.ll_trace, log_str))
 }
 
 pub fn run() -> Result<()> {
@@ -335,13 +388,26 @@ pub fn run() -> Result<()> {
                     .default_value("1e-18")
                     .value_parser(clap::value_parser!(EMProb))
                     )
-                .arg(arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold")
+                .arg(arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold: relative change in the penalized log-likelihood")
                     .default_value("1e-6")
                     .value_parser(clap::value_parser!(EMProb))
                     )
                 .arg(arg!(-t --threads <THREADS>"Number of threads (defaults to 2; 0 uses maximum number of threads)")
                     .default_value("2")
                     .value_parser(clap::value_parser!(usize))
+                    )
+                .arg(arg!(--seq2taxid <MAP_FILE> "seqid2taxid.map (seqid<whitespace>taxid) assigning index sequences to taxa: every sequence becomes a leaf under its taxid, an internal vertex the EM can report; sequences without a taxid hang under the root")
+                    .required(false)
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(--nodes <NODES_FILE> "Taxonomy over the --seq2taxid taxids: NCBI nodes.dmp, or lines of `taxid parent [rank]`. The EM then runs hierarchically, pruning and reporting vertices of the tree")
+                    .required(false)
+                    .requires("seq2taxid")
+                    .value_parser(clap::value_parser!(String))
+                    )
+                .arg(arg!(--gamma <GAMMA> "Confidence level in (0.5, 1]: a read descends to the deepest vertex whose subtree posterior is at least GAMMA")
+                    .default_value("0.6")
+                    .value_parser(clap::value_parser!(EMProb))
                     )
         )
         .subcommand(
@@ -433,6 +499,12 @@ pub fn run() -> Result<()> {
             let use_penalty = *sub_m.get_one::<bool>("no-penalty").unwrap();
             let em_threshold = *sub_m.get_one::<EMProb>("em_threshold").expect("required");
             let threads = *sub_m.get_one::<usize>("threads").expect("required");
+            let seq2taxid = sub_m.get_one::<String>("seq2taxid").map(String::as_str);
+            let nodes = sub_m.get_one::<String>("nodes").map(String::as_str);
+            let gamma = *sub_m.get_one::<EMProb>("gamma").expect("defaulted");
+            if !(gamma > 0.5 && gamma <= 1.0) {
+                anyhow::bail!("--gamma must be in (0.5, 1], got {}", gamma);
+            }
 
             let now = Instant::now();
             let open = |ext: &str| -> Result<BufWriter<File>> {
@@ -445,6 +517,7 @@ pub fn run() -> Result<()> {
                 matches: open("matches")?,
                 posteriors: open("posteriors")?,
                 props: open("props")?,
+                nodes: open("nodes")?,
                 aligns: open("aligns")?,
             };
             run_query(
@@ -460,17 +533,20 @@ pub fn run() -> Result<()> {
                 em_threshold,
                 use_penalty,
                 threads,
+                seq2taxid,
+                nodes,
+                gamma,
                 None,
                 &mut tables,
             )
             .with_context(|| {
                 format!(
-                    "query run failed (output '{}.{{matches,posteriors,props,aligns}}')",
+                    "query run failed (output '{}.{{matches,posteriors,props,nodes,aligns}}')",
                     outfile
                 )
             })?;
             println!(
-                "Query written to {}.{{matches,posteriors,props,aligns}} ({:.2?})",
+                "Query written to {}.{{matches,posteriors,props,nodes,aligns}} ({:.2?})",
                 outfile,
                 now.elapsed()
             );
