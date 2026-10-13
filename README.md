@@ -79,8 +79,12 @@ premise query \
   --em_threshold <float>   \  # EM convergence threshold (default 1e-6)
   --no-penalty             \  # disable the L1 penalty (plain EM)
   -t <threads>             \  # default 2; 0 = all available cores
+  --seq2taxid <map>        \  # optional: one EM column per taxid instead of per sequence (see below)
   -o <output_prefix>
 ```
+
+`--seq2taxid` takes a kraken/centrifuge-style `seqid2taxid.map` (`seqid<whitespace>taxid`, extra columns ignored, blank and `#` lines skipped; a seqid is matched on its full FASTA header or its first token) and makes the *taxid* the unit the EM estimates. Alignment stays per sequence, P(read | taxid) = Σ P(read | sequence) over the taxid's sequences, and `.props`, `.posteriors` and `.matches` name taxids. Every taxid is an independent column.
+Sequences absent from the map remain their own column, named by their header, and a warning counts them.
 
 Outputs:
 | File | Contents |
@@ -143,7 +147,8 @@ premise/
 | `posterior` | Posterior probability of assignment |
 
 ### `.posteriors` (TSV)
-Full posterior probability matrix: one row per read, one column per reference.
+Full posterior probability matrix: one row per (read, reference), or per (read, taxid) with
+`--seq2taxid`.
 
 ### `.props` (TSV)
 | Column | Description |
