@@ -11,7 +11,7 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = "${src}/Cargo.lock";
     outputHashes = {
-      "haystackfm-0.5.0" = "sha256-yKWwEjemqm+/RCufg3aRVAgfpfg3vs+biDwdcKgwri4=";
+      "haystackfm-0.6.8" = "sha256-1knSJSCm1SK0LTkH3JiCMyZ5Jo25rjBGxl7YR26ryYQ=";
     };
   };
 
