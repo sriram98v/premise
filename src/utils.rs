@@ -53,6 +53,12 @@ impl std::ops::Deref for ReadIdx {
 
 pub struct MatchLikelihoods(pub(crate) HashMap<SeqId, HashMap<usize, LogProb>>);
 
+impl Default for MatchLikelihoods {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MatchLikelihoods {
     /// Create an empty `MatchLikelihoods` map.
     pub fn new() -> Self {
@@ -273,6 +279,12 @@ pub struct QueryProgress {
     pub em_iter_done: AtomicU64,
     pub em_iter_total: AtomicU64,
     pub started_ms: u64,
+}
+
+impl Default for QueryProgress {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl QueryProgress {

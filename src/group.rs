@@ -130,7 +130,7 @@ impl Grouping {
         self.taxids[col.index()]
     }
 
-    /// Header of the id column in `.posteriors` / `.matches`.
+    /// Header of the id column in `.matches` (and `LABEL_HEADER` of the report).
     pub fn label_header(&self) -> &'static str {
         if self.from_map {
             "TaxID"

@@ -1,6 +1,8 @@
-use crate::io::{build_index_from_bytes, QueryWriters};
+use crate::analyze::{run_analyze, AnalyzeOutputs, AnalyzeParams};
+use crate::io::build_index_from_bytes;
+use crate::report::export::props_tsv;
+use crate::run_alignment;
 use crate::utils::{EMProb, QueryProgress};
-use crate::{run_alignment, run_query};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::fs::File;
@@ -324,6 +326,7 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -445,17 +448,12 @@ fn handle_query_run(
 
     // Run query in background thread; main server loop can serve progress polls
     thread::spawn(move || {
-        let mut tables = QueryWriters {
-            matches: Vec::new(),
-            posteriors: Vec::new(),
-            props: Vec::new(),
-            nodes: Vec::new(),
-            aligns: Vec::new(),
-        };
-        let result = run_query(
-            &ref_path,
-            &r1_path,
-            &r2_path,
+        let mut report: Vec<u8> = Vec::new();
+        let mut matches: Vec<u8> = Vec::new();
+        let params = AnalyzeParams {
+            ref_file: &ref_path,
+            r1_file: &r1_path,
+            r2_file: &r2_path,
             mem_seed_length,
             eps_1,
             eps_2,
@@ -465,26 +463,34 @@ fn handle_query_run(
             em_threshold,
             use_penalty,
             threads,
-            None,
-            None,
-            0.6,
+            seq2taxid: None,
+            nodes: None,
+            init: crate::em::Init::Split,
+            index_hash: true,
+        };
+        let result = run_analyze(
+            &params,
             Some(progress.clone()),
-            &mut tables,
+            AnalyzeOutputs {
+                report: Some(&mut report),
+                matches: Some((&mut matches, 0.6)),
+            },
         );
 
         let json = match result {
-            Ok((em_likelihoods, log_str)) => {
+            Ok(summary) => {
                 progress.phase.store(3, Ordering::Relaxed);
-                let matches_tsv = String::from_utf8_lossy(&tables.matches);
-                let posteriors_tsv = String::from_utf8_lossy(&tables.posteriors);
-                let props_tsv = String::from_utf8_lossy(&tables.props);
-                let aligns_tsv = String::from_utf8_lossy(&tables.aligns);
+                let matches_tsv = String::from_utf8_lossy(&matches);
+                let report_text = String::from_utf8_lossy(&report);
+                let props_text = props_tsv(&summary.head);
                 let convergence_json = format!(
                     "[{}]",
-                    em_likelihoods
+                    summary
+                        .head
+                        .em_trace
                         .iter()
-                        .map(|v| if v.is_finite() {
-                            format!("{:.10e}", v)
+                        .map(|it| if it.ll.is_finite() {
+                            format!("{:.10e}", it.ll)
                         } else {
                             "null".to_string()
                         })
@@ -492,13 +498,12 @@ fn handle_query_run(
                         .join(",")
                 );
                 format!(
-                    r#"{{"ok":true,"matches":"{}","posteriors":"{}","props":"{}","aligns":"{}","convergence":{},"log":"{}"}}"#,
+                    r#"{{"ok":true,"matches":"{}","posteriors":"","props":"{}","aligns":"","report":"{}","convergence":{},"log":"{}"}}"#,
                     json_escape(&matches_tsv),
-                    json_escape(&posteriors_tsv),
-                    json_escape(&props_tsv),
-                    json_escape(&aligns_tsv),
+                    json_escape(&props_text),
+                    json_escape(&report_text),
                     convergence_json,
-                    json_escape(&log_str),
+                    json_escape(&summary.log),
                 )
             }
             Err(e) => {

@@ -625,7 +625,7 @@ let _qPage    = 0;
 let _qSortCol = null;
 let _qSortDir = 'asc';
 let _qFilterRx = [null, null];
-let _qMatchesUrl = null, _qPosteriorsUrl = null, _qPropsUrl = null, _qAlignsUrl = null;
+let _qMatchesUrl = null, _qReportUrl = null, _qPropsUrl = null;
 let _lastPropsTsv = null;
 
 function qTPerPage() {
@@ -1222,19 +1222,16 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     setQueryProgress(100, 'Done!');
 
     // Blob URLs
-    if (_qMatchesUrl)    URL.revokeObjectURL(_qMatchesUrl);
-    if (_qPosteriorsUrl) URL.revokeObjectURL(_qPosteriorsUrl);
-    if (_qPropsUrl)      URL.revokeObjectURL(_qPropsUrl);
-    if (_qAlignsUrl)     URL.revokeObjectURL(_qAlignsUrl);
-    _qMatchesUrl    = URL.createObjectURL(new Blob([data.matches],    { type: 'text/tab-separated-values' }));
-    _qPosteriorsUrl = URL.createObjectURL(new Blob([data.posteriors], { type: 'text/tab-separated-values' }));
-    _qPropsUrl      = URL.createObjectURL(new Blob([data.props],      { type: 'text/tab-separated-values' }));
-    _qAlignsUrl     = URL.createObjectURL(new Blob([data.aligns],     { type: 'text/tab-separated-values' }));
+    if (_qMatchesUrl) URL.revokeObjectURL(_qMatchesUrl);
+    if (_qReportUrl)  URL.revokeObjectURL(_qReportUrl);
+    if (_qPropsUrl)   URL.revokeObjectURL(_qPropsUrl);
+    _qMatchesUrl = URL.createObjectURL(new Blob([data.matches], { type: 'text/tab-separated-values' }));
+    _qReportUrl  = URL.createObjectURL(new Blob([data.report],  { type: 'text/plain' }));
+    _qPropsUrl   = URL.createObjectURL(new Blob([data.props],   { type: 'text/tab-separated-values' }));
 
-    document.getElementById('query-dl-matches').href    = _qMatchesUrl;
-    document.getElementById('query-dl-posteriors').href = _qPosteriorsUrl;
-    document.getElementById('query-dl-props').href      = _qPropsUrl;
-    document.getElementById('query-dl-aligns').href     = _qAlignsUrl;
+    document.getElementById('query-dl-matches').href = _qMatchesUrl;
+    document.getElementById('query-dl-report').href  = _qReportUrl;
+    document.getElementById('query-dl-props').href   = _qPropsUrl;
 
     const rowCount = data.matches.trim().split('\n').length - 1;
     document.getElementById('query-stats').textContent =

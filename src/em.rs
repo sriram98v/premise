@@ -4,16 +4,21 @@
 //! `A = (a_is)`. The EM parameters live on a [`TaxTree`] whose leaves own the
 //! sequences ([`Partition`]).
 
+#[cfg(test)]
+use crate::tree::assign_read;
+#[cfg(test)]
+use crate::tree::NO_NODE;
 use crate::tree::{
-    assign_read, contig_pi, init_conditionals, leaf_marginals, m_step, penalty, prune_and_collapse,
-    subtree_counts, Partition, TaxTree, NO_NODE,
+    contig_pi, init_conditionals, init_uniform, leaf_marginals, m_step, penalty,
+    prune_and_collapse, subtree_counts, Partition, TaxTree,
 };
 use crate::utils::{EMProb, QueryProgress, ReadAlignments, ReadIdx};
 use crate::SeqId;
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use phylo::node::NodeID;
+use phylo::prelude::*;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -25,7 +30,9 @@ pub struct CsrLikelihood {
     ref_compact: HashMap<SeqId, u32>,
     /// CSR row → original [`ReadIdx`].
     reads: Vec<ReadIdx>,
-    /// `row_of[read_idx]` = the row holding that read, or [`NO_ROW`].
+    /// `row_of[read_idx]` = the row holding that read, or [`NO_ROW`] (read by the
+    /// test-only [`Posteriors`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     row_of: Vec<u32>,
     /// `row_ptr[r]..row_ptr[r + 1]` bounds row `r`'s entries in `col`/`lik`.
     row_ptr: Vec<usize>,
@@ -46,6 +53,10 @@ pub struct CsrLikelihood {
 /// Marker in [`CsrLikelihood::row_of`] for reads without a row.
 const NO_ROW: u32 = u32::MAX;
 
+/// Largest read → row table [`CsrBuilder::new`] allocates up front; a file-announced
+/// read count beyond it grows the table as rows arrive.
+const MAX_ROW_PREALLOC: usize = 1 << 16;
+
 /// Scale one read's log-likelihoods by their maximum: `(exp(ll − max), max)`. Every
 /// responsibility is unchanged and nothing underflows to 0.
 fn scaled_row(lls: &[EMProb]) -> (Vec<EMProb>, EMProb) {
@@ -53,56 +64,115 @@ fn scaled_row(lls: &[EMProb]) -> (Vec<EMProb>, EMProb) {
     (lls.iter().map(|&l| (l - m).exp()).collect(), m)
 }
 
-impl CsrLikelihood {
-    /// Build the matrix from the surviving alignments: one column per sequence with at
-    /// least one finite log-likelihood, one row per read with such an alignment.
-    pub fn build(aligns: &ReadAlignments<'_>) -> Self {
-        let mut reads = Vec::with_capacity(aligns.len());
-        let mut row_of = vec![NO_ROW; aligns.len()];
-        let mut row_ptr = Vec::with_capacity(aligns.len() + 1);
-        let mut cols_seq: Vec<SeqId> = Vec::with_capacity(aligns.nnz());
-        let mut lik = Vec::with_capacity(aligns.nnz());
-        let mut log_scale = Vec::with_capacity(aligns.len());
-        let mut lls: Vec<EMProb> = Vec::new();
-        row_ptr.push(0);
-        for (read_idx, _, refs, als) in aligns.iter() {
-            lls.clear();
-            for (ref_idx, align) in refs.iter().zip(als) {
-                let ll = *align.get_full_match_ll() as EMProb;
-                if ll.is_finite() {
-                    cols_seq.push(*ref_idx);
-                    lls.push(ll);
-                }
-            }
-            if lls.is_empty() {
-                continue;
-            }
-            let (scaled, m) = scaled_row(&lls);
-            lik.extend(scaled);
-            log_scale.push(m);
-            row_of[read_idx.0] = reads.len() as u32;
-            reads.push(read_idx);
-            row_ptr.push(cols_seq.len());
+/// Assembles a [`CsrLikelihood`] one read at a time from log-likelihoods, whether they
+/// come from the aligner or from a report's ALIGNMENT_LIKELIHOODS.
+pub struct CsrBuilder {
+    reads: Vec<ReadIdx>,
+    row_of: Vec<u32>,
+    row_ptr: Vec<usize>,
+    cols_seq: Vec<SeqId>,
+    seen: HashSet<SeqId>,
+    lik: Vec<EMProb>,
+    log_scale: Vec<EMProb>,
+    lls: Vec<EMProb>,
+}
+
+impl CsrBuilder {
+    /// `n_reads` is a hint for the read → row table: an untrusted count (a report's
+    /// `NREADS`) is only preallocated up to a cap, and a larger [`ReadIdx`] grows it.
+    pub fn new(n_reads: usize) -> Self {
+        Self {
+            reads: Vec::new(),
+            row_of: vec![NO_ROW; n_reads.min(MAX_ROW_PREALLOC)],
+            row_ptr: vec![0],
+            cols_seq: Vec::new(),
+            seen: HashSet::new(),
+            lik: Vec::new(),
+            log_scale: Vec::new(),
+            lls: Vec::new(),
         }
-        let mut refs = cols_seq.clone();
+    }
+
+    /// Reserve for the aligner's known sizes.
+    fn with_capacity(n_reads: usize, nnz: usize) -> Self {
+        let mut b = Self::new(0);
+        b.row_of = vec![NO_ROW; n_reads];
+        b.reads.reserve(n_reads);
+        b.row_ptr.reserve(n_reads);
+        b.cols_seq.reserve(nnz);
+        b.lik.reserve(nnz);
+        b.log_scale.reserve(n_reads);
+        b
+    }
+
+    /// One read's `(sequence, log-likelihood)` entries in ascending sequence order;
+    /// reads arrive in ascending [`ReadIdx`] order. Non-finite entries are dropped; a
+    /// read left without any gets no row.
+    pub fn push(&mut self, read_idx: ReadIdx, entries: impl IntoIterator<Item = (SeqId, EMProb)>) {
+        debug_assert!(
+            self.reads.last().is_none_or(|last| last.0 < read_idx.0),
+            "reads must be pushed in ascending order"
+        );
+        self.lls.clear();
+        for (seq, ll) in entries {
+            if ll.is_finite() {
+                self.cols_seq.push(seq);
+                self.seen.insert(seq);
+                self.lls.push(ll);
+            }
+        }
+        if self.lls.is_empty() {
+            return;
+        }
+        let (scaled, m) = scaled_row(&self.lls);
+        self.lik.extend(scaled);
+        self.log_scale.push(m);
+        if read_idx.0 >= self.row_of.len() {
+            self.row_of.resize(read_idx.0 + 1, NO_ROW);
+        }
+        self.row_of[read_idx.0] =
+            u32::try_from(self.reads.len()).expect("more than u32::MAX reads with alignments");
+        self.reads.push(read_idx);
+        self.row_ptr.push(self.cols_seq.len());
+    }
+
+    /// Columns are the sorted, deduplicated sequences seen.
+    pub fn finish(self) -> CsrLikelihood {
+        let mut refs: Vec<SeqId> = self.seen.into_iter().collect();
         refs.sort_unstable_by_key(|r| r.0);
-        refs.dedup();
         let ref_compact: HashMap<SeqId, u32> = refs
             .iter()
             .enumerate()
             .map(|(i, r)| (*r, i as u32))
             .collect();
-        let col = cols_seq.iter().map(|r| ref_compact[r]).collect();
-        Self::from_rows(
+        let col = self.cols_seq.iter().map(|r| ref_compact[r]).collect();
+        CsrLikelihood::from_rows(
             refs,
             ref_compact,
-            reads,
-            row_of,
-            row_ptr,
+            self.reads,
+            self.row_of,
+            self.row_ptr,
             col,
-            lik,
-            log_scale,
+            self.lik,
+            self.log_scale,
         )
+    }
+}
+
+impl CsrLikelihood {
+    /// Build the matrix from the surviving alignments: one column per sequence with at
+    /// least one finite log-likelihood, one row per read with such an alignment.
+    pub fn build(aligns: &ReadAlignments<'_>) -> Self {
+        let mut b = CsrBuilder::with_capacity(aligns.len(), aligns.nnz());
+        for (read_idx, _, refs, als) in aligns.iter() {
+            b.push(
+                read_idx,
+                refs.iter()
+                    .zip(als)
+                    .map(|(r, a)| (*r, *a.get_full_match_ll() as EMProb)),
+            );
+        }
+        b.finish()
     }
 
     /// Assemble the CSC copy from the CSR parts.
@@ -164,7 +234,13 @@ impl CsrLikelihood {
         &self.refs
     }
 
+    /// The column of a sequence, if it has one.
+    pub fn col_of(&self, seq: SeqId) -> Option<usize> {
+        self.ref_compact.get(&seq).map(|&c| c as usize)
+    }
+
     /// Position of the `(read, sequence)` entry
+    #[cfg(test)]
     fn entry(&self, read_idx: ReadIdx, ref_idx: SeqId) -> Option<usize> {
         let range = self.row(read_idx)?;
         let c = *self.ref_compact.get(&ref_idx)?;
@@ -237,6 +313,7 @@ impl CsrLikelihood {
     }
 
     /// The row of a read, if it has one.
+    #[cfg(test)]
     fn row(&self, read_idx: ReadIdx) -> Option<std::ops::Range<usize>> {
         let row = *self.row_of.get(read_idx.0)?;
         if row == NO_ROW {
@@ -247,6 +324,7 @@ impl CsrLikelihood {
 }
 
 /// Posteriors under the final proportions
+#[cfg(test)]
 pub struct Posteriors<'m> {
     pub(crate) matrix: &'m CsrLikelihood,
     /// `π̃_s` per column.
@@ -255,6 +333,7 @@ pub struct Posteriors<'m> {
     pub(crate) d: Vec<EMProb>,
 }
 
+#[cfg(test)]
 impl Posteriors<'_> {
     fn weight(&self, k: usize, row: u32) -> EMProb {
         let d = self.d[row as usize];
@@ -309,8 +388,37 @@ impl Posteriors<'_> {
     }
 }
 
+/// How the conditionals start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Init {
+    /// Each read's best-scoring sequences share one count (ties split evenly); the counts
+    /// summed up the tree give `q_{c|v} = N_c / N_v`.
+    #[default]
+    Split,
+    /// `q_{c|v} = 1 / |ch(v)|` at every internal vertex.
+    Uniform,
+}
+
+impl Init {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "split" => Some(Self::Split),
+            "uniform" => Some(Self::Uniform),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Uniform => "uniform",
+        }
+    }
+}
+
 /// Settings of [`estimate_proportions`].
 pub struct EmParams {
+    pub init: Init,
     pub num_iter: usize,
     /// Penalty weight; also the minimum expected reads a vertex needs to survive. 0 = plain EM.
     pub rho: EMProb,
@@ -325,10 +433,11 @@ pub struct EmFit {
     pub node_pi: Vec<EMProb>,
     /// `π̃_s` per column under the final tree.
     pub pi_tilde: Vec<EMProb>,
-    /// `D_i` per row under the final proportions.
-    pub d: Vec<EMProb>,
     /// Penalized log-likelihood after each iteration (first entry: the initial state).
     pub ll_trace: Vec<EMProb>,
+    /// `(leaf, π_ℓ)` over the leaves of the tree at each iteration, aligned with
+    /// `ll_trace`: entry 0 is the initial state, the last the final proportions.
+    pub pi_trace: Vec<Vec<(NodeID, EMProb)>>,
     pub pruned: usize,
     pub collapsed: usize,
     /// Every child of the root fell below `ρ` at some iteration: the sample is one tip.
@@ -347,14 +456,17 @@ pub fn estimate_proportions(
         return EmFit {
             node_pi: Vec::new(),
             pi_tilde: Vec::new(),
-            d: Vec::new(),
             ll_trace: Vec::new(),
+            pi_trace: Vec::new(),
             pruned: 0,
             collapsed: 0,
             root_collapsed: false,
         };
     }
-    init_conditionals(tree, part, &csr.initial_pi());
+    match p.init {
+        Init::Split => init_conditionals(tree, part, &csr.initial_pi()),
+        Init::Uniform => init_uniform(tree),
+    }
 
     if let Some(ref pr) = progress {
         pr.phase.store(2, Ordering::Relaxed);
@@ -369,10 +481,13 @@ pub fn estimate_proportions(
         ll - penalty(tree, p.rho, p.omega)
     };
     let mut ll_trace = vec![penalized(csr, tree, part)];
+    let mut pi_trace: Vec<Vec<(NodeID, EMProb)>> = Vec::new();
     let (mut n_pruned, mut n_collapsed, mut root_collapsed) = (0, 0, false);
 
     for i in 0..p.num_iter {
-        let pi = contig_pi(part, &leaf_marginals(tree));
+        let node_pi = leaf_marginals(tree);
+        pi_trace.push(leaf_proportions(tree, &node_pi));
+        let pi = contig_pi(part, &node_pi);
         let (ll, m, _) = csr.e_step(&pi);
         subtree_counts(tree, part, &m);
         let report = if p.rho > 0.0 {
@@ -402,21 +517,35 @@ pub fn estimate_proportions(
     pb.finish_with_message(format!("Final penalized LL: {}", ll_trace.last().unwrap()));
 
     let node_pi = leaf_marginals(tree);
+    pi_trace.push(leaf_proportions(tree, &node_pi));
     let pi_tilde = contig_pi(part, &node_pi);
-    let d = csr.row_normalizers(&pi_tilde);
     EmFit {
         node_pi,
         pi_tilde,
-        d,
         ll_trace,
+        pi_trace,
         pruned: n_pruned,
         collapsed: n_collapsed,
         root_collapsed,
     }
 }
 
+/// `(leaf, π_ℓ)` for every leaf with mass, by node id.
+fn leaf_proportions(tree: &TaxTree, node_pi: &[EMProb]) -> Vec<(NodeID, EMProb)> {
+    let mut rows: Vec<(NodeID, EMProb)> = tree
+        .get_leaf_ids()
+        .filter_map(|l| {
+            let p = node_pi.get(l).copied().unwrap_or(0.0);
+            (p > 0.0).then_some((l, p))
+        })
+        .collect();
+    rows.sort_unstable_by_key(|r| r.0);
+    rows
+}
+
 /// Assign every read with a row to the deepest vertex whose subtree posterior is at least
 /// `gamma`
+#[cfg(test)]
 pub fn assign_reads(
     csr: &CsrLikelihood,
     tree: &TaxTree,
@@ -440,7 +569,6 @@ pub fn assign_reads(
 mod tests {
     use super::*;
     use crate::tree::{label, TaxNode};
-    use phylo::prelude::*;
 
     /// A matrix from dense rows of linear likelihoods (0.0 = no entry); sequence j is
     /// `SeqId(j)`. Rows are stored unscaled (`log_scale` 0).
@@ -538,6 +666,7 @@ mod tests {
 
     fn params(rho: EMProb) -> EmParams {
         EmParams {
+            init: Init::Split,
             num_iter: 50,
             rho,
             omega: 1e-10,
@@ -562,7 +691,7 @@ mod tests {
         Posteriors {
             matrix: m,
             pi: fit.pi_tilde.clone(),
-            d: fit.d.clone(),
+            d: m.row_normalizers(&fit.pi_tilde),
         }
     }
 
@@ -676,6 +805,152 @@ mod tests {
     }
 
     #[test]
+    fn pi_trace_tracks_leaves_per_iteration() {
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0, 0.0][..], 300));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0, 0.0][..], 300));
+        rows.extend(std::iter::repeat_n(&[0.0, 0.4, 0.6][..], 100));
+        let m = csr(&rows);
+        let (mut t, mut part) = star(3);
+        let fit = estimate_proportions(&m, &mut t, &mut part, &params(150.0), None);
+
+        assert_eq!(fit.pi_trace.len(), fit.ll_trace.len());
+        assert!(fit.pi_trace.len() >= 2);
+        // Entry 0: every initial leaf with mass; the last: the final leaves == node_pi.
+        let first: Vec<NodeID> = fit.pi_trace[0].iter().map(|r| r.0).collect();
+        assert_eq!(first, vec![1, 2, 3]);
+        let last = fit.pi_trace.last().unwrap();
+        let final_leaves: Vec<NodeID> = {
+            let mut l: Vec<NodeID> = t.get_leaf_ids().collect();
+            l.sort_unstable();
+            l
+        };
+        assert_eq!(last.iter().map(|r| r.0).collect::<Vec<_>>(), final_leaves);
+        for &(leaf, p) in last {
+            assert_eq!(p, fit.node_pi[leaf]);
+        }
+        for entry in &fit.pi_trace {
+            let total: EMProb = entry.iter().map(|r| r.1).sum();
+            assert!((total - 1.0).abs() < 1e-9, "{entry:?}");
+            assert!(entry.windows(2).all(|w| w[0].0 < w[1].0));
+        }
+        // Pruning only ever shrinks the leaf set.
+        for w in fit.pi_trace.windows(2) {
+            assert!(w[1].len() <= w[0].len());
+        }
+        assert!(last.len() < first.len());
+    }
+
+    /// The streaming `.matches` writer, fed posteriors recomputed from the stored
+    /// log-likelihoods, must make exactly the decision `assign_reads` makes from the
+    /// EM's own posteriors: same vertex, same `h` to the bit.
+    #[test]
+    fn matches_writer_agrees_with_assign_reads() {
+        use crate::report::posterior::row_posteriors;
+        use crate::report::tables::{Candidate, MatchesWriter};
+        use crate::report::{AlignRow, ReportTree};
+        use crate::tree::{is_synthetic_root, label};
+
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0, 0.0][..], 40));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0, 0.0][..], 30));
+        rows.extend(std::iter::repeat_n(&[0.6, 0.4, 0.0][..], 20));
+        rows.extend(std::iter::repeat_n(&[0.0, 0.5, 0.5][..], 20));
+        rows.extend(std::iter::repeat_n(&[0.3, 0.3, 0.4][..], 10));
+        rows.extend(std::iter::repeat_n(&[0.5, 0.5, 0.0][..], 10));
+        // Scaled like `build`, so the EM's internal posteriors use the same arithmetic.
+        let logs: Vec<Vec<Option<EMProb>>> = rows
+            .iter()
+            .map(|r| r.iter().map(|&l| (l != 0.0).then(|| l.ln())).collect())
+            .collect();
+        let m = csr_log(&logs);
+        let (mut t, mut part) = two_genera();
+        let stored = t.clone();
+        let tips: Vec<NodeID> = (0..part.n_cols()).map(|c| part.leaf_of(c)).collect();
+        let fit = estimate_proportions(&m, &mut t, &mut part, &params(12.0), None);
+        let post = posteriors(&m, &fit);
+        let report_tree = ReportTree::from_fit(&stored, &tips, &t, &part, &fit);
+        let pi_tilde = |s: SeqId| fit.pi_tilde[s.index()];
+        for gamma in [0.51, 0.6, 0.9, 1.0] {
+            let oracle = assign_reads(&m, &t, &part, &post, gamma);
+            let mut w =
+                MatchesWriter::new(Vec::new(), "RefID", report_tree.to_tax_tree(), gamma).unwrap();
+            let mut posts = Vec::new();
+            for (r, row) in logs.iter().enumerate() {
+                let aligns: Vec<AlignRow> = row
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(s, l)| {
+                        l.map(|loglik| AlignRow {
+                            seq: SeqId(s as u32),
+                            loglik,
+                            pos: (r, s),
+                        })
+                    })
+                    .collect();
+                row_posteriors(pi_tilde, &aligns, &mut posts);
+                let cands: Vec<Candidate> = aligns
+                    .iter()
+                    .zip(&posts)
+                    .filter(|(a, _)| post.leaf_of(a.seq, &part) != NO_NODE)
+                    .map(|(a, &posterior)| Candidate {
+                        leaf: post.leaf_of(a.seq, &part),
+                        posterior,
+                        loglik: a.loglik,
+                        pos: a.pos,
+                    })
+                    .collect();
+                // The recomputed posterior is the EM's, bit for bit.
+                for (a, &posterior) in aligns.iter().zip(&posts) {
+                    assert_eq!(
+                        posterior,
+                        post.get(ReadIdx(r), a.seq),
+                        "read {r} seq {:?}",
+                        a.seq
+                    );
+                }
+                w.push(&format!("r{r}"), &cands).unwrap();
+            }
+            let out = String::from_utf8(w.finish().unwrap()).unwrap();
+            for (r, line) in out.lines().skip(1).enumerate() {
+                let cols: Vec<&str> = line.split('\t').collect();
+                match oracle.get(&ReadIdx(r)) {
+                    Some(&(v, h)) if !is_synthetic_root(&t, v) => {
+                        assert_eq!(cols[1], label(&t, v), "gamma {gamma} read {r}: {line}");
+                        assert_eq!(cols[2], format!("{:.5e}", h), "gamma {gamma} read {r}");
+                    }
+                    _ => assert_eq!(cols[1], "unclassified", "gamma {gamma} read {r}: {line}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn csr_builder_skips_empty_reads_and_non_finite_entries() {
+        // A huge announced count is not preallocated; the table grows with the rows.
+        let b = CsrBuilder::new(usize::MAX / 2);
+        assert_eq!(b.row_of.len(), MAX_ROW_PREALLOC);
+        let mut b2 = CsrBuilder::new(2);
+        b2.push(ReadIdx(5), [(SeqId(1), -1.0)]);
+        assert_eq!(b2.finish().row_of.len(), 6);
+        let mut b = CsrBuilder::new(2);
+        b.push(ReadIdx(0), [(SeqId(7), -2.0), (SeqId(9), -1.0)]);
+        b.push(ReadIdx(1), [(SeqId(9), EMProb::NEG_INFINITY)]);
+        b.push(ReadIdx(3), [(SeqId(2), EMProb::NAN), (SeqId(7), -5.0)]);
+        let m = b.finish();
+        assert_eq!(m.refs(), &[SeqId(7), SeqId(9)]);
+        assert_eq!(m.n_reads(), 2);
+        assert_eq!(m.reads, vec![ReadIdx(0), ReadIdx(3)]);
+        assert_eq!(m.row_of, vec![0, NO_ROW, NO_ROW, 1]);
+        assert_eq!(m.row_ptr, vec![0, 2, 3]);
+        assert_eq!(m.col, vec![0, 1, 0]);
+        assert_eq!(m.log_scale, vec![-1.0, -5.0]);
+        assert_eq!(m.lik, vec![(-1.0f64).exp(), 1.0, 1.0]);
+        assert_eq!(m.col_ptr, vec![0, 2, 3]);
+        assert_eq!(m.row_idx, vec![0, 1, 0]);
+    }
+
+    #[test]
     fn rho_zero_star_em_matches_count_ratio() {
         let mut rows: Vec<&[EMProb]> = Vec::new();
         rows.extend(std::iter::repeat_n(&[1.0, 0.0][..], 30));
@@ -752,6 +1027,24 @@ mod tests {
         assert_eq!(hits, vec![(1, 1.0)]);
         let asg = assign_reads(&m, &t, &part, &post, 0.6);
         assert_eq!(asg[&ReadIdx(0)], (1, 1.0));
+    }
+
+    #[test]
+    fn uniform_init_reaches_the_same_plain_fit() {
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0][..], 30));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0][..], 10));
+        let m = csr(&rows);
+        let (mut t, mut part) = star(2);
+        let p = EmParams {
+            init: Init::Uniform,
+            ..params(0.0)
+        };
+        let fit = estimate_proportions(&m, &mut t, &mut part, &p, None);
+        let props = leaf_props(&part, &fit.node_pi);
+        assert!((props[0] - 0.75).abs() < 1e-9, "{props:?}");
+        assert_eq!(Init::parse("uniform"), Some(Init::Uniform));
+        assert_eq!(Init::parse("nope"), None);
     }
 
     #[test]

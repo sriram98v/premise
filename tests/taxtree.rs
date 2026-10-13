@@ -55,6 +55,7 @@ struct Opts<'a> {
     gamma: Option<&'a str>,
     /// `Some(rho)` runs with the penalty at that strength; `None` passes `--no-penalty`.
     rho: Option<&'a str>,
+    init: Option<&'a str>,
 }
 
 fn query_args(index: &Path, out: &Path, opts: &Opts<'_>) -> Vec<String> {
@@ -92,9 +93,12 @@ fn query_args(index: &Path, out: &Path, opts: &Opts<'_>) -> Vec<String> {
         args.push("--nodes".to_string());
         args.push(n.to_str().unwrap().to_string());
     }
-    if let Some(g) = opts.gamma {
-        args.push("--gamma".to_string());
-        args.push(g.to_string());
+    // `query` writes `.matches` only with a gamma; the tests read it.
+    args.push("--gamma".to_string());
+    args.push(opts.gamma.unwrap_or("0.6").to_string());
+    if let Some(i) = opts.init {
+        args.push("--init".to_string());
+        args.push(i.to_string());
     }
     args
 }
@@ -110,11 +114,107 @@ fn query(
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(&argv);
     ok(&output);
+    export_tables(&out);
     (out, output)
 }
 
 fn read(prefix: &Path, ext: &str) -> String {
     fs::read_to_string(format!("{}.{}", prefix.display(), ext)).expect("output file")
+}
+
+/// Regenerate the legacy `.props` / `.nodes` tables from the report.
+fn export_tables(prefix: &Path) {
+    let p = prefix.display();
+    ok(&run(&[
+        "analyze",
+        "-r",
+        &format!("{p}.report"),
+        "-o",
+        &p.to_string(),
+        "--props",
+        "--nodes",
+    ]));
+}
+
+/// One block of the report, from `BEGIN <name>;` to its `END;`.
+fn block(prefix: &Path, name: &str) -> String {
+    let report = read(prefix, "report");
+    let start = report
+        .find(&format!("BEGIN {name};"))
+        .unwrap_or_else(|| panic!("no {name} block"));
+    let end = report[start..].find("END;").expect("block end") + start;
+    report[start..end].to_string()
+}
+
+/// The ALIGNMENT_LIKELIHOODS block without the two position lines of every read (tied
+/// placements are not deterministic between runs).
+fn aligns_no_pos(prefix: &Path) -> String {
+    let block = block(prefix, "ALIGNMENT_LIKELIHOODS");
+    let mut out = Vec::new();
+    let mut lines = block.lines().skip_while(|l| !l.contains("MATRIX")).skip(1);
+    while let Some(hdr) = lines.next() {
+        out.push(hdr.trim().to_string());
+        if hdr.trim() == ";" {
+            break;
+        }
+        let n: usize = hdr
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if n > 0 {
+            out.push(lines.next().unwrap().trim().to_string());
+            out.push(lines.next().unwrap().trim().to_string());
+            lines.next();
+            lines.next();
+        }
+    }
+    out.join("\n")
+}
+
+/// Split a NEXUS row into tokens, keeping `'quoted labels'` together.
+fn nexus_tokens(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    for ch in line.chars() {
+        match ch {
+            '\'' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Status of every vertex of the report's NODES block, by label (labels come from
+/// TAXLABELS, in NODES order).
+fn vertex_status(prefix: &Path) -> HashMap<String, String> {
+    let labels: Vec<String> = block(prefix, "TAXA")
+        .lines()
+        .skip_while(|l| !l.contains("TAXLABELS"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .flat_map(nexus_tokens)
+        .collect();
+    let statuses: Vec<String> = block(prefix, "NODES")
+        .lines()
+        .skip_while(|l| !l.contains("MATRIX"))
+        .skip(1)
+        .filter_map(|l| {
+            let c = nexus_tokens(l);
+            (c.len() == 8).then(|| c[3].clone())
+        })
+        .collect();
+    assert_eq!(labels.len(), statuses.len());
+    labels.into_iter().zip(statuses).collect()
 }
 
 /// `.nodes` rows keyed by TaxID: (Parent, Rank, Contigs, Count, Proportion, Conditional).
@@ -153,16 +253,6 @@ fn props(prefix: &Path) -> HashMap<String, f64> {
 /// Assigned ids of `.matches`, excluding unclassified reads.
 fn matches(prefix: &Path) -> Vec<String> {
     read(prefix, "matches")
-        .lines()
-        .skip(1)
-        .filter_map(|l| l.split('\t').nth(1))
-        .filter(|r| *r != "unclassified")
-        .map(str::to_string)
-        .collect()
-}
-
-fn posterior_labels(prefix: &Path) -> Vec<String> {
-    read(prefix, "posteriors")
         .lines()
         .skip(1)
         .filter_map(|l| l.split('\t').nth(1))
@@ -312,9 +402,9 @@ fn sibling_species_share_genus() {
     for (k, v) in &pf {
         assert!((pt[k] - v).abs() < 1e-6, "{k}: {pt:?} vs {pf:?}");
     }
-    assert_eq!(read(&flat_out, "aligns"), read(&tree_out, "aligns"));
+    assert_eq!(aligns_no_pos(&flat_out), aligns_no_pos(&tree_out));
     assert_eq!(matches(&flat_out), matches(&tree_out));
-    assert!(read(&tree_out, "posteriors").starts_with("ReadID\tTaxID\tPosterior"));
+    assert!(block(&tree_out, "PREMISE").contains("LABEL_HEADER TaxID;"));
 }
 
 #[test]
@@ -351,9 +441,10 @@ fn sequences_of_an_internal_taxid_are_its_own_tips() {
             "{id}"
         );
     }
-    for id in posterior_labels(&out) {
-        assert!(id == "ref_A" || id == "ref_B", "{id}");
-    }
+    let status = vertex_status(&out);
+    assert_eq!(status["ref_A"], "active");
+    assert_eq!(status["ref_B"], "active");
+    assert_eq!(status.len(), 6, "{status:?}");
 }
 
 #[test]
@@ -482,7 +573,47 @@ fn collapse_reports_the_taxid_over_its_sequences() {
     let ids = matches(&out);
     assert!(!ids.is_empty());
     assert!(ids.iter().all(|i| i == "11"), "{ids:?}");
-    assert!(posterior_labels(&out).iter().all(|i| i == "11"));
+    let status = vertex_status(&out);
+    assert_eq!(status["11"], "collapsed");
+    assert_eq!(status["ref_A"], "pooled");
+    assert_eq!(status["ref_B"], "pooled");
+}
+
+#[test]
+fn uniform_init_matches_split_init_without_penalty() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = build_index(tmp.path());
+    let map = tmp.path().join("sib.map");
+    fs::write(&map, "ref_A\t11\nref_B\t12\n").unwrap();
+    let nodes = nodes_fixture();
+    let split = Opts {
+        map: Some(&map),
+        nodes: Some(&nodes),
+        ..Default::default()
+    };
+    let (s_out, s_output) = query(tmp.path(), &index, "split", &split);
+    assert!(String::from_utf8_lossy(&s_output.stdout).contains("Init: split"));
+    let unif = Opts {
+        map: Some(&map),
+        nodes: Some(&nodes),
+        init: Some("uniform"),
+        ..Default::default()
+    };
+    let (u_out, u_output) = query(tmp.path(), &index, "unif", &unif);
+    assert!(String::from_utf8_lossy(&u_output.stdout).contains("Init: uniform"));
+    let (ps, pu) = (props(&s_out), props(&u_out));
+    assert_eq!(ps.len(), pu.len());
+    for (k, v) in &ps {
+        assert!((pu[k] - v).abs() < 1e-4, "{k}: {pu:?} vs {ps:?}");
+    }
+    assert_eq!(matches(&s_out), matches(&u_out));
+    let bad = Opts {
+        init: Some("random"),
+        ..Default::default()
+    };
+    let args = query_args(&index, &tmp.path().join("bad"), &bad);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    assert!(!run(&argv).status.success());
 }
 
 #[test]

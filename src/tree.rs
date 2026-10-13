@@ -36,7 +36,7 @@ pub type TaxNode = Node<String, EMProb, EMProb>;
 /// Column marker for a sequence whose leaf was pruned.
 pub const NO_NODE: NodeID = usize::MAX;
 /// Id of the root (never deleted, never renumbered).
-const ROOT: NodeID = 0;
+pub(crate) const ROOT: NodeID = 0;
 const ROOT_RANK: &str = "root";
 /// Rank annotation of an index sequence at a tip.
 pub const SEQ_RANK: &str = "sequence";
@@ -130,7 +130,7 @@ impl TaxNodes {
     }
 }
 
-fn new_node(id: NodeID, label: &str, rank: &str) -> TaxNode {
+pub(crate) fn new_node(id: NodeID, label: &str, rank: &str) -> TaxNode {
     let mut node = TaxNode::new(id);
     node.set_taxa(Some(label.to_string()));
     node.set_annotation(Some(rank.into()));
@@ -139,7 +139,7 @@ fn new_node(id: NodeID, label: &str, rank: &str) -> TaxNode {
     node
 }
 
-fn new_tree() -> TaxTree {
+pub(crate) fn new_tree() -> TaxTree {
     let mut tree = TaxTree::new(ROOT);
     tree.set_node(new_node(ROOT, "root", ROOT_RANK));
     tree
@@ -200,7 +200,7 @@ fn set_count(tree: &mut TaxTree, id: NodeID, n: EMProb) {
     }
 }
 
-fn children(tree: &TaxTree, id: NodeID) -> Vec<NodeID> {
+pub(crate) fn children(tree: &TaxTree, id: NodeID) -> Vec<NodeID> {
     tree.get_node(id)
         .map(|n| n.get_children().to_vec())
         .unwrap_or_default()
@@ -221,7 +221,7 @@ fn postorder(tree: &TaxTree, start: NodeID) -> Vec<NodeID> {
 }
 
 /// Length of a per-node array indexed by id.
-fn arena_len(tree: &TaxTree) -> usize {
+pub(crate) fn arena_len(tree: &TaxTree) -> usize {
     tree.get_node_ids().max().map_or(0, |m| m + 1)
 }
 
@@ -453,6 +453,19 @@ fn conditionals_from_counts(tree: &mut TaxTree) {
 pub fn init_conditionals(tree: &mut TaxTree, part: &Partition, pi_contig: &[EMProb]) {
     subtree_counts(tree, part, pi_contig);
     conditionals_from_counts(tree);
+}
+
+/// Uniform initial conditionals: `q_{c|v} = 1 / |ch(v)|` at every internal vertex.
+pub fn init_uniform(tree: &mut TaxTree) {
+    let root = tree.get_root_id();
+    set_weight(tree, root, 1.0);
+    for v in preorder(tree) {
+        let ch = children(tree, v);
+        let q = 1.0 / ch.len() as EMProb;
+        for c in ch {
+            set_weight(tree, c, q);
+        }
+    }
 }
 
 /// `π_v` for every node id (product of conditionals along the root path; pruned ids 0).
@@ -950,6 +963,20 @@ mod tests {
         assert_eq!(pi[part.leaf_of(0)], 0.125);
         let cp = contig_pi(&part, &pi);
         assert_eq!(cp, vec![0.125, 0.125, 0.75]);
+    }
+
+    #[test]
+    fn uniform_init_splits_every_vertex_evenly() {
+        let g = grouping(&[("s0", 11), ("s1", 11), ("s2", 12)]);
+        let rt = reference_tree(&g, Some(&nodes())).unwrap();
+        let (mut t, part) = contract_to_observed(&rt, &seqs(&[0, 1, 2])).unwrap();
+        init_uniform(&mut t);
+        let pi = leaf_marginals(&t);
+        assert_eq!(pi[by_label(&t, "10")], 1.0, "unary chain above the genus");
+        assert_eq!(pi[by_label(&t, "11")], 0.5);
+        assert_eq!(pi[part.leaf_of(0)], 0.25);
+        assert_eq!(pi[part.leaf_of(1)], 0.25);
+        assert_eq!(pi[part.leaf_of(2)], 0.5);
     }
 
     #[test]

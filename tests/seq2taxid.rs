@@ -58,6 +58,8 @@ fn query_args(index: &Path, out: &Path, map: Option<&Path>) -> Vec<String> {
         "1",
         "-i",
         "5",
+        "--gamma",
+        "0.6",
         "--no-penalty",
     ]
     .iter()
@@ -83,11 +85,62 @@ fn query(
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(&argv);
     ok(&output);
+    export_tables(&out);
     (out, output)
 }
 
 fn read(prefix: &Path, ext: &str) -> String {
     fs::read_to_string(format!("{}.{}", prefix.display(), ext)).expect("output file")
+}
+
+/// Regenerate the legacy `.props` / `.nodes` tables from the report.
+fn export_tables(prefix: &Path) {
+    let p = prefix.display();
+    ok(&run(&[
+        "analyze",
+        "-r",
+        &format!("{p}.report"),
+        "-o",
+        &p.to_string(),
+        "--props",
+        "--nodes",
+    ]));
+}
+
+/// One block of the report, from `BEGIN <name>;` to its `END;`.
+fn block(prefix: &Path, name: &str) -> String {
+    let report = read(prefix, "report");
+    let start = report
+        .find(&format!("BEGIN {name};"))
+        .unwrap_or_else(|| panic!("no {name} block"));
+    let end = report[start..].find("END;").expect("block end") + start;
+    report[start..end].to_string()
+}
+
+/// The ALIGNMENT_LIKELIHOODS block without the two position lines of every read (tied
+/// placements are not deterministic between runs).
+fn aligns_no_pos(prefix: &Path) -> String {
+    let block = block(prefix, "ALIGNMENT_LIKELIHOODS");
+    let mut out = Vec::new();
+    let mut lines = block.lines().skip_while(|l| !l.contains("MATRIX")).skip(1);
+    while let Some(hdr) = lines.next() {
+        out.push(hdr.trim().to_string());
+        if hdr.trim() == ";" {
+            break;
+        }
+        let n: usize = hdr
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if n > 0 {
+            out.push(lines.next().unwrap().trim().to_string());
+            out.push(lines.next().unwrap().trim().to_string());
+            lines.next();
+            lines.next();
+        }
+    }
+    out.join("\n")
 }
 
 fn ids(table: &str) -> Vec<String> {
@@ -114,10 +167,7 @@ fn no_flag_header_is_refid() {
     let tmp = tempfile::tempdir().unwrap();
     let index = build_index(tmp.path());
     let (plain, output) = query(tmp.path(), &index, "plain", None);
-    assert_eq!(
-        read(&plain, "posteriors").lines().next(),
-        Some("ReadID\tRefID\tPosterior")
-    );
+    assert!(block(&plain, "PREMISE").contains("LABEL_HEADER RefID;"));
     assert!(read(&plain, "matches").starts_with("ReadID\tRefID\tPosterior\t"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("Taxa:"), "{stdout}");
@@ -135,12 +185,8 @@ fn distinct_taxids_match_no_map() {
 
     // the taxid vertices are unary and change nothing but the table header
     let relabel = |t: String| t.replace("\tRefID\t", "\tTaxID\t");
-    assert_eq!(read(&plain, "aligns"), read(&taxed, "aligns"));
+    assert_eq!(aligns_no_pos(&plain), aligns_no_pos(&taxed));
     assert_eq!(read(&plain, "props"), read(&taxed, "props"));
-    assert_eq!(
-        relabel(read(&plain, "posteriors")),
-        read(&taxed, "posteriors")
-    );
     assert_eq!(
         no_pos(&relabel(read(&plain, "matches"))),
         no_pos(&read(&taxed, "matches"))
@@ -156,10 +202,7 @@ fn distinct_taxids_match_no_map() {
             .any(|l| l.starts_with("ref_A\t1\tsequence\t1\t")),
         "{nodes}"
     );
-    assert_eq!(
-        read(&taxed, "posteriors").lines().next(),
-        Some("ReadID\tTaxID\tPosterior")
-    );
+    assert!(block(&taxed, "PREMISE").contains("LABEL_HEADER TaxID;"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("Taxa: 2 from 2 sequences (2 with a taxid, 0 without"),
@@ -207,24 +250,33 @@ fn shared_taxid_is_an_internal_vertex_over_its_sequences() {
     for id in ids(&read(&taxed, "matches")) {
         assert!(id == "9" || id == "ref_A" || id == "ref_B", "{id}");
     }
-    let posteriors = read(&taxed, "posteriors");
-    let mut keys: Vec<(&str, &str)> = posteriors
-        .lines()
-        .skip(1)
-        .map(|l| {
-            let mut c = l.split('\t');
-            (c.next().unwrap(), c.next().unwrap())
-        })
-        .collect();
-    assert!(keys.iter().all(|(_, t)| *t == "ref_A" || *t == "ref_B"));
-    let n = keys.len();
-    keys.sort();
-    keys.dedup();
-    assert_eq!(keys.len(), n, "duplicate (read, taxid) rows");
-
-    let aligns = ids(&read(&taxed, "aligns"));
-    assert!(aligns.iter().any(|r| r == "ref_A"));
-    assert!(aligns.iter().any(|r| r == "ref_B"));
+    // every alignment names one of the two index sequences, each at most once per read
+    let aligns = block(&taxed, "ALIGNMENT_LIKELIHOODS");
+    let mut lines = aligns.lines().skip_while(|l| !l.contains("MATRIX")).skip(1);
+    let mut n_reads = 0;
+    while let Some(hdr) = lines.next() {
+        if hdr.trim() == ";" {
+            break;
+        }
+        n_reads += 1;
+        let n: usize = hdr.split_whitespace().last().unwrap().parse().unwrap();
+        assert!(n <= 2, "{hdr}");
+        if n > 0 {
+            let seqs: Vec<u32> = lines
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .map(|t| t.parse().unwrap())
+                .collect();
+            assert!(seqs[0] <= 1, "{seqs:?}");
+            assert!(seqs.iter().skip(1).all(|&d| d == 1), "{seqs:?}");
+            for _ in 0..3 {
+                lines.next();
+            }
+        }
+    }
+    assert_eq!(n_reads, 5);
+    assert!(block(&taxed, "REFMAP").contains("DIMENSIONS N=2;"));
 }
 
 #[test]
