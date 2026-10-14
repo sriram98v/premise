@@ -1,18 +1,14 @@
 //! File input and output
 
-use crate::em::Posteriors;
-use crate::utils::{
-    get_extension_from_filename, EMProb, Read, ReadAlignments, ReadID, ReadIdx, ReadPair,
-};
+use crate::utils::{get_extension_from_filename, Read, ReadAlignments, ReadID, ReadPair};
 use crate::{RefIndex, SeqId};
 use anyhow::{Context, Result};
 use bio::io::{fasta, fastq};
 use chrono::Local;
 use flate2::read::GzDecoder;
 use haystackfm::alphabet::{self, encode_byte};
-use haystackfm::occ::OccEncoding;
-use haystackfm::{DnaSequence, FmIndexConfig as RefIndexConfig};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use haystackfm::{DnaSequence, RlFmIndexConfig as RefIndexConfig};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufReader, Cursor, Write};
 
@@ -24,13 +20,13 @@ pub const DEFAULT_LOOKUP_DEPTH: u32 = 8;
 /// Largest accepted lookup depth: each index half then holds about 12 × 4^13 bytes (~0.8 GB).
 pub const MAX_LOOKUP_DEPTH: u32 = 13;
 
-/// Build a serialized FM-index from raw FASTA bytes, keeping every suffix-array entry and
+/// Build a serialized run-length FM-index from raw FASTA bytes, keeping every suffix-array entry and
 /// the default k-mer lookup tables.
 pub fn build_index_from_bytes(fasta_data: &[u8]) -> Result<(Vec<u8>, String)> {
     build_index_from_bytes_with(fasta_data, 1, DEFAULT_LOOKUP_DEPTH)
 }
 
-/// Build a serialized FM-index from raw FASTA bytes, keeping one suffix-array entry in
+/// Build a serialized run-length FM-index from raw FASTA bytes, keeping one suffix-array entry in
 /// every `sa_sample_rate` (1 = the full suffix array). Larger rates shrink the index and
 /// slow down locating occurrences. `lookup_depth` is the k of the k-mer tables that let
 /// the SMEM search skip its first k extensions (0 = no tables); each index half grows by
@@ -111,9 +107,6 @@ pub fn build_index_from_bytes_with(
 
     let config = RefIndexConfig {
         sa_sample_rate,
-        use_gpu: false,
-        occ_encoding: OccEncoding::OneHot,
-        build_lcp: false,
         lookup_depth,
         ..Default::default()
     };
@@ -122,7 +115,7 @@ pub fn build_index_from_bytes_with(
 
     let bytes = fmidx
         .to_bytes()
-        .map_err(|e| anyhow::anyhow!("FmIndex serialize error: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("FM-index serialize error: {}", e))?;
     Ok((bytes, log_str))
 }
 
@@ -130,13 +123,25 @@ pub fn build_index_from_bytes_with(
 pub fn load_index(bytes: &[u8], path: &str) -> Result<RefIndex> {
     RefIndex::from_bytes(bytes).map_err(|e| {
         anyhow::anyhow!(
-            "failed to parse FM-index '{}': {}. Indexes built by a much older or a newer \
-             version of premise are not readable; rebuild it with this version's `build` \
-             subcommand.",
+            "failed to parse FM-index '{}': {}. Indexes built by an older premise (a plain, \
+             not run-length, FM-index) or by a newer one are not readable; rebuild it with \
+             this version's `build` subcommand.",
             path,
             e
         )
     })
+}
+
+/// Length of reference `id` in bases (0 for an unknown id), read off the index's sequence
+/// boundaries: the run-length index keeps no text, so `sequence` would LF-walk the record.
+pub fn ref_len(fmidx: &RefIndex, id: SeqId) -> usize {
+    let ends = fmidx.seq_boundaries();
+    let i = id.index();
+    match ends.get(i) {
+        // `ends` are exclusive and count each record's sentinel.
+        Some(&end) => (end - if i == 0 { 0 } else { ends[i - 1] } - 1) as usize,
+        None => 0,
+    }
 }
 
 /// Read and load the `.fmidx` file at `path`.
@@ -244,18 +249,6 @@ pub fn all_read_ids<'a>(pairs: &'a [ReadPair], unpaired: &'a [ReadID]) -> BTreeS
         .collect()
 }
 
-/// The four output tables of [`crate::run_query`], each streamed to its own writer:
-/// - `matches`: per-read MAP assignment table (TSV)
-/// - `posteriors`: full posterior probability matrix (TSV)
-/// - `props`: estimated reference abundance proportions (TSV)
-/// - `aligns`: raw per-read alignment likelihoods (TSV, same format as `run_alignment`)
-pub struct QueryWriters<W: Write> {
-    pub matches: W,
-    pub posteriors: W,
-    pub props: W,
-    pub aligns: W,
-}
-
 /// `align` table
 pub fn write_alignments<W: Write>(
     out: &mut W,
@@ -283,126 +276,6 @@ pub fn write_alignments<W: Write>(
                 likelihood.get_full_match_ll().exp(),
                 likelihood.get_pos().0,
                 likelihood.get_pos().1,
-            )?;
-        }
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// `.posteriors` table
-pub fn write_posteriors<W: Write>(
-    out: &mut W,
-    fmidx: &RefIndex,
-    read_ids: &BTreeSet<&ReadID>,
-    aligns: &ReadAlignments<'_>,
-    read_assignments: &HashMap<ReadIdx, SeqId>,
-    posteriors: &Posteriors<'_>,
-) -> Result<()> {
-    writeln!(out, "ReadID\tRefID\tPosterior")?;
-    for read_id in read_ids.iter() {
-        let classified = aligns
-            .read_idx(read_id)
-            .filter(|read_idx| read_assignments.contains_key(read_idx));
-        let Some(read_idx) = classified else {
-            writeln!(out, "{}\tunclassified\t-", **read_id)?;
-            continue;
-        };
-        let (refs, _) = aligns.row(read_idx);
-        for ref_idx in refs {
-            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-            writeln!(
-                out,
-                "{}\t{}\t{:.5e}",
-                **read_id,
-                ref_id,
-                posteriors.get(read_idx, *ref_idx),
-            )?;
-        }
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// `.matches` table
-pub fn write_matches<W: Write>(
-    out: &mut W,
-    fmidx: &RefIndex,
-    read_ids: &BTreeSet<&ReadID>,
-    aligns: &ReadAlignments<'_>,
-    read_assignments: &HashMap<ReadIdx, SeqId>,
-    posteriors: &Posteriors<'_>,
-    props_refs: &HashSet<SeqId>,
-) -> Result<HashSet<ReadIdx>> {
-    let mut classified_reads: HashSet<ReadIdx> = HashSet::new();
-    writeln!(
-        out,
-        "ReadID\tRefID\tPosterior\tForward Position\tReverse Position"
-    )?;
-    for read_id in read_ids.iter() {
-        let assignment = aligns
-            .read_idx(read_id)
-            .and_then(|read_idx| read_assignments.get(&read_idx).map(|r| (read_idx, *r)));
-        let Some((read_idx, ref_idx)) = assignment.filter(|(_, r)| props_refs.contains(r)) else {
-            writeln!(out, "{}\tunclassified\t-\t-\t-", **read_id)?;
-            continue;
-        };
-        let Some(alignment) = aligns.get(read_idx, ref_idx) else {
-            continue;
-        };
-        let ref_id = fmidx.seq_header(ref_idx).unwrap_or("");
-        writeln!(
-            out,
-            "{}\t{}\t{:.5e}\t{}\t{}",
-            **read_id,
-            ref_id,
-            posteriors.get(read_idx, ref_idx),
-            alignment.get_pos().0,
-            alignment.get_pos().1,
-        )?;
-        classified_reads.insert(read_idx);
-    }
-    out.flush()?;
-    Ok(classified_reads)
-}
-
-/// The `.props` table: one line per reference with its proportion, in reference order.
-pub fn write_props<W: Write>(
-    out: &mut W,
-    fmidx: &RefIndex,
-    props: &HashMap<SeqId, EMProb>,
-) -> Result<()> {
-    // BTreeMap only to keep the output order deterministic.
-    for (ref_idx, prop) in props.iter().collect::<BTreeMap<_, _>>() {
-        let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-        writeln!(out, "{}\t{:.10e}", ref_id, prop)?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-/// The `.aligns` table
-pub fn write_aligns<W: Write>(
-    out: &mut W,
-    fmidx: &RefIndex,
-    read_ids: &BTreeSet<&ReadID>,
-    aligns: &ReadAlignments<'_>,
-) -> Result<()> {
-    writeln!(out, "ReadID\tRefID\tProbability")?;
-    for read_id in read_ids.iter() {
-        let Some(read_idx) = aligns.read_idx(read_id) else {
-            writeln!(out, "{}\tunclassified\t-", **read_id)?;
-            continue;
-        };
-        let (refs, row) = aligns.row(read_idx);
-        for (ref_idx, likelihood) in refs.iter().zip(row) {
-            let ref_id = fmidx.seq_header(*ref_idx).unwrap_or("");
-            writeln!(
-                out,
-                "{}\t{}\t{:.5e}",
-                **read_id,
-                ref_id,
-                likelihood.get_full_match_ll().exp(),
             )?;
         }
     }

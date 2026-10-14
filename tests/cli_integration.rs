@@ -57,6 +57,56 @@ fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Regenerate the legacy `.props` / `.nodes` tables of a query from its report.
+fn export_tables(prefix: &Path) {
+    let p = prefix.display();
+    assert_success(&run(&[
+        "analyze",
+        "-r",
+        &format!("{p}.report"),
+        "-o",
+        &p.to_string(),
+        "--props",
+        "--nodes",
+    ]));
+}
+
+/// The ALIGNMENT_LIKELIHOODS block of a report (between its `BEGIN` and `END;`).
+fn aligns_block(prefix: &Path) -> String {
+    let report = fs::read_to_string(format!("{}.report", prefix.display())).expect("report");
+    let start = report
+        .find("BEGIN ALIGNMENT_LIKELIHOODS;")
+        .expect("ALIGNMENT_LIKELIHOODS block");
+    let end = report[start..].find("END;").expect("block end") + start;
+    report[start..end].to_string()
+}
+
+/// The same block without the two position lines of every read (tied placements are
+/// not deterministic between runs): each read keeps its header, seqids and log-likelihoods.
+fn aligns_no_pos(prefix: &Path) -> String {
+    let block = aligns_block(prefix);
+    let mut out = Vec::new();
+    let mut lines = block.lines().skip_while(|l| !l.contains("MATRIX")).skip(1);
+    while let Some(hdr) = lines.next() {
+        out.push(hdr.trim().to_string());
+        let n: usize = hdr
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if hdr.trim() == ";" {
+            break;
+        }
+        if n > 0 {
+            out.push(lines.next().unwrap().trim().to_string());
+            out.push(lines.next().unwrap().trim().to_string());
+            lines.next();
+            lines.next();
+        }
+    }
+    out.join("\n")
+}
+
 /// Build an FM-index from the fixture FASTA into a temp directory.
 ///
 /// The binary writes the index to exactly the path given via `-o`, so we pass
@@ -91,7 +141,7 @@ fn help_exits_zero_and_lists_subcommands() {
     let output = run(&["--help"]);
     assert_success(&output);
     let out = stdout(&output);
-    for cmd in &["build", "query", "server"] {
+    for cmd in &["build", "query", "analyze", "server"] {
         assert!(
             out.contains(cmd),
             "help output missing expected subcommand '{}'\nfull output:\n{}",
@@ -247,6 +297,8 @@ fn query_end_to_end_produces_output_files() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -265,9 +317,10 @@ fn query_end_to_end_produces_output_files() {
 
     assert_success(&output);
 
-    // All four output files must exist. The `.props` file can be empty when EM
-    // collapses all proportions to zero, so we only check existence for it.
-    for ext in &["matches", "posteriors", "props", "aligns"] {
+    // The report and the matches table must exist, and the legacy tables must be
+    // recoverable from the report.
+    export_tables(&outprefix);
+    for ext in &["matches", "report", "props", "nodes"] {
         let path = tmpdir.path().join(format!("results.{}", ext));
         assert!(
             path.exists(),
@@ -276,8 +329,8 @@ fn query_end_to_end_produces_output_files() {
         );
     }
 
-    // matches, posteriors and aligns always have at least a header row
-    for ext in &["matches", "posteriors", "aligns"] {
+    // matches, report and nodes always have at least a header row
+    for ext in &["matches", "report", "nodes"] {
         let path = tmpdir.path().join(format!("results.{}", ext));
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("could not read {}", path.display()));
@@ -304,6 +357,8 @@ fn query_props_file_exists_after_query() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -320,6 +375,7 @@ fn query_props_file_exists_after_query() {
         "5",
     ]);
     assert_success(&output);
+    export_tables(&outprefix);
 
     // File must exist (may be empty — EM can collapse all proportions to 0).
     let props_path = tmpdir.path().join("results.props");
@@ -354,6 +410,8 @@ fn query_matches_file_has_data_rows() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -380,9 +438,10 @@ fn query_matches_file_has_data_rows() {
     );
 }
 
-/// The `.posteriors` output should have one row per read plus a header.
+/// The report holds an ALIGNMENT_LIKELIHOODS block with every read, and ends with the
+/// PROFILE.
 #[test]
-fn query_posteriors_file_has_data_rows() {
+fn query_report_has_alignments_for_every_read() {
     let tmpdir = tempfile::tempdir().expect("could not create temp dir");
     let index = build_index(tmpdir.path());
     let r1 = fixtures().join("r1.fastq");
@@ -391,6 +450,8 @@ fn query_posteriors_file_has_data_rows() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -408,12 +469,12 @@ fn query_posteriors_file_has_data_rows() {
     ]);
     assert_success(&output);
 
-    let path = tmpdir.path().join("results.posteriors");
-    let content = fs::read_to_string(&path).expect("could not read results.posteriors");
-    assert!(
-        !content.trim().is_empty(),
-        "posteriors file should not be empty"
-    );
+    let block = aligns_block(&outprefix);
+    assert!(block.contains("DIMENSIONS NREADS=5;"), "{block}");
+    let report = fs::read_to_string(tmpdir.path().join("results.report")).unwrap();
+    assert!(report.starts_with("#NEXUS\n"));
+    assert!(report.contains("BEGIN PROFILE;"));
+    assert!(report.trim_end().ends_with("END;"));
 }
 
 /// The stdout of `query` should mention the output prefix.
@@ -427,6 +488,8 @@ fn query_stdout_reports_output_path() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -459,6 +522,8 @@ fn query_nonexistent_index_fails() {
     let r2 = fixtures().join("r2.fastq");
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         "/nonexistent/ref.fmidx",
         "-1",
@@ -485,6 +550,8 @@ fn query_nonexistent_r1_fails() {
     let r2 = fixtures().join("r2.fastq");
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -514,6 +581,8 @@ fn query_no_penalty_flag_succeeds() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -531,6 +600,8 @@ fn query_no_penalty_flag_succeeds() {
         "--no-penalty",
     ]);
     assert_success(&output);
+    assert!(tmpdir.path().join("results_nopenalty.report").exists());
+    export_tables(&outprefix);
     assert!(tmpdir.path().join("results_nopenalty.props").exists());
 }
 
@@ -564,7 +635,7 @@ fn server_serves_html_on_root() {
 
     let port_str = port.to_string();
     let mut child = Command::new(bin())
-        .args(&["server", "--port", &port_str, "--ip", "127.0.0.1"])
+        .args(["server", "--port", &port_str, "--ip", "127.0.0.1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -624,7 +695,7 @@ fn server_returns_404_for_unknown_route() {
 
     let port_str = port.to_string();
     let mut child = Command::new(bin())
-        .args(&["server", "--port", &port_str, "--ip", "127.0.0.1"])
+        .args(["server", "--port", &port_str, "--ip", "127.0.0.1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -671,6 +742,8 @@ fn query_props_agree_with_corrected_matches() {
 
     let output = run(&[
         "query",
+        "--gamma",
+        "0.6",
         "-s",
         index.to_str().unwrap(),
         "-1",
@@ -687,6 +760,7 @@ fn query_props_agree_with_corrected_matches() {
         "5",
     ]);
     assert_success(&output);
+    export_tables(&outprefix);
 
     let matches = fs::read_to_string(tmpdir.path().join("agree.matches"))
         .expect("could not read agree.matches");
@@ -722,8 +796,8 @@ fn query_props_agree_with_corrected_matches() {
         );
     }
 
-    // Proportions are refit over the classified reads by a final E/M step whose M-step
-    // enforces the simplex constraint, so they must sum to one without renormalization.
+    // The leaves partition the mass (every vertex's conditionals sum to one), so the
+    // proportions must sum to one without renormalization.
     for (ref_id, prop) in &listed {
         assert!(
             *prop > 0.0 && *prop <= 1.0 + 1e-6,
@@ -835,6 +909,8 @@ fn build_sa_sample_rate_gives_same_query_results() {
         let out = tmpdir.path().join(tag);
         assert_success(&run(&[
             "query",
+            "--gamma",
+            "0.6",
             "-s",
             index.to_str().unwrap(),
             "-1",
@@ -900,6 +976,8 @@ fn build_lookup_depth_gives_same_query_results() {
         let out = tmpdir.path().join(tag);
         assert_success(&run(&[
             "query",
+            "--gamma",
+            "0.6",
             "-s",
             index.to_str().unwrap(),
             "-1",
@@ -915,10 +993,13 @@ fn build_lookup_depth_gives_same_query_results() {
             "-i",
             "5",
         ]));
-        ["matches", "props", "aligns"]
+        export_tables(&out);
+        let mut tables: Vec<String> = ["matches", "props"]
             .iter()
             .map(|ext| fs::read_to_string(tmpdir.path().join(format!("{tag}.{ext}"))).unwrap())
-            .collect()
+            .collect();
+        tables.push(aligns_no_pos(&out));
+        tables
     };
     assert_eq!(query(&tabled, "tabled"), query(&plain, "plain"));
 }

@@ -684,20 +684,31 @@ mod tests {
         index_raw_depth(refs, 0)
     }
 
+    fn dna(refs: &[(&str, &str)]) -> Vec<haystackfm::DnaSequence> {
+        refs.iter()
+            .map(|(h, s)| haystackfm::DnaSequence::from_str_with_header(s, h).unwrap())
+            .collect()
+    }
+
     /// [`index_raw`] with k-mer lookup tables of depth `lookup_depth`.
     fn index_raw_depth(refs: &[(&str, &str)], lookup_depth: u32) -> RefIndex {
-        use haystackfm::{DnaSequence, FmIndexConfig};
-        let cfg = FmIndexConfig {
+        let cfg = haystackfm::RlFmIndexConfig {
+            sa_sample_rate: 1,
+            lookup_depth,
+            ..Default::default()
+        };
+        RefIndex::build_cpu(&dna(refs), &cfg).unwrap()
+    }
+
+    /// The plain (not run-length) bidirectional index over `refs`, for parity checks.
+    fn plain_index(refs: &[(&str, &str)], lookup_depth: u32) -> haystackfm::BidirFmIndex {
+        let cfg = haystackfm::FmIndexConfig {
             sa_sample_rate: 1,
             use_gpu: false,
             lookup_depth,
             ..Default::default()
         };
-        let dna: Vec<DnaSequence> = refs
-            .iter()
-            .map(|(h, s)| DnaSequence::from_str_with_header(s, h).unwrap())
-            .collect();
-        RefIndex::build_cpu(&dna, &cfg).unwrap()
+        haystackfm::BidirFmIndex::build_cpu(&dna(refs), &cfg).unwrap()
     }
 
     fn index_from(refs: &[(&str, &str)]) -> RefIndex {
@@ -749,7 +760,7 @@ mod tests {
 
     fn brute_force_reach(idx: &RefIndex, read: &[u8]) -> Vec<usize> {
         let n = read.len();
-        let texts: Vec<&[u8]> = (0..idx.num_sequences())
+        let texts: Vec<Vec<u8>> = (0..idx.num_sequences())
             .map(|j| idx.sequence(SeqId(j)).unwrap())
             .collect();
         (0..n)
@@ -1264,7 +1275,7 @@ mod tests {
         for j in 0..idx.num_sequences() {
             let text = idx.sequence(SeqId(j)).unwrap();
             let mut run = 0;
-            for &b in text {
+            for &b in &text {
                 codes[b as usize] += 1;
                 if b >= N {
                     run += 1;
@@ -1567,6 +1578,86 @@ mod tests {
                 assert_placements_match_oracle(&idx, &read, &quals, k, &ctx);
             }
         }
+    }
+
+    /// The run-length index answers every cursor operation the SMEM search and the walk use
+    /// exactly as the plain bidirectional index does (same intervals, children, occurrences
+    /// and lookup seeds), on IUPAC references and reads with `N`, along every extension
+    /// path of the read in both directions.
+    #[test]
+    fn rl_index_cursor_matches_plain_index() {
+        const WILD: [char; 11] = ['N', 'R', 'Y', 'S', 'W', 'K', 'M', 'B', 'D', 'H', 'V'];
+        let mut st = 0x52u64;
+        for case in 0..100 {
+            let (refs, read, _, _) = random_case_with(&mut st, &WILD);
+            let borrowed: Vec<(&str, &str)> =
+                refs.iter().map(|(h, s)| (h.as_str(), s.as_str())).collect();
+            let depth = 1 + case as u32 % 4;
+            let (rl, plain) = (
+                index_raw_depth(&borrowed, depth),
+                plain_index(&borrowed, depth),
+            );
+            let ctx = format!("case {case}: refs {refs:?} read {read:?}");
+            let occ = |mut v: Vec<(SeqId, u32)>| {
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(rl.full_interval(), plain.full_interval(), "{ctx}");
+            let k = depth as usize;
+            for at in 0..read.len().saturating_sub(k - 1) {
+                let kmer = &read[at..at + k];
+                assert_eq!(
+                    rl.lookup_interval(kmer),
+                    plain.lookup_interval(kmer),
+                    "{ctx}"
+                );
+            }
+            for i in 0..read.len() {
+                let (mut a, mut b) = (rl.full_interval(), plain.full_interval());
+                for &c in &read[i..] {
+                    assert_eq!(rl.children_right(&a), plain.children_right(&b), "{ctx}");
+                    assert_eq!(rl.children_left(&a), plain.children_left(&b), "{ctx}");
+                    match (rl.extend_right(a, c), plain.extend_right(b, c)) {
+                        (Some(x), Some(y)) => {
+                            assert_eq!(x, y, "{ctx}");
+                            assert_eq!(occ(rl.locate_interval(&x)), occ(plain.locate_interval(&y)));
+                            (a, b) = (x, y);
+                        }
+                        (x, y) => {
+                            assert_eq!(x, y, "{ctx}");
+                            break;
+                        }
+                    }
+                }
+                let (mut a, mut b) = (rl.full_interval(), plain.full_interval());
+                for &c in read[..=i].iter().rev() {
+                    match (rl.extend_left(a, c), plain.extend_left(b, c)) {
+                        (Some(x), Some(y)) => {
+                            assert_eq!(x, y, "{ctx}");
+                            (a, b) = (x, y);
+                        }
+                        (x, y) => {
+                            assert_eq!(x, y, "{ctx}");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`crate::io::ref_len`] reads each record's length off the sequence boundaries.
+    #[test]
+    fn ref_len_matches_the_extracted_records() {
+        let idx = index_raw(&[("a", "ACGTRA"), ("b", "G"), ("c", "TTTTNNNNACG")]);
+        for j in 0..idx.num_sequences() {
+            let id = SeqId(j);
+            assert_eq!(
+                crate::io::ref_len(&idx, id),
+                idx.sequence(id).unwrap().len()
+            );
+        }
+        assert_eq!(crate::io::ref_len(&idx, SeqId(3)), 0);
     }
 
     /// The SMEM enumeration agrees with haystackfm's `find_smems` on ACGT-only input
