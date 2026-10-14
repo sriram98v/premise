@@ -2,6 +2,8 @@
   #
   #     nix develop                    # dev shell: build and hack on PREMISE
   #     nix build                      # the PREMISE binary
+  #     nix build .#premise-static     # Linux: a fully static (musl) binary that runs without Nix
+  #     nix flake check                # build, tests, clippy and rustfmt, as CI runs them
   #
   # The benchmark against other classifiers, and its toolchain, live in the separate
   # premise-comparative-analysis repository, which takes this flake as an input.
@@ -12,10 +14,10 @@
 
   outputs = { self, nixpkgs }:
     let
-      system = "x86_64-linux";
-      pkgs = import nixpkgs { inherit system; };
+      systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
 
-      premise-pkg = pkgs.rustPlatform.buildRustPackage {
+      premiseFor = pkgs: pkgs.rustPlatform.buildRustPackage {
         pname = "premise";
         version = "0.5.0";
         src = self;
@@ -39,24 +41,56 @@
         };
       };
     in {
-      packages.${system} = {
-        premise = premise-pkg;
-        default = premise-pkg;
-      };
+      packages = forAllSystems (pkgs:
+        let premise = premiseFor pkgs; in {
+          inherit premise;
+          default = premise;
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          premise-static = premiseFor pkgs.pkgsStatic;
+        });
 
-      devShells.${system}.default = pkgs.mkShell {
-        packages = [
-          pkgs.cargo
-          pkgs.rustc
-          pkgs.clippy
-          pkgs.rustfmt
-          pkgs.rust-analyzer
-          pkgs.cargo-nextest
-          pkgs.pkg-config
-          pkgs.git
-        ];
+      checks = forAllSystems (pkgs:
+        let premise = premiseFor pkgs; in {
+          build = premise;
 
-        buildInputs = [ pkgs.zlib ];
-      };
+          tests = premise.overrideAttrs { doCheck = true; };
+
+          # The benches are left out: they do not build against the current criterion.
+          clippy = premise.overrideAttrs (old: {
+            pname = "premise-clippy";
+            nativeBuildInputs = old.nativeBuildInputs ++ [ pkgs.clippy ];
+            buildPhase = ''
+              runHook preBuild
+              cargo clippy --release --lib --bins --tests -- -D warnings
+              runHook postBuild
+            '';
+            installPhase = "touch $out";
+          });
+
+          fmt = pkgs.runCommand "premise-fmt" {
+            nativeBuildInputs = [ pkgs.cargo pkgs.rustfmt ];
+          } ''
+            cd ${self}
+            cargo fmt --check
+            touch $out
+          '';
+        });
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+            pkgs.rust-analyzer
+            pkgs.cargo-nextest
+            pkgs.pkg-config
+            pkgs.git
+          ];
+
+          buildInputs = [ pkgs.zlib ];
+        };
+      });
     };
 }

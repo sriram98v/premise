@@ -1,41 +1,86 @@
-name: Build & Release
+name: CI
 
 on:
   push:
     branches: [main]
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # ── Build & test ────────────────────────────────────────────────────────
+  # ── Build, tests, clippy and rustfmt, all from the flake ────────────────
+  check:
+    name: Nix checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: DeterminateSystems/nix-installer-action@v23
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: nix flake check
+        run: nix flake check -L
+
+  # ── Release binaries ────────────────────────────────────────────────────
+  # Linux: a static musl binary from the flake, so it runs without Nix. A Nix build
+  # elsewhere would depend on /nix/store, and Nix does not run on Windows, so macOS and
+  # Windows are built with cargo.
   build:
     name: Build (${{ matrix.target }})
+    needs: check
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            nix: true
+            artifact: premise
+          - target: aarch64-apple-darwin
+            os: macos-latest
             artifact: premise
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: premise.exe
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            artifact: premise
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
+
+      - if: matrix.nix
+        uses: DeterminateSystems/nix-installer-action@v23
+
+      - if: matrix.nix
+        uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Build static binary (Nix)
+        if: matrix.nix
+        run: |
+          nix build .#premise-static -L
+          file -L result/bin/premise | tee /dev/stderr | grep -q "static"
+          mkdir -p "target/${{ matrix.target }}/release"
+          cp result/bin/premise "target/${{ matrix.target }}/release/"
 
       - name: Install Rust toolchain
+        if: ${{ !matrix.nix }}
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry & build
-        uses: actions/cache@v5
+        if: ${{ !matrix.nix }}
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -45,21 +90,24 @@ jobs:
           restore-keys: ${{ matrix.target }}-cargo-
 
       - name: Build release binary
+        if: ${{ !matrix.nix }}
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Linux and macOS are tested by `nix flake check`; Windows only here.
       - name: Run tests
+        if: matrix.os == 'windows-latest'
         run: cargo test --release --target ${{ matrix.target }}
 
       - name: Rename binary for upload
         shell: bash
         run: |
           SRC="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          DST="premise-${{ matrix.target }}${{ matrix.target == 'x86_64-pc-windows-msvc' && '.exe' || '' }}"
+          DST="premise-${{ matrix.target }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}"
           cp "$SRC" "$DST"
-          echo "ASSET=$DST" >> $GITHUB_ENV
+          echo "ASSET=$DST" >> "$GITHUB_ENV"
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: ${{ env.ASSET }}
@@ -68,13 +116,16 @@ jobs:
   release:
     name: Publish release
     needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
@@ -83,11 +134,11 @@ jobs:
         id: version
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=v$VERSION-dev" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION-dev" >> "$GITHUB_OUTPUT"
 
       - name: Create or update rolling release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "PREMISE ${{ steps.version.outputs.version }} (latest build)"

@@ -150,7 +150,7 @@ premise/
 │   └── templates/       # browser GUI (embedded at compile time)
 ├── tests/               # integration tests (CLI + local server)
 ├── benches/             # Criterion benchmarks
-├── flake.nix            # the pinned PREMISE package and dev shell
+├── flake.nix            # the pinned PREMISE package (and static Linux build), CI checks, dev shell
 ├── Cargo.toml
 └── README.md
 ```
