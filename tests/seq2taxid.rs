@@ -58,9 +58,9 @@ fn query_args(index: &Path, out: &Path, map: Option<&Path>) -> Vec<String> {
         "1",
         "-i",
         "5",
+        "--matches",
         "--gamma",
         "0.6",
-        "--no-penalty",
     ]
     .iter()
     .map(|s| s.to_string())

@@ -2,6 +2,7 @@
 //! compression; `query` writes what its flags ask for; the head records the run without
 //! paths.
 
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,13 +42,13 @@ fn build_index(dir: &Path) -> PathBuf {
     out
 }
 
-/// A run configuration: `Some(rho)` with the penalty, `None` for `--no-penalty`.
+/// A run configuration: `Some(rho)` with the penalty, `None` without (the default).
 struct Cfg {
     tree: bool,
     rho: Option<&'static str>,
 }
 
-/// `query` arguments without `--gamma`.
+/// `query` arguments without `--gamma` or `--matches`.
 fn query_args(index: &Path, dir: &Path, out: &Path, cfg: &Cfg) -> Vec<String> {
     let r1 = fixtures().join("r1.fastq");
     let r2 = fixtures().join("r2.fastq");
@@ -71,9 +72,8 @@ fn query_args(index: &Path, dir: &Path, out: &Path, cfg: &Cfg) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    match cfg.rho {
-        Some(rho) => args.extend(["--rho", rho, "--omega", "1e-10"].map(str::to_string)),
-        None => args.push("--no-penalty".to_string()),
+    if let Some(rho) = cfg.rho {
+        args.extend(["--rho", rho, "--omega", "1e-10"].map(str::to_string));
     }
     if cfg.tree {
         let map = dir.join("same.map");
@@ -142,7 +142,7 @@ fn block(report: &str, name: &str) -> String {
     report[start..end].to_string()
 }
 
-const GAMMAS: [&str; 4] = ["0.51", "0.6", "0.9", "1.0"];
+const GAMMAS: [&str; 4] = ["0.5", "0.6", "0.9", "0.99"];
 
 #[test]
 fn analyze_reproduces_query_for_every_gamma() {
@@ -171,18 +171,22 @@ fn analyze_reproduces_query_for_every_gamma() {
             },
         ),
     ] {
-        // A report without any gamma, as `query` writes it by default.
+        // A report without .matches, as `query` writes it by default.
         let base = tmp.path().join(format!("{tag}-base"));
         ok(&run_owned(&query_args(&index, tmp.path(), &base, &cfg)));
         assert!(
             !with_ext(&base, "matches").exists(),
-            "{tag}: no gamma, no matches"
+            "{tag}: no --matches, no matches"
         );
         let base_report = with_ext(&base, "report");
         for g in GAMMAS {
             let direct = tmp.path().join(format!("{tag}-q{g}"));
             let mut q = query_args(&index, tmp.path(), &direct, &cfg);
-            q.extend(["--gamma".to_string(), g.to_string()]);
+            q.extend([
+                "--matches".to_string(),
+                "--gamma".to_string(),
+                g.to_string(),
+            ]);
             ok(&run_owned(&q));
             let want = read(&with_ext(&direct, "matches"));
             assert!(want.lines().count() == 6, "header + 5 reads: {want}");
@@ -193,6 +197,7 @@ fn analyze_reproduces_query_for_every_gamma() {
                 "analyze",
                 "-r",
                 with_ext(&direct, "report").to_str().unwrap(),
+                "--matches",
                 "--gamma",
                 g,
                 "-o",
@@ -206,6 +211,7 @@ fn analyze_reproduces_query_for_every_gamma() {
                 "analyze",
                 "-r",
                 base_report.to_str().unwrap(),
+                "--matches",
                 "--gamma",
                 g,
                 "-o",
@@ -228,10 +234,10 @@ fn query_flags_choose_the_outputs() {
         tree: false,
         rho: None,
     };
-    // --no-report with --gamma: only the table.
+    // --no-report with --matches: only the table.
     let only = tmp.path().join("only");
     let mut q = query_args(&index, tmp.path(), &only, &cfg);
-    q.extend(["--gamma", "0.6", "--no-report"].map(str::to_string));
+    q.extend(["--matches", "--gamma", "0.6", "--no-report"].map(str::to_string));
     let out = run_owned(&q);
     ok(&out);
     assert!(with_ext(&only, "matches").exists());
@@ -241,24 +247,26 @@ fn query_flags_choose_the_outputs() {
         stdout.contains("only.matches") && !stdout.contains("report"),
         "{stdout}"
     );
-    // --no-report without --gamma is a usage error, before any work is done.
+    // --no-report without --matches is a usage error, before any work is done.
     let bad = tmp.path().join("bad");
     let mut q = query_args(&index, tmp.path(), &bad, &cfg);
     q.push("--no-report".to_string());
     let out = run_owned(&q);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--gamma"), "{stderr}");
+    assert!(stderr.contains("--matches"), "{stderr}");
     assert!(!with_ext(&bad, "matches").exists() && !with_ext(&bad, "report").exists());
-    // --gamma out of range.
-    let mut q = query_args(&index, tmp.path(), &bad, &cfg);
-    q.extend(["--gamma", "1.5"].map(str::to_string));
-    let out = run_owned(&q);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--gamma must be in (0.5, 1]"));
+    // --gamma out of [0.5, 1).
+    for g in ["0.49", "1", "1.5"] {
+        let mut q = query_args(&index, tmp.path(), &bad, &cfg);
+        q.extend(["--matches", "--gamma", g].map(str::to_string));
+        let out = run_owned(&q);
+        assert!(!out.status.success(), "gamma {g}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--gamma must be in [0.5, 1)"));
+    }
     // --compress conflicts with --no-report.
     let mut q = query_args(&index, tmp.path(), &bad, &cfg);
-    q.extend(["--gamma", "0.6", "--no-report", "--compress"].map(str::to_string));
+    q.extend(["--matches", "--gamma", "0.6", "--no-report", "--compress"].map(str::to_string));
     assert!(!run_owned(&q).status.success());
 }
 
@@ -272,7 +280,11 @@ fn compressed_report_gives_the_same_matches_and_tables() {
     };
     let plain = tmp.path().join("plain");
     let mut q = query_args(&index, tmp.path(), &plain, &cfg);
-    q.extend(["--gamma".to_string(), "0.9".to_string()]);
+    q.extend([
+        "--matches".to_string(),
+        "--gamma".to_string(),
+        "0.9".to_string(),
+    ]);
     ok(&run_owned(&q));
 
     let zst = tmp.path().join("zst");
@@ -292,6 +304,7 @@ fn compressed_report_gives_the_same_matches_and_tables() {
         "analyze",
         "-r",
         zpath.to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.9",
         "-o",
@@ -299,7 +312,7 @@ fn compressed_report_gives_the_same_matches_and_tables() {
         "--props",
         "--nodes",
     ]));
-    // Head-only export needs no --gamma.
+    // Head-only export needs no --matches.
     ok(&run(&[
         "analyze",
         "-r",
@@ -343,11 +356,15 @@ fn report_head_records_the_run_without_paths() {
         rho: Some("3.5"),
     };
     let mut q = query_args(&index, tmp.path(), &out, &cfg);
-    q.extend(["--gamma".to_string(), "0.6".to_string()]);
+    q.extend([
+        "--matches".to_string(),
+        "--gamma".to_string(),
+        "0.6".to_string(),
+    ]);
     ok(&run_owned(&q));
     let report = read(&tmp.path().join("meta.report"));
     for needle in [
-        "#NEXUS\n[premise report v3]\n",
+        "#NEXUS\n[PREMISE report v3]\n",
         "BEGIN PREMISE;",
         "\tVERSION 3;",
         "\tLABEL_HEADER TaxID;",
@@ -395,17 +412,7 @@ fn report_head_records_the_run_without_paths() {
         .expect("sha line");
     assert_eq!(sha.len(), 64, "{sha}");
     assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()));
-    let expect = {
-        let out = Command::new("sha256sum")
-            .arg(&index)
-            .output()
-            .expect("sha256sum");
-        String::from_utf8_lossy(&out.stdout)
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .to_string()
-    };
+    let expect = format!("{:x}", Sha256::digest(fs::read(&index).unwrap()));
     assert_eq!(sha, expect);
     // NODES has 8 columns and no labels; TAXA has as many labels as NODES rows.
     let nodes = block(&report, "NODES");
@@ -483,7 +490,7 @@ fn no_index_hash_leaves_the_checksum_empty() {
         rho: None,
     };
     let mut q = query_args(&index, tmp.path(), &out, &cfg);
-    q.extend(["--no-index-hash", "--gamma", "0.6"].map(str::to_string));
+    q.extend(["--no-index-hash", "--matches", "--gamma", "0.6"].map(str::to_string));
     ok(&run_owned(&q));
     let report = read(&with_ext(&out, "report"));
     assert!(
@@ -495,6 +502,7 @@ fn no_index_hash_leaves_the_checksum_empty() {
         "analyze",
         "-r",
         with_ext(&out, "report").to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.6",
         "-o",
@@ -524,6 +532,7 @@ fn corrupt_reports_leave_no_partial_matches() {
             "analyze",
             "-r",
             path.to_str().unwrap(),
+            "--matches",
             "--gamma",
             "0.6",
             "-o",
@@ -588,13 +597,12 @@ fn analyze_needs_an_output_and_a_valid_gamma() {
     let no_output = run(&["analyze", "-r", r, "-o", o]);
     assert!(!no_output.status.success());
     assert!(String::from_utf8_lossy(&no_output.stderr).contains("nothing to do"));
-    let bad_gamma = run(&["analyze", "-r", r, "--gamma", "0.5", "-o", o]);
+    let bad_gamma = run(&["analyze", "-r", r, "--matches", "--gamma", "1", "-o", o]);
     assert!(!bad_gamma.status.success());
-    assert!(String::from_utf8_lossy(&bad_gamma.stderr).contains("--gamma must be in (0.5, 1]"));
-    // --posteriors needs --gamma; --compress needs --write-report; --rho excludes --no-penalty.
-    // Each case would otherwise be a valid request, so clap's rule is what fails it.
+    assert!(String::from_utf8_lossy(&bad_gamma.stderr).contains("--gamma must be in [0.5, 1)"));
+    // --compress needs --write-report; --rho excludes --no-penalty. Each case would
+    // otherwise be a valid request, so clap's rule is what fails it.
     for (extra, needle) in [
-        (&["--posteriors", "--props"][..], "--gamma"),
         (
             &["--compress", "--no-penalty", "--props"][..],
             "--write-report",
@@ -631,6 +639,7 @@ fn analyze_needs_an_output_and_a_valid_gamma() {
         "analyze",
         "-r",
         "/nonexistent.report",
+        "--matches",
         "--gamma",
         "0.6",
         "-o",
@@ -684,7 +693,7 @@ fn analyze_writes_every_table_from_the_stored_fit() {
     };
     let q = tmp.path().join("q");
     let mut args = query_args(&index, tmp.path(), &q, &cfg);
-    args.extend(["--gamma", "0.6"].map(str::to_string));
+    args.extend(["--matches", "--gamma", "0.6"].map(str::to_string));
     ok(&run_owned(&args));
     let t = tmp.path().join("t");
     let out = run(&[
@@ -693,6 +702,7 @@ fn analyze_writes_every_table_from_the_stored_fit() {
         with_ext(&q, "report").to_str().unwrap(),
         "-o",
         t.to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.6",
         "--props",
@@ -744,6 +754,7 @@ fn analyze_writes_every_table_from_the_stored_fit() {
         "-o",
         two.to_str().unwrap(),
         "--no-penalty",
+        "--matches",
         "--gamma",
         "0.51",
         "--posteriors",
@@ -786,7 +797,7 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
     };
     let q = tmp.path().join("q");
     let mut args = query_args(&index, tmp.path(), &q, &cfg);
-    args.extend(["--gamma", "0.6"].map(str::to_string));
+    args.extend(["--matches", "--gamma", "0.6"].map(str::to_string));
     ok(&run_owned(&args));
     let q_report = with_ext(&q, "report");
     let base = tmp.path().join("base");
@@ -796,6 +807,7 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
         q_report.to_str().unwrap(),
         "-o",
         base.to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.6",
         "--props",
@@ -812,6 +824,7 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
         same.to_str().unwrap(),
         "--rho",
         "3.5",
+        "--matches",
         "--gamma",
         "0.6",
         "--props",
@@ -907,6 +920,7 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
         with_ext(&same, "report").to_str().unwrap(),
         "-o",
         chain.to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.6",
         "--props",
@@ -1024,6 +1038,7 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
         "--no-penalty",
         "--write-report",
         "--compress",
+        "--matches",
         "--gamma",
         "0.9",
     ]));
@@ -1037,6 +1052,7 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
         zpath.to_str().unwrap(),
         "-o",
         again.to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.9",
     ]));
@@ -1070,6 +1086,7 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
         bad.to_str().unwrap(),
         "-o",
         b.to_str().unwrap(),
+        "--matches",
         "--gamma",
         "0.6",
         "--props",

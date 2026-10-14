@@ -20,7 +20,7 @@ pub fn serve(addr: &str) -> Result<()> {
     let server =
         Server::http(addr).map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", addr, e))?;
 
-    println!("Premise web interface running at http://{}", addr);
+    println!("PREMISE web interface running at http://{}", addr);
     println!("Press Ctrl+C to stop.");
 
     let mut sessions: HashMap<String, AlignSession> = HashMap::new();
@@ -388,7 +388,7 @@ fn handle_query_run(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1e-18);
     let num_iter: usize = qs.get("iter").and_then(|s| s.parse().ok()).unwrap_or(100);
-    let rho: EMProb = qs.get("rho").and_then(|s| s.parse().ok()).unwrap_or(150.0);
+    let rho: EMProb = qs.get("rho").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     let omega: EMProb = qs
         .get("omega")
         .and_then(|s| s.parse().ok())
@@ -397,8 +397,7 @@ fn handle_query_run(
         .get("em_threshold")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1e-6);
-    let no_penalty: bool = qs.get("no_penalty").map(|s| s == "true").unwrap_or(false);
-    let use_penalty = !no_penalty;
+    let use_penalty = rho > 0.0;
     let threads: usize = qs.get("threads").and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let session = match sessions.get(&session_id) {
@@ -473,7 +472,7 @@ fn handle_query_run(
             Some(progress.clone()),
             AnalyzeOutputs {
                 report: Some(&mut report),
-                matches: Some((&mut matches, 0.6)),
+                matches: Some((&mut matches, crate::analyze::DEFAULT_GAMMA)),
             },
         );
 

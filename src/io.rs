@@ -123,7 +123,7 @@ pub fn build_index_from_bytes_with(
 pub fn load_index(bytes: &[u8], path: &str) -> Result<RefIndex> {
     RefIndex::from_bytes(bytes).map_err(|e| {
         anyhow::anyhow!(
-            "failed to parse FM-index '{}': {}. Indexes built by an older premise (a plain, \
+            "failed to parse FM-index '{}': {}. Indexes built by an older PREMISE (a plain, \
              not run-length, FM-index) or by a newer one are not readable; rebuild it with \
              this version's `build` subcommand.",
             path,

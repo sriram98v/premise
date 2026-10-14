@@ -53,7 +53,7 @@ struct Opts<'a> {
     map: Option<&'a Path>,
     nodes: Option<&'a Path>,
     gamma: Option<&'a str>,
-    /// `Some(rho)` runs with the penalty at that strength; `None` passes `--no-penalty`.
+    /// `Some(rho)` runs with the penalty at that strength; `None` without (the default).
     rho: Option<&'a str>,
     init: Option<&'a str>,
 }
@@ -81,9 +81,8 @@ fn query_args(index: &Path, out: &Path, opts: &Opts<'_>) -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    match opts.rho {
-        Some(rho) => args.extend(["--rho", rho, "--omega", "1e-10"].map(str::to_string)),
-        None => args.push("--no-penalty".to_string()),
+    if let Some(rho) = opts.rho {
+        args.extend(["--rho", rho, "--omega", "1e-10"].map(str::to_string));
     }
     if let Some(m) = opts.map {
         args.push("--seq2taxid".to_string());
@@ -93,7 +92,8 @@ fn query_args(index: &Path, out: &Path, opts: &Opts<'_>) -> Vec<String> {
         args.push("--nodes".to_string());
         args.push(n.to_str().unwrap().to_string());
     }
-    // `query` writes `.matches` only with a gamma; the tests read it.
+    // `query` writes `.matches` only with --matches; the tests read it.
+    args.push("--matches".to_string());
     args.push("--gamma".to_string());
     args.push(opts.gamma.unwrap_or("0.6").to_string());
     if let Some(i) = opts.init {
@@ -284,10 +284,10 @@ fn nodes_requires_seq2taxid() {
 }
 
 #[test]
-fn gamma_outside_half_one_is_an_error() {
+fn gamma_outside_half_open_unit_interval_is_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let index = build_index(tmp.path());
-    for g in ["0", "0.3", "0.5", "1.5"] {
+    for g in ["0", "0.3", "0.49", "1", "1.5"] {
         let out = tmp.path().join("bad");
         let opts = Opts {
             gamma: Some(g),
@@ -301,7 +301,7 @@ fn gamma_outside_half_one_is_an_error() {
         assert!(stderr.contains("gamma"), "{stderr}");
     }
     let fine = Opts {
-        gamma: Some("0.51"),
+        gamma: Some("0.5"),
         ..Default::default()
     };
     query(tmp.path(), &index, "fine", &fine);
@@ -500,7 +500,7 @@ fn ties_never_descend_below_the_genus() {
     fs::write(&map, "twin_1\t11\ntwin_2\t12\n").unwrap();
     let nodes = nodes_fixture();
 
-    for gamma in ["1", "0.51"] {
+    for gamma in ["0.99", "0.5"] {
         let opts = Opts {
             map: Some(&map),
             nodes: Some(&nodes),

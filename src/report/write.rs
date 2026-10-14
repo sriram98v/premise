@@ -236,7 +236,7 @@ fn write_refmap_props<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
 /// Write every block before ALIGNMENT_LIKELIHOODS.
 pub fn write_head<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
     writeln!(out, "#NEXUS")?;
-    writeln!(out, "[premise report v{}]", head.meta.version)?;
+    writeln!(out, "[PREMISE report v{}]", head.meta.version)?;
     writeln!(out)?;
     write_premise(out, head)?;
     write_em_trace(out, head)?;

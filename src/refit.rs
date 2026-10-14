@@ -44,13 +44,14 @@ impl RefitParams {
             || self.no_penalty
     }
 
-    /// The report's parameters with these overrides, validated. `--rho` turns the
-    /// penalty on, `--no-penalty` off; the alignment parameters are the report's.
+    /// The report's parameters with these overrides, validated. `--rho` > 0 turns the
+    /// penalty on and `--rho 0` or `--no-penalty` off; the alignment parameters are the
+    /// report's.
     fn apply(&self, base: &RunParams) -> Result<RunParams> {
         let mut p = base.clone();
         if let Some(rho) = self.rho {
             p.rho = rho;
-            p.penalty = true;
+            p.penalty = rho > 0.0;
         }
         if self.no_penalty {
             p.penalty = false;
@@ -87,8 +88,9 @@ impl RefitParams {
 #[derive(Clone, Copy, Debug)]
 pub struct TableRequest<'a> {
     pub out: &'a str,
-    /// `.matches` (and, with `posteriors`, `.posteriors`) at this gamma.
-    pub gamma: Option<EMProb>,
+    /// The confidence level `.matches` and `.posteriors` classify reads at.
+    pub gamma: EMProb,
+    pub matches: bool,
     pub posteriors: bool,
     pub props: bool,
     pub nodes: bool,
@@ -116,11 +118,11 @@ impl TableRequest<'_> {
         if self.report {
             v.push(self.report_path());
         }
-        if self.gamma.is_some() {
+        if self.matches {
             v.push(self.path("matches"));
-            if self.posteriors {
-                v.push(self.path("posteriors"));
-            }
+        }
+        if self.posteriors {
+            v.push(self.path("posteriors"));
         }
         if self.props {
             v.push(self.path("props"));
@@ -160,7 +162,7 @@ pub fn analyze_report(
     let paths = req.paths();
     if paths.is_empty() {
         bail!(
-            "analyze: nothing to do; give --gamma, --props, --posteriors, --nodes or --write-report"
+            "analyze: nothing to do; give --matches, --posteriors, --props, --nodes or --write-report"
         );
     }
     if req.report && !refit.is_refit() {
@@ -366,7 +368,7 @@ fn write_outputs(
         std::fs::write(&path, nodes_tsv(head))
             .with_context(|| format!("failed to write '{}'", path))?;
     }
-    if req.gamma.is_none() && !req.report {
+    if !req.matches && !req.posteriors && !req.report {
         return Ok(());
     }
     let t_write = Instant::now();
@@ -382,9 +384,12 @@ fn write_outputs(
         }
         false => None,
     };
-    let mut tables = match req.gamma {
-        Some(gamma) => {
-            let matches = Some(create(req.path("matches"), created)?);
+    let mut tables = match req.matches || req.posteriors {
+        true => {
+            let matches = match req.matches {
+                true => Some(create(req.path("matches"), created)?),
+                false => None,
+            };
             let posteriors = match req.posteriors {
                 true => Some(create(req.path("posteriors"), created)?),
                 false => None,
@@ -392,12 +397,12 @@ fn write_outputs(
             Some(TableWriters::new(
                 &head.meta.label_header,
                 head.tree.to_tax_tree(),
-                gamma,
+                req.gamma,
                 matches,
                 posteriors,
             )?)
         }
-        None => None,
+        false => None,
     };
     let pi_tilde = pi_tilde_by_seq(head);
     let leaf_of = leaf_by_seq(head);
@@ -478,6 +483,12 @@ mod tests {
         let mut on = base();
         on.penalty = true;
         assert!(!off.apply(&on).unwrap().penalty);
+        let zero = RefitParams {
+            rho: Some(0.0),
+            ..Default::default()
+        };
+        assert!(zero.is_refit());
+        assert!(!zero.apply(&on).unwrap().penalty);
     }
 
     #[test]
@@ -512,7 +523,8 @@ mod tests {
     fn request_paths_follow_the_flags() {
         let req = TableRequest {
             out: "x",
-            gamma: Some(0.6),
+            gamma: 0.6,
+            matches: true,
             posteriors: true,
             props: true,
             nodes: false,
@@ -523,14 +535,20 @@ mod tests {
             req.paths(),
             vec!["x.report.zst", "x.matches", "x.posteriors", "x.props"]
         );
-        let none = TableRequest {
+        let posteriors = TableRequest {
             out: "x",
-            gamma: None,
+            gamma: 0.5,
+            matches: false,
             posteriors: true,
             props: false,
             nodes: false,
             report: false,
             compress: false,
+        };
+        assert_eq!(posteriors.paths(), vec!["x.posteriors"]);
+        let none = TableRequest {
+            posteriors: false,
+            ..posteriors
         };
         assert!(none.paths().is_empty());
     }

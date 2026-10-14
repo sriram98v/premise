@@ -710,8 +710,8 @@ pub fn solve_lambda(n: &[EMProb], w: &[EMProb]) -> EMProb {
     lambda
 }
 
-/// Descend from the root to the child with the largest subtree posterior while it is at
-/// least `gamma`. `hits` are the read's posteriors per leaf. Returns the vertex and its
+/// Descend from the root to the child with the largest subtree posterior while it
+/// exceeds `gamma`. `hits` are the read's posteriors per leaf. Returns the vertex and its
 /// subtree posterior.
 pub fn assign_read(tree: &TaxTree, hits: &[(NodeID, EMProb)], gamma: EMProb) -> (NodeID, EMProb) {
     let mut h: HashMap<NodeID, EMProb> = HashMap::new();
@@ -730,7 +730,7 @@ pub fn assign_read(tree: &TaxTree, hits: &[(NodeID, EMProb)], gamma: EMProb) -> 
             .map(|c| (c, h.get(&c).copied().unwrap_or(0.0)))
             .max_by(|a, b| a.1.total_cmp(&b.1));
         match best {
-            Some((c, hc)) if hc > 0.0 && hc >= gamma => {
+            Some((c, hc)) if hc > 0.0 && hc > gamma => {
                 v = c;
                 hv = hc;
             }
@@ -1124,7 +1124,7 @@ mod tests {
     // --- assignment -----------------------------------------------------------------------
 
     #[test]
-    fn assignment_stops_where_the_posterior_drops_below_gamma() {
+    fn assignment_stops_where_the_posterior_no_longer_exceeds_gamma() {
         let g = grouping(&[("s0", 11), ("s1", 12), ("s2", 10)]);
         let rt = reference_tree(&g, Some(&nodes())).unwrap();
         let (t, part) = contract_to_observed(&rt, &seqs(&[0, 1, 2])).unwrap();
@@ -1140,6 +1140,9 @@ mod tests {
         // a sequence that sits directly under the genus is a sibling of the species
         let (v, h) = assign_read(&t, &[(l2, 0.8), (l1, 0.2)], 0.6);
         assert_eq!((v, h), (l2, 0.8));
+        // a child must exceed gamma, not merely reach it
+        let (v, h) = assign_read(&t, &[(l0, 0.6), (l1, 0.4)], 0.6);
+        assert_eq!((v, h), (genus, 1.0));
         // the unary vertices root -> 1 -> 10 carry the whole mass; the split below the
         // genus is too even for gamma 0.7
         let (v, h) = assign_read(&t, &[(l0, 0.4), (l2, 0.6)], 0.7);

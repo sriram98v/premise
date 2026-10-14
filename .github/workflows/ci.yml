@@ -22,6 +22,9 @@ jobs:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             artifact: premise.exe
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: premise
 
     steps:
       - uses: actions/checkout@v5

@@ -221,7 +221,7 @@ impl MetaBuilder {
         let version = self.version.ok_or_else(|| need("VERSION"))?;
         if version != FORMAT_VERSION {
             bail!(
-                "report format version {} is not the version this premise reads ({})",
+                "report format version {} is not the version this PREMISE reads ({})",
                 version,
                 FORMAT_VERSION
             );
@@ -853,7 +853,7 @@ pub(crate) mod tests {
         ReportHead {
             meta: ReportMeta {
                 version: FORMAT_VERSION,
-                tool: "premise 0.4.0".into(),
+                tool: concat!("PREMISE ", env!("CARGO_PKG_VERSION")).into(),
                 timestamp: "2026-10-10 10:00:00".into(),
                 label_header: "TaxID".into(),
                 index: "idx with space.fmidx".into(),
@@ -973,7 +973,7 @@ pub(crate) mod tests {
     fn head_and_reads_round_trip_exactly() {
         let bytes = write_sample(Vec::new());
         let text = String::from_utf8(bytes.clone()).unwrap();
-        assert!(text.starts_with("#NEXUS\n[premise report v3]\n"));
+        assert!(text.starts_with("#NEXUS\n[PREMISE report v3]\n"));
         assert!(text.contains("\tINDEX 'idx with space.fmidx';\n\tINDEX_SHA256 aaaa"));
         assert!(text.contains("\t'read_1/1' 2 2\n\t2 5\n\t-6.9e2 -1.025e1\n\t0 1\n\t10 0\n\t10 0\n\t'no rows' 0\n\t'it''s' 1 1\n\t9\n\t-5e-1\n\t7\n\t1\n\t;\n"));
         assert!(text.contains("BEGIN PROFILE;\n\tRUNTIME write_s=2.5e-1 total_s=2.5e0;\n\tMEMORY peak_rss_kb=123456;\nEND;\n"));
@@ -1055,7 +1055,7 @@ pub(crate) mod tests {
     fn malformed_heads_are_rejected_with_a_reason() {
         // Other format versions, old or new.
         let e = head_err(|t| t.replacen("\tVERSION 3;", "\tVERSION 2;", 1));
-        assert!(e.contains("not the version this premise reads"), "{e}");
+        assert!(e.contains("not the version this PREMISE reads"), "{e}");
         let e = head_err(|t| t.replacen("\tVERSION 3;", "\tVERSION 4;", 1));
         assert!(e.contains("not the version"), "{e}");
         let e = head_err(|t| t.replacen("\tINDEX_SHA256 aaaa", "\tINDEX_SHA256 zzzz", 1));

@@ -114,9 +114,9 @@ fn em_args() -> [Arg; 5] {
     [
         arg!(-i --iter <ITER>"Number of iterations for EM")
             .value_parser(clap::value_parser!(usize)),
-        arg!(--omega <OMEGA>"penalty weight")
+        arg!(--omega <OMEGA>"Penalty weight omega (used when --rho > 0)")
             .value_parser(clap::value_parser!(EMProb)),
-        arg!(--rho <RHO>"penalty weight")
+        arg!(--rho <RHO>"Penalty weight rho: > 0 turns the penalty on, 0 leaves it off")
             .value_parser(clap::value_parser!(EMProb)),
         arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold: relative change in the penalized log-likelihood")
             .value_parser(clap::value_parser!(EMProb)),
@@ -131,7 +131,7 @@ fn threads_arg() -> Arg {
         .value_parser(clap::value_parser!(usize))
 }
 
-/// The `query` arguments (everything but `--gamma`).
+/// The `query` arguments (everything but `--gamma` and `--matches`).
 fn query_args(cmd: Command) -> Command {
     let [iter, omega, rho, em_threshold, init] = em_args();
     cmd.arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
@@ -156,17 +156,11 @@ fn query_args(cmd: Command) -> Command {
             )
         .arg(iter.default_value("100"))
         .arg(omega.default_value("1e-10"))
-        .arg(rho.default_value("150"))
+        .arg(rho.default_value("0"))
         .arg(arg!(-o --out <OUT_FILE>"Output prefix")
             .default_value("out")
             .value_parser(clap::value_parser!(String))
             )
-        .arg(Arg::new("no-penalty")
-            .long("no-penalty")
-            .help("Disable penalty")
-            .required(false)
-            .num_args(0)
-            .action(ArgAction::SetFalse))
         .arg(arg!(--eps_2 <EPS_2>"Minimum match log-probability threshold")
             .default_value("1e-18")
             .value_parser(clap::value_parser!(EMProb))
@@ -197,13 +191,13 @@ fn analyze_args(cmd: Command) -> Command {
             .required(true)
             .value_parser(clap::value_parser!(String))
             )
-        .arg(gamma_arg("Confidence level in (0.5, 1]: writes <OUT_FILE>.matches"))
+        .arg(gamma_arg())
+        .arg(matches_arg("Write <OUT_FILE>.matches: the vertex each read is assigned to at --gamma"))
         .arg(Arg::new("posteriors")
             .long("posteriors")
-            .help("Write <OUT_FILE>.posteriors: the posterior of every classified read on each EM leaf (needs --gamma)")
+            .help("Write <OUT_FILE>.posteriors: the posterior of every classified read on each EM leaf")
             .num_args(0)
-            .action(ArgAction::SetTrue)
-            .requires("gamma"))
+            .action(ArgAction::SetTrue))
         .arg(Arg::new("props")
             .long("props")
             .help("Write <OUT_FILE>.props, the proportions as a legacy table")
@@ -228,7 +222,7 @@ fn analyze_args(cmd: Command) -> Command {
         .arg(threads_arg())
         .arg(iter.help("Refit: number of EM iterations (default: the report's)"))
         .arg(omega.help("Refit: penalty weight omega (default: the report's)"))
-        .arg(rho.help("Refit: penalty weight rho, turning the penalty on (default: the report's)")
+        .arg(rho.help("Refit: penalty weight rho; > 0 turns the penalty on, 0 turns it off (default: the report's)")
             .conflicts_with("no-penalty"))
         .arg(em_threshold.help("Refit: EM convergence threshold (default: the report's)"))
         .arg(init.help("Refit: initial conditionals, split or uniform (default: the report's)"))
@@ -239,21 +233,28 @@ fn analyze_args(cmd: Command) -> Command {
             .action(ArgAction::SetTrue))
 }
 
-fn gamma_arg(help: &'static str) -> Arg {
+fn gamma_arg() -> Arg {
     arg!(--gamma <GAMMA>)
-        .help(help)
+        .help("Confidence level in [0.5, 1): a read descends to the deepest vertex whose subtree posterior exceeds GAMMA")
+        .default_value("0.5")
         .value_parser(clap::value_parser!(EMProb))
 }
 
-/// `--gamma`, validated when given.
-fn parse_gamma(sub_m: &clap::ArgMatches) -> Result<Option<EMProb>> {
-    let Some(&gamma) = sub_m.get_one::<EMProb>("gamma") else {
-        return Ok(None);
-    };
-    if !(gamma > 0.5 && gamma <= 1.0) {
-        anyhow::bail!("--gamma must be in (0.5, 1], got {}", gamma);
+fn matches_arg(help: &'static str) -> Arg {
+    Arg::new("matches")
+        .long("matches")
+        .help(help)
+        .num_args(0)
+        .action(ArgAction::SetTrue)
+}
+
+/// `--gamma`, validated.
+fn parse_gamma(sub_m: &clap::ArgMatches) -> Result<EMProb> {
+    let gamma = *sub_m.get_one::<EMProb>("gamma").expect("defaulted");
+    if !(0.5..1.0).contains(&gamma) {
+        anyhow::bail!("--gamma must be in [0.5, 1), got {}", gamma);
     }
-    Ok(Some(gamma))
+    Ok(gamma)
 }
 
 /// The [`AnalyzeParams`] of a parsed `query` command line.
@@ -272,7 +273,7 @@ fn analyze_params(sub_m: &clap::ArgMatches) -> AnalyzeParams<'_> {
         rho: *sub_m.get_one::<EMProb>("rho").expect("defaulted"),
         omega: *sub_m.get_one::<EMProb>("omega").expect("defaulted"),
         em_threshold: *sub_m.get_one::<EMProb>("em_threshold").expect("defaulted"),
-        use_penalty: *sub_m.get_one::<bool>("no-penalty").expect("flag"),
+        use_penalty: *sub_m.get_one::<EMProb>("rho").expect("defaulted") > 0.0,
         threads: *sub_m.get_one::<usize>("threads").expect("defaulted"),
         seq2taxid: sub_m.get_one::<String>("seq2taxid").map(String::as_str),
         nodes: sub_m.get_one::<String>("nodes").map(String::as_str),
@@ -314,7 +315,9 @@ fn run_summary(summary: &analyze::AnalyzeSummary, report_path: Option<&str>) -> 
 
 pub fn run() -> Result<()> {
     let matches = Command::new(env!("CARGO_PKG_NAME"))
+        .display_name("PREMISE")
         .version(env!("CARGO_PKG_VERSION"))
+        .propagate_version(true)
         .author("Sriram Vijendran <vijendran.sriram@gmail.com>")
         .subcommand(
             Command::new("build")
@@ -386,14 +389,15 @@ pub fn run() -> Result<()> {
         )
         .subcommand(
             query_args(Command::new("query")
-                .about("Classify paired-end reads: align, fit the EM and write the report; with --gamma also the .matches table"))
-                .arg(gamma_arg("Confidence level in (0.5, 1]: a read descends to the deepest vertex whose subtree posterior is at least GAMMA. Also writes <OUT>.matches"))
+                .about("Classify paired-end reads: align, fit the EM and write the report; with --matches also the .matches table"))
+                .arg(gamma_arg())
+                .arg(matches_arg("Write <OUT>.matches: the vertex each read is assigned to at --gamma"))
                 .arg(Arg::new("no-report")
                     .long("no-report")
-                    .help("Write only <OUT>.matches (needs --gamma)")
+                    .help("Write only <OUT>.matches (needs --matches)")
                     .num_args(0)
                     .action(ArgAction::SetTrue)
-                    .requires("gamma"))
+                    .requires("matches"))
                 .arg(Arg::new("compress")
                     .long("compress")
                     .help("zstd-compress the report (writes <OUT>.report.zst)")
@@ -427,7 +431,7 @@ pub fn run() -> Result<()> {
                     .value_parser(clap::value_parser!(String))
                 )
         )
-        .about("Maximum Likelihood Metagenomic classifier using Suffix trees")
+        .about("PREMISE: A probabilistic framework for source assignment of Illumina reads")
         .get_matches();
 
     match matches.subcommand() {
@@ -485,6 +489,7 @@ pub fn run() -> Result<()> {
         Some(("query", sub_m)) => {
             let outfile = sub_m.get_one::<String>("out").unwrap().as_str();
             let gamma = parse_gamma(sub_m)?;
+            let write_matches = sub_m.get_flag("matches");
             let no_report = sub_m.get_flag("no-report");
             let compress = sub_m.get_flag("compress");
             let params = analyze_params(sub_m);
@@ -498,7 +503,7 @@ pub fn run() -> Result<()> {
             if !no_report {
                 written.push(&report_path);
             }
-            if gamma.is_some() {
+            if write_matches {
                 written.push(&matches_path);
             }
             let run = || -> Result<analyze::AnalyzeSummary> {
@@ -507,23 +512,20 @@ pub fn run() -> Result<()> {
                 } else {
                     Some(Sink::create(&report_path, compress)?)
                 };
-                let mut matches = match gamma {
-                    Some(_) => Some(
+                let mut matches = match write_matches {
+                    true => Some(
                         File::create(&matches_path)
                             .map(BufWriter::new)
                             .with_context(|| format!("failed to create '{}'", matches_path))?,
                     ),
-                    None => None,
+                    false => None,
                 };
                 let summary = run_analyze(
                     &params,
                     None,
                     AnalyzeOutputs {
                         report: report.as_mut().map(|r| r as &mut dyn Write),
-                        matches: match (matches.as_mut(), gamma) {
-                            (Some(m), Some(g)) => Some((m as &mut dyn Write, g)),
-                            _ => None,
-                        },
+                        matches: matches.as_mut().map(|m| (m as &mut dyn Write, gamma)),
                     },
                 )?;
                 if let Some(r) = report {
@@ -551,6 +553,7 @@ pub fn run() -> Result<()> {
             let req = TableRequest {
                 out: sub_m.get_one::<String>("out").expect("required").as_str(),
                 gamma: parse_gamma(sub_m)?,
+                matches: sub_m.get_flag("matches"),
                 posteriors: sub_m.get_flag("posteriors"),
                 props: sub_m.get_flag("props"),
                 nodes: sub_m.get_flag("nodes"),
