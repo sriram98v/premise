@@ -1,4 +1,4 @@
-# PREMISE:  A probabilistic framework for source assignment of viral Illumina reads
+# PREMISE:  A probabilistic framework for source assignment of Illumina reads
 
 [![Build](https://github.com/sriram98v/premise/actions/workflows/ci.yml/badge.svg)](https://github.com/sriram98v/premise/actions)
 [![License](https://img.shields.io/github/license/sriram98v/premise)](https://github.com/sriram98v/premise/blob/main/LICENSE)
@@ -73,13 +73,13 @@ premise query \
   -m <min_seed_length>     \  # minimum MEM seed length (default 22)
   --eps_1 <float>          \  # alignment likelihood cutoff (default 0: keep every alignment)
   --eps_2 <float>          \  # minimum match log-probability (default 1e-18)
-  --rho   <float>          \  # EM penalty weight ρ (default 150)
-  --omega <float>          \  # EM penalty weight ω (default 1e-10)
+  --rho   <float>          \  # EM penalty weight ρ; > 0 turns the penalty on (default 0: plain EM, no pruning)
+  --omega <float>          \  # EM penalty weight ω, used when ρ > 0 (default 1e-10)
   --iter  <int>            \  # EM iterations (default 100)
   --em_threshold <float>   \  # EM convergence: relative change in the penalized log-likelihood (default 1e-6)
-  --no-penalty             \  # disable the penalty (plain EM, no pruning)
-  --gamma <float>          \  # optional: also write <output>.matches, descending to a vertex while its posterior is at least gamma, in (0.5, 1]
-  --no-report              \  # with --gamma: write only <output>.matches
+  --matches                \  # also write <output>.matches, the vertex each read is assigned to
+  --gamma <float>          \  # descend to a vertex while its posterior exceeds gamma, in [0.5, 1) (default 0.5)
+  --no-report              \  # with --matches: write only <output>.matches
   --compress               \  # zstd-compress the report (<output>.report.zst)
   --no-index-hash          \  # skip the SHA-256 of the index in the report (a full read of the index, run alongside the alignment)
   --init <split|uniform>   \  # initial conditionals: split-tie argmax counts (default) or 1/|children|
@@ -89,13 +89,13 @@ premise query \
   -o <output_prefix>
 ```
 
-`--seq2taxid` takes a kraken/centrifuge-style `seqid2taxid.map` (`seqid<whitespace>taxid`, extra columns ignored, blank and `#` lines skipped; a seqid is matched on its full FASTA header or its first token) and makes the *taxid* the unit the EM estimates. Alignment stays per sequence, P(read | taxid) = Σ P(read | sequence) over the taxid's sequences, and `.props`, `.posteriors` and `.matches` name taxids. Every taxid is an independent column. `--nodes` adds the lineages above them from an NCBI `nodes.dmp` (`taxid | parent | rank | …`) or plain `taxid parent [rank]` lines. Sequences absent from the map hang under the root, named by their header, and a warning counts them. Each read is then assigned by descending from the root to the child with the largest subtree posterior while that posterior is at least `--gamma`.
+`--seq2taxid` takes a kraken/centrifuge-style `seqid2taxid.map` (`seqid<whitespace>taxid`, extra columns ignored, blank and `#` lines skipped; a seqid is matched on its full FASTA header or its first token) and makes the *taxid* the unit the EM estimates. Alignment stays per sequence, P(read | taxid) = Σ P(read | sequence) over the taxid's sequences, and `.props`, `.posteriors` and `.matches` name taxids. Every taxid is an independent column. `--nodes` adds the lineages above them from an NCBI `nodes.dmp` (`taxid | parent | rank | …`) or plain `taxid parent [rank]` lines. Sequences absent from the map hang under the root, named by their header, and a warning counts them. Each read is then assigned by descending from the root to the child with the largest subtree posterior while that posterior exceeds `--gamma`.
 
 Outputs:
 | File | Contents |
 |------|----------|
 | `<output>.report` | The run: taxonomy, every alignment log-likelihood of every read, proportions, EM trace and metadata (NEXUS, see [Output Format](#output-format)) |
-| `<output>.matches` | Per-read assignments, only with `--gamma` (TSV) |
+| `<output>.matches` | Per-read assignments, only with `--matches` (TSV) |
 
 Run `premise query -h` for the full option list. The report holds every alignment of every read, so on a large sample it is about the size of an alignment dump.
 
@@ -104,20 +104,20 @@ Run `premise query -h` for the full option list. The report holds every alignmen
 Everything but the read assignment is independent of `--gamma`, and the posteriors a read needs are recomputed from its stored log-likelihoods and the fitted proportions, so `analyze` turns a report into the legacy tables for any `gamma` without the index or the reads:
 
 ```bash
-premise analyze -r <output>.report[.zst] -o <prefix> --gamma 0.9 --posteriors --props --nodes
-#   <prefix>.matches (--gamma), .posteriors (--posteriors, needs --gamma), .props, .nodes
+premise analyze -r <output>.report[.zst] -o <prefix> --matches --gamma 0.9 --posteriors --props --nodes
+#   <prefix>.matches (--matches), .posteriors (--posteriors), .props, .nodes; --gamma defaults to 0.5
 ```
 
 The report also holds every alignment likelihood the EM saw and the contracted tree it ran on, so the EM can be re-run with other penalty parameters, again without the index or the reads. Any EM option makes `analyze` a refit; whatever is not given keeps the report's value:
 
 ```bash
-premise analyze -r <output>.report -o <prefix> --rho 8 --gamma 0.6 --props          # tables of the refit
+premise analyze -r <output>.report -o <prefix> --rho 8 --matches --props            # tables of the refit
 premise analyze -r <output>.report -o <prefix> --no-penalty --write-report [--compress]  # + <prefix>.report[.zst]
 ```
 
 | Option | Effect |
 |--------|--------|
-| `--rho R` | Penalty weight; also turns the penalty on |
+| `--rho R` | Penalty weight; R > 0 turns the penalty on, `--rho 0` turns it off |
 | `--omega W`, `--iter N`, `--em_threshold T`, `--init split\|uniform` | As for `query` |
 | `--no-penalty` | Plain EM (excludes `--rho`) |
 | `--write-report` | Write the refit as a report (`SOURCE` names the input); needs an EM option |
@@ -150,7 +150,7 @@ premise/
 │   └── templates/       # browser GUI (embedded at compile time)
 ├── tests/               # integration tests (CLI + local server)
 ├── benches/             # Criterion benchmarks
-├── flake.nix            # the pinned premise package and dev shell
+├── flake.nix            # the pinned PREMISE package and dev shell
 ├── Cargo.toml
 └── README.md
 ```
@@ -168,7 +168,7 @@ premise/
 ### `.report` (NEXUS)
 
 A `#NEXUS` text file (zstd-compressed by `query --compress`; `analyze` detects either). The standard `TAXA` and `TREES` blocks let tree viewers open it; the other blocks are private
-and skipped by conforming readers. Labels are NEXUS-quoted (`'...'`, `''` for a quote). This is format version 3; `premise` reads only its own version, so reports written by earlier versions must be regenerated.
+and skipped by conforming readers. Labels are NEXUS-quoted (`'...'`, `''` for a quote). This is format version 3; PREMISE reads only its own version, so reports written by earlier versions must be regenerated.
 
 | Block | Contents |
 |-------|----------|
@@ -183,7 +183,7 @@ and skipped by conforming readers. Labels are NEXUS-quoted (`'...'`, `''` for a 
 | `PROFILE` | Write and total seconds, peak resident set size (KiB); written last |
 
 
-### `.posteriors` (TSV, from `analyze --posteriors --gamma G`)
+### `.posteriors` (TSV, from `analyze --posteriors [--gamma G]`)
 | Column | Description |
 |--------|-------------|
 | `read_id` | Read identifier |

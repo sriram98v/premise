@@ -1,12 +1,12 @@
 {
   #
-  #     nix develop                    # dev shell: build and hack on premise
-  #     nix build                      # the premise binary
+  #     nix develop                    # dev shell: build and hack on PREMISE
+  #     nix build                      # the PREMISE binary
   #
   # The benchmark against other classifiers, and its toolchain, live in the separate
   # premise-comparative-analysis repository, which takes this flake as an input.
   #
-  description = "premise — paired-end metagenomic read classifier";
+  description = "PREMISE — paired-end metagenomic read classifier";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -17,7 +17,7 @@
 
       premise-pkg = pkgs.rustPlatform.buildRustPackage {
         pname = "premise";
-        version = "0.4.0";
+        version = "0.5.0";
         src = self;
 
         cargoLock = {

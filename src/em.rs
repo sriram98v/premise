@@ -871,7 +871,7 @@ mod tests {
         let post = posteriors(&m, &fit);
         let report_tree = ReportTree::from_fit(&stored, &tips, &t, &part, &fit);
         let pi_tilde = |s: SeqId| fit.pi_tilde[s.index()];
-        for gamma in [0.51, 0.6, 0.9, 1.0] {
+        for gamma in [0.5, 0.6, 0.9, 0.99] {
             let oracle = assign_reads(&m, &t, &part, &post, gamma);
             let mut w =
                 MatchesWriter::new(Vec::new(), "RefID", report_tree.to_tax_tree(), gamma).unwrap();

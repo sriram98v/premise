@@ -946,7 +946,7 @@ mod tests {
     /// reference `b`'s six-base run is shadowed: it seeds nothing and `b` receives no
     /// placement. Shortening the read below `b`'s run makes both qualify again.
     /// The walk's own scorer is the same model as [`compute_match_log_prob`], which
-    /// `utils.rs` shares with the rest of premise: every non-sentinel symbol pair, at
+    /// `utils.rs` shares with the rest of PREMISE: every non-sentinel symbol pair, at
     /// several qualities, must agree exactly.
     #[test]
     fn score_tables_agree_with_compute_match_log_prob() {

@@ -107,6 +107,17 @@ fn aligns_no_pos(prefix: &Path) -> String {
     out.join("\n")
 }
 
+/// A `.matches` table without its position columns: where a mate has equal-likelihood
+/// placements, which one is reported varies from run to run.
+fn matches_no_pos(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|l| l.split('\t').take(3).collect::<Vec<_>>().join("\t"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Build an FM-index from the fixture FASTA into a temp directory.
 ///
 /// The binary writes the index to exactly the path given via `-o`, so we pass
@@ -297,6 +308,7 @@ fn query_end_to_end_produces_output_files() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -357,6 +369,7 @@ fn query_props_file_exists_after_query() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -410,6 +423,7 @@ fn query_matches_file_has_data_rows() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -450,6 +464,7 @@ fn query_report_has_alignments_for_every_read() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -488,6 +503,7 @@ fn query_stdout_reports_output_path() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -522,6 +538,7 @@ fn query_nonexistent_index_fails() {
     let r2 = fixtures().join("r2.fastq");
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -550,6 +567,7 @@ fn query_nonexistent_r1_fails() {
     let r2 = fixtures().join("r2.fastq");
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -570,9 +588,9 @@ fn query_nonexistent_r1_fails() {
     assert_failure(&output);
 }
 
-/// `query` with `--no-penalty` flag should still succeed and produce output.
+/// `query` runs without the penalty unless `--rho` > 0, and has no `--no-penalty` flag.
 #[test]
-fn query_no_penalty_flag_succeeds() {
+fn query_penalty_is_off_by_default() {
     let tmpdir = tempfile::tempdir().expect("could not create temp dir");
     let index = build_index(tmpdir.path());
     let r1 = fixtures().join("r1.fastq");
@@ -581,6 +599,7 @@ fn query_no_penalty_flag_succeeds() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -597,12 +616,30 @@ fn query_no_penalty_flag_succeeds() {
         "1",
         "-i",
         "5",
-        "--no-penalty",
     ]);
     assert_success(&output);
-    assert!(tmpdir.path().join("results_nopenalty.report").exists());
+    let report =
+        std::fs::read_to_string(tmpdir.path().join("results_nopenalty.report")).expect("report");
+    assert!(
+        report.contains(" rho=0e0 ") && report.contains(" penalty=0;"),
+        "{report}"
+    );
     export_tables(&outprefix);
     assert!(tmpdir.path().join("results_nopenalty.props").exists());
+
+    let output = run(&[
+        "query",
+        "-s",
+        index.to_str().unwrap(),
+        "-1",
+        r1.to_str().unwrap(),
+        "-2",
+        r2.to_str().unwrap(),
+        "-o",
+        outprefix.to_str().unwrap(),
+        "--no-penalty",
+    ]);
+    assert_failure(&output);
 }
 
 // ─────────────────────────── server subcommand ───────────────────────────────
@@ -742,6 +779,7 @@ fn query_props_agree_with_corrected_matches() {
 
     let output = run(&[
         "query",
+        "--matches",
         "--gamma",
         "0.6",
         "-s",
@@ -909,6 +947,7 @@ fn build_sa_sample_rate_gives_same_query_results() {
         let out = tmpdir.path().join(tag);
         assert_success(&run(&[
             "query",
+            "--matches",
             "--gamma",
             "0.6",
             "-s",
@@ -926,7 +965,7 @@ fn build_sa_sample_rate_gives_same_query_results() {
             "-i",
             "5",
         ]));
-        fs::read_to_string(tmpdir.path().join(format!("{tag}.matches"))).unwrap()
+        matches_no_pos(&tmpdir.path().join(format!("{tag}.matches")))
     };
     assert_eq!(query(&full, "full"), query(&sampled, "sampled"));
 }
@@ -976,6 +1015,7 @@ fn build_lookup_depth_gives_same_query_results() {
         let out = tmpdir.path().join(tag);
         assert_success(&run(&[
             "query",
+            "--matches",
             "--gamma",
             "0.6",
             "-s",
@@ -994,10 +1034,10 @@ fn build_lookup_depth_gives_same_query_results() {
             "5",
         ]));
         export_tables(&out);
-        let mut tables: Vec<String> = ["matches", "props"]
-            .iter()
-            .map(|ext| fs::read_to_string(tmpdir.path().join(format!("{tag}.{ext}"))).unwrap())
-            .collect();
+        let mut tables = vec![
+            matches_no_pos(&tmpdir.path().join(format!("{tag}.matches"))),
+            fs::read_to_string(tmpdir.path().join(format!("{tag}.props"))).unwrap(),
+        ];
         tables.push(aligns_no_pos(&out));
         tables
     };

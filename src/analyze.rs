@@ -33,6 +33,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// The confidence level reads are classified at when none is given (`--gamma`).
+pub const DEFAULT_GAMMA: EMProb = 0.5;
+
 /// Everything `query` / `analyze` take on the command line except `gamma`.
 #[derive(Clone, Debug)]
 pub struct AnalyzeParams<'a> {
@@ -175,7 +178,7 @@ fn query_meta(
 ) -> ReportMeta {
     ReportMeta {
         version: FORMAT_VERSION,
-        tool: format!("premise {}", env!("CARGO_PKG_VERSION")),
+        tool: format!("PREMISE {}", env!("CARGO_PKG_VERSION")),
         timestamp,
         label_header: grouping.label_header().to_string(),
         index: basename(p.ref_file),

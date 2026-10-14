@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Premise — ML Metagenomic Classifier</title>
+  <title>PREMISE — ML Metagenomic Classifier</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="stylesheet"
@@ -290,8 +290,8 @@
           <!-- Parameters row 3: rho, omega -->
           <div class="grid">
             <label for="query-rho">
-              ρ <small>(penalty weight)</small>
-              <input type="number" id="query-rho" value="150" min="0" step="any" />
+              ρ <small>(penalty weight; 0 = no penalty)</small>
+              <input type="number" id="query-rho" value="0" min="0" step="any" />
             </label>
             <label for="query-omega">
               ω <small>(penalty weight)</small>
@@ -310,12 +310,6 @@
               <input type="text" id="query-em-threshold" value="1e-6" />
             </label>
           </div>
-
-          <!-- No-penalty checkbox -->
-          <label style="margin-top:0.5rem">
-            <input type="checkbox" id="query-no-penalty" />
-            Disable penalty (no regularization)
-          </label>
 
           <button id="query-btn" disabled style="margin-top:1rem;width:100%">
             <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"

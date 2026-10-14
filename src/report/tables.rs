@@ -273,9 +273,9 @@ mod tests {
         // gamma 0.8: 3 has 0.7 < 0.8 → stop at genus A with 1.0; best position over all.
         let out = write(0.8, &[("r", cands.clone())]);
         assert_eq!(out.lines().nth(1).unwrap(), "r\tA\t1.00000e0\t9\t10");
-        // gamma 1.0: still the genus (exactly 1.0 passes).
-        let out = write(1.0, &[("r", cands)]);
-        assert!(out.lines().nth(1).unwrap().starts_with("r\tA\t"));
+        // gamma 0.7: 3 has exactly 0.7, which does not exceed it → the genus.
+        let out = write(0.7, &[("r", cands)]);
+        assert_eq!(out.lines().nth(1).unwrap(), "r\tA\t1.00000e0\t9\t10");
     }
 
     #[test]
