@@ -133,12 +133,6 @@ premise server
 
 Opens a browser UI at `http://localhost:8080` with drag-and-drop file upload, interactive results tables, pie chart, and EM convergence plot. Supports light/dark mode.
 
-## Algorithm
-
-PREMISE seeds each read with **Super-Maximal Exact Matches (SMEMs)** found via the reference FM-index. Each seed is projected onto a reference diagonal, and the full read is then rescored **ungapped** against that offset — there is no chaining and no gapped extension. Read-level alignment log-likelihoods are computed from base quality scores (Phred-scaled error probabilities in natural log space); `-m`/`--mem` sets the minimum seed length.
-
-Parameters **ε₁** and **ε₂** control alignment filtering: ε₁ is a minimum alignment likelihood threshold (linear space); ε₂ is a minimum match log-probability per read.
-
 ## Project Structure
 
 ```
@@ -156,8 +150,7 @@ premise/
 │   └── templates/       # browser GUI (embedded at compile time)
 ├── tests/               # integration tests (CLI + local server)
 ├── benches/             # Criterion benchmarks
-├── comparative-analysis/  # benchmark against other classifiers + parameter ablation
-├── flake.nix, nix/      # pinned toolchains: premise and the benchmark
+├── flake.nix            # the pinned premise package and dev shell
 ├── Cargo.toml
 └── README.md
 ```
@@ -220,20 +213,6 @@ over its subtree) is in `.nodes`.
 | `Conditional` | Share of the parent's mass, `q_{v|parent}` |
 
 Rows are in pre-order; pruned vertices are absent (the report's `NODES` block keeps them, with their status). Without `--seq2taxid` the table is the root plus one row per sequence.
-
-## Comparative Analysis
-
-PREMISE is evaluated against seven other read-classification and quantification tools --- [Centrifuger](https://github.com/mourisl/centrifuger), [Ganon](https://github.com/pirovc/ganon), [Karp](https://github.com/mreppell/Karp), [KMCP](https://github.com/shenwei356/kmcp), [MORA](https://github.com/AlgoLab/MORA), [Salmon](https://github.com/COMBINE-lab/salmon), and [Sylph](https://github.com/bluenote-1577/sylph) --- across five dataset splits: three simulated (synthetic isolate, synthetic mixed, synthetic same-subtype mixed) and two real (isolate and mixed-infection samples from NCBI SRA). Every method is evaluated on runtime, peak memory, per-read precision, coverage, reference-level false positives and negatives, Ruzicka distance, and Jaccard distance. A separate ablation sweeps PREMISE's parameters `-m`, `--eps_1`, `--eps_2`, `--rho`, `--omega` and `--sa_sample_rate`.
-
-The toolchain for every competing method is pinned in `flake.nix`:
-
-```bash
-nix develop .#benchmark              # every binary the benchmark needs, on PATH
-cd comparative-analysis
-python3 -m premise_bench run --threads <n>
-```
-
-See [comparative-analysis/README.md](comparative-analysis/README.md) for data preparation, configuration (`params.toml`), the output CSVs, and the ablation.
 
 ## Citation
 
