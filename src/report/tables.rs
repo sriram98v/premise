@@ -1,8 +1,8 @@
 //! The legacy per-read tables, written from `(EM leaf, posterior, likelihood, position)`
-//! candidates: `.matches` (the vertex each read is assigned to at `gamma`) and
+//! candidates: `.matches` (the vertex each read is assigned to, see [`Placement`]) and
 //! `.posteriors` (the read's posterior on every EM leaf). `query` feeds them straight
 //! from the fit and `analyze` from a report, so both produce the same bytes for the
-//! same `gamma`.
+//! same placement.
 
 use crate::tree::{assign_read, is_synthetic_root, label, SubtreeIndex, TaxTree};
 use crate::utils::EMProb;
@@ -20,6 +20,30 @@ pub struct Candidate {
     pub pos: (usize, usize),
 }
 
+/// How a read is placed on the final EM tree.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Placement {
+    /// Without a taxonomy (no `--seq2taxid`): the sequence with the largest posterior, ties
+    /// to the first in index order, as PREMISE classified before taxonomies; gamma plays no
+    /// part.
+    BestSequence,
+    /// With a taxonomy: descend from the root while the largest child's subtree posterior
+    /// exceeds gamma.
+    Descend(EMProb),
+}
+
+impl Placement {
+    /// [`Placement::Descend`] at `gamma` for a run with a taxonomy, else
+    /// [`Placement::BestSequence`].
+    pub fn new(taxonomy: bool, gamma: EMProb) -> Self {
+        if taxonomy {
+            Self::Descend(gamma)
+        } else {
+            Self::BestSequence
+        }
+    }
+}
+
 /// Where a classified read landed: the vertex, its subtree posterior `h`, and the
 /// position of the read's best-scoring sequence beneath it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -29,23 +53,24 @@ pub struct Assignment {
     pub pos: (usize, usize),
 }
 
-/// Assigns reads on the final EM tree at a `gamma`; one classification feeds every table.
+/// Assigns reads on the final EM tree by a [`Placement`]; one classification feeds every
+/// table.
 pub struct Classifier {
     tree: TaxTree,
     subtree: SubtreeIndex,
-    gamma: EMProb,
+    placement: Placement,
     /// Posterior per EM leaf of the last read, in first-appearance order.
     hits: Vec<(NodeID, EMProb)>,
 }
 
 impl Classifier {
     /// `tree` is the final EM tree (collapsed vertices are leaves).
-    pub fn new(tree: TaxTree, gamma: EMProb) -> Self {
+    pub fn new(tree: TaxTree, placement: Placement) -> Self {
         let subtree = SubtreeIndex::new(&tree);
         Self {
             tree,
             subtree,
-            gamma,
+            placement,
             hits: Vec::new(),
         }
     }
@@ -67,7 +92,10 @@ impl Classifier {
         if self.hits.is_empty() {
             return None;
         }
-        let (vertex, h) = assign_read(&self.tree, &self.hits, self.gamma);
+        let (vertex, h) = match self.placement {
+            Placement::Descend(gamma) => assign_read(&self.tree, &self.hits, gamma),
+            Placement::BestSequence => best_hit(&self.hits),
+        };
         if is_synthetic_root(&self.tree, vertex) {
             return None;
         }
@@ -92,6 +120,13 @@ impl Classifier {
     }
 }
 
+/// The EM leaf with the largest posterior; ties go to the first in `hits` (index order).
+fn best_hit(hits: &[(NodeID, EMProb)]) -> (NodeID, EMProb) {
+    hits.iter()
+        .copied()
+        .fold(hits[0], |best, h| if h.1 > best.1 { h } else { best })
+}
+
 /// `.matches` and / or `.posteriors`, written read by read from one classification.
 pub struct TableWriters<W: Write> {
     classifier: Classifier,
@@ -104,7 +139,7 @@ impl<W: Write> TableWriters<W> {
     pub fn new(
         label_header: &str,
         tree: TaxTree,
-        gamma: EMProb,
+        placement: Placement,
         mut matches: Option<W>,
         mut posteriors: Option<W>,
     ) -> Result<Self> {
@@ -119,7 +154,7 @@ impl<W: Write> TableWriters<W> {
             writeln!(out, "ReadID\t{}\tPosterior", label_header)?;
         }
         Ok(Self {
-            classifier: Classifier::new(tree, gamma),
+            classifier: Classifier::new(tree, placement),
             matches,
             posteriors,
         })
@@ -178,11 +213,11 @@ pub struct MatchesWriter<W: Write>(TableWriters<W>);
 
 impl<W: Write> MatchesWriter<W> {
     /// Writes the header. `tree` is the final EM tree (collapsed vertices are leaves).
-    pub fn new(out: W, label_header: &str, tree: TaxTree, gamma: EMProb) -> Result<Self> {
+    pub fn new(out: W, label_header: &str, tree: TaxTree, placement: Placement) -> Result<Self> {
         Ok(Self(TableWriters::new(
             label_header,
             tree,
-            gamma,
+            placement,
             Some(out),
             None,
         )?))
@@ -224,7 +259,7 @@ mod tests {
         let mut w = TableWriters::new(
             "TaxID",
             final_tree(),
-            gamma,
+            Placement::Descend(gamma),
             Some(Vec::new()),
             Some(Vec::new()),
         )
@@ -240,7 +275,9 @@ mod tests {
     }
 
     fn write(gamma: EMProb, reads: &[(&str, Vec<Candidate>)]) -> String {
-        let mut w = MatchesWriter::new(Vec::new(), "TaxID", final_tree(), gamma).unwrap();
+        let mut w =
+            MatchesWriter::new(Vec::new(), "TaxID", final_tree(), Placement::Descend(gamma))
+                .unwrap();
         for (id, cands) in reads {
             w.push(id, cands).unwrap();
         }
@@ -276,6 +313,39 @@ mod tests {
         // gamma 0.7: 3 has exactly 0.7, which does not exceed it → the genus.
         let out = write(0.7, &[("r", cands)]);
         assert_eq!(out.lines().nth(1).unwrap(), "r\tA\t1.00000e0\t9\t10");
+    }
+
+    #[test]
+    fn without_a_taxonomy_the_most_probable_sequence_wins_whatever_gamma() {
+        let best = |cands: Vec<Candidate>| {
+            let mut w =
+                MatchesWriter::new(Vec::new(), "RefID", final_tree(), Placement::BestSequence)
+                    .unwrap();
+            w.push("r", &cands).unwrap();
+            let out = String::from_utf8(w.finish().unwrap()).unwrap();
+            out.lines().nth(1).unwrap().to_string()
+        };
+        // a split no gamma in [0.5, 1) descends into: still the more probable sequence
+        assert_eq!(
+            best(vec![c(3, 0.45, 1e-9, (5, 6)), c(8, 0.55, 1e-7, (9, 10))]),
+            "r\ts2|x\t5.50000e-1\t9\t10"
+        );
+        // pooled rows of one leaf add up, and ties go to the first in index order
+        assert_eq!(
+            best(vec![
+                c(3, 0.25, 1e-9, (5, 6)),
+                c(3, 0.25, 1e-8, (7, 8)),
+                c(8, 0.5, 1e-7, (9, 10))
+            ]),
+            "r\tsp1\t5.00000e-1\t7\t8"
+        );
+        // no posterior mass: unclassified
+        assert_eq!(
+            best(vec![c(3, 0.0, 1e-9, (5, 6))]),
+            "r\tunclassified\t-\t-\t-"
+        );
+        assert_eq!(Placement::new(false, 0.9), Placement::BestSequence);
+        assert_eq!(Placement::new(true, 0.9), Placement::Descend(0.9));
     }
 
     #[test]
@@ -338,7 +408,14 @@ mod tests {
 
     #[test]
     fn posteriors_alone_need_no_matches_sink() {
-        let mut w = TableWriters::new("RefID", final_tree(), 0.9, None, Some(Vec::new())).unwrap();
+        let mut w = TableWriters::new(
+            "RefID",
+            final_tree(),
+            Placement::Descend(0.9),
+            None,
+            Some(Vec::new()),
+        )
+        .unwrap();
         w.push("r", &[c(8, 1.0, 1e-2, (1, 1))]).unwrap();
         let (m, p) = w.finish().unwrap();
         assert!(m.is_none());

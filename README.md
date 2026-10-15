@@ -78,7 +78,7 @@ premise query \
   --iter  <int>            \  # EM iterations (default 100)
   --em_threshold <float>   \  # EM convergence: relative change in the penalized log-likelihood (default 1e-6)
   --matches                \  # also write <output>.matches, the vertex each read is assigned to
-  --gamma <float>          \  # descend to a vertex while its posterior exceeds gamma, in [0.5, 1) (default 0.5)
+  --gamma <float>          \  # with --seq2taxid: descend to a vertex while its posterior exceeds gamma, in [0.5, 1) (default 0.5)
   --no-report              \  # with --matches: write only <output>.matches
   --compress               \  # zstd-compress the report (<output>.report.zst)
   --no-index-hash          \  # skip the SHA-256 of the index in the report (a full read of the index, run alongside the alignment)
@@ -89,7 +89,7 @@ premise query \
   -o <output_prefix>
 ```
 
-`--seq2taxid` takes a kraken/centrifuge-style `seqid2taxid.map` (`seqid<whitespace>taxid`, extra columns ignored, blank and `#` lines skipped; a seqid is matched on its full FASTA header or its first token) and makes the *taxid* the unit the EM estimates. Alignment stays per sequence, P(read | taxid) = Σ P(read | sequence) over the taxid's sequences, and `.props`, `.posteriors` and `.matches` name taxids. Every taxid is an independent column. `--nodes` adds the lineages above them from an NCBI `nodes.dmp` (`taxid | parent | rank | …`) or plain `taxid parent [rank]` lines. Sequences absent from the map hang under the root, named by their header, and a warning counts them. Each read is then assigned by descending from the root to the child with the largest subtree posterior while that posterior exceeds `--gamma`.
+`--seq2taxid` takes a kraken/centrifuge-style `seqid2taxid.map` (`seqid<whitespace>taxid`, extra columns ignored, blank and `#` lines skipped; a seqid is matched on its full FASTA header or its first token) and makes the *taxid* the unit the EM estimates. Alignment stays per sequence, P(read | taxid) = Σ P(read | sequence) over the taxid's sequences, and `.props`, `.posteriors` and `.matches` name taxids. Every taxid is an independent column. `--nodes` adds the lineages above them from an NCBI `nodes.dmp` (`taxid | parent | rank | …`) or plain `taxid parent [rank]` lines. Sequences absent from the map hang under the root, named by their header, and a warning counts them. Each read is then assigned by descending from the root to the child with the largest subtree posterior while that posterior exceeds `--gamma`. Without `--seq2taxid` there is no taxonomy to descend: each read goes to the sequence with its largest posterior (ties to the first in the index), the strain-level classification of earlier versions, and `--gamma` has no effect.
 
 Outputs:
 | File | Contents |

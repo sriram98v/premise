@@ -847,7 +847,7 @@ mod tests {
     #[test]
     fn matches_writer_agrees_with_assign_reads() {
         use crate::report::posterior::row_posteriors;
-        use crate::report::tables::{Candidate, MatchesWriter};
+        use crate::report::tables::{Candidate, MatchesWriter, Placement};
         use crate::report::{AlignRow, ReportTree};
         use crate::tree::{is_synthetic_root, label};
 
@@ -873,8 +873,13 @@ mod tests {
         let pi_tilde = |s: SeqId| fit.pi_tilde[s.index()];
         for gamma in [0.5, 0.6, 0.9, 0.99] {
             let oracle = assign_reads(&m, &t, &part, &post, gamma);
-            let mut w =
-                MatchesWriter::new(Vec::new(), "RefID", report_tree.to_tax_tree(), gamma).unwrap();
+            let mut w = MatchesWriter::new(
+                Vec::new(),
+                "RefID",
+                report_tree.to_tax_tree(),
+                Placement::Descend(gamma),
+            )
+            .unwrap();
             let mut posts = Vec::new();
             for (r, row) in logs.iter().enumerate() {
                 let aligns: Vec<AlignRow> = row

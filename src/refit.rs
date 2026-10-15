@@ -9,7 +9,7 @@ use crate::report::export::{nodes_tsv, props_tsv};
 use crate::report::nexus::{open_report, Sink};
 use crate::report::posterior::{leaf_by_seq, pi_tilde_by_seq};
 use crate::report::read::ReportReader;
-use crate::report::tables::{Candidate, TableWriters};
+use crate::report::tables::{Candidate, Placement, TableWriters};
 use crate::report::write::ReportWriter;
 use crate::report::{PhaseTimes, Profile, ReadRows, ReportHead, ReportMeta, RunParams};
 use crate::tree::{children, Partition};
@@ -397,7 +397,7 @@ fn write_outputs(
             Some(TableWriters::new(
                 &head.meta.label_header,
                 head.tree.to_tax_tree(),
-                req.gamma,
+                Placement::new(head.meta.seq2taxid.is_some(), req.gamma),
                 matches,
                 posteriors,
             )?)
