@@ -235,7 +235,7 @@ fn analyze_args(cmd: Command) -> Command {
 
 fn gamma_arg() -> Arg {
     arg!(--gamma <GAMMA>)
-        .help("Confidence level in [0.5, 1): a read descends to the deepest vertex whose subtree posterior exceeds GAMMA")
+        .help("Confidence level in [0.5, 1), used with --seq2taxid: a read descends to the deepest vertex whose subtree posterior exceeds GAMMA. Without a taxonomy every read goes to its most probable sequence and GAMMA has no effect")
         .default_value("0.5")
         .value_parser(clap::value_parser!(EMProb))
 }

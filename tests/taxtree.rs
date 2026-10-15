@@ -517,6 +517,57 @@ fn ties_never_descend_below_the_genus() {
     }
 }
 
+/// Without a taxonomy PREMISE classifies to strains as before: every read goes to its most
+/// probable sequence (ties to the first), so gamma changes nothing. Twin references split
+/// every read 0.5 / 0.5, which no gamma in [0.5, 1) would descend into.
+#[test]
+fn without_a_taxonomy_gamma_has_no_effect() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ref_a = fs::read_to_string(fixtures().join("ref.fasta")).unwrap();
+    let seq_a: String = ref_a
+        .lines()
+        .skip(1)
+        .take_while(|l| !l.starts_with('>'))
+        .collect();
+    let fasta_path = tmp.path().join("twins.fasta");
+    fs::write(&fasta_path, format!(">twin_1\n{seq_a}\n>twin_2\n{seq_a}\n")).unwrap();
+    let index = build_index_from(tmp.path(), &fasta_path);
+
+    let (out, _) = query(tmp.path(), &index, "plain", &Opts::default());
+    let ids = matches(&out);
+    assert!(!ids.is_empty());
+    assert!(ids.iter().all(|i| i == "twin_1"), "{ids:?}");
+    // the same report at two gammas: byte-identical tables
+    let report = format!("{}.report", out.display());
+    let at = |gamma: &str| {
+        let o = tmp.path().join(format!("a{gamma}"));
+        ok(&run(&[
+            "analyze",
+            "-r",
+            &report,
+            "-o",
+            o.to_str().unwrap(),
+            "--matches",
+            "--gamma",
+            gamma,
+        ]));
+        read(&o, "matches")
+    };
+    let (lo, hi) = (at("0.5"), at("0.99"));
+    assert_eq!(lo, hi);
+    // reads 4 and 5 come from ref_B, absent from the twins: unclassified at any gamma
+    let classified: Vec<&str> = lo
+        .lines()
+        .skip(1)
+        .filter(|l| !l.contains("\tunclassified\t"))
+        .collect();
+    assert_eq!(classified.len(), 3, "{lo}");
+    for line in classified {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(&cols[1..3], ["twin_1", "5.00000e-1"], "{line}");
+    }
+}
+
 #[test]
 fn penalty_prunes_a_weak_species_and_reports_it() {
     let tmp = tempfile::tempdir().unwrap();

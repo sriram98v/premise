@@ -9,7 +9,7 @@ use crate::io::{
     all_read_ids, load_fastq_forward, load_fastq_reverse, pair_reads, read_index_file,
 };
 use crate::report::posterior::{leaf_by_seq, pi_tilde_by_seq, row_posteriors};
-use crate::report::tables::{Candidate, MatchesWriter};
+use crate::report::tables::{Candidate, MatchesWriter, Placement};
 use crate::report::write::ReportWriter;
 use crate::report::{
     AlignRow, EmIter, EmStats, PhaseTimes, Profile, RefMap, ReportHead, ReportMeta, ReportTree,
@@ -479,7 +479,7 @@ pub fn run_analyze(
             w,
             grouping.label_header(),
             head.tree.to_tax_tree(),
-            gamma,
+            Placement::new(p.seq2taxid.is_some(), gamma),
         )?),
         None => None,
     };
