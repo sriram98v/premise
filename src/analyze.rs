@@ -3,7 +3,7 @@
 //! instead lives in [`crate::refit`].
 
 use crate::em::EmFit;
-use crate::em::{estimate_proportions, EmParams, Init};
+use crate::em::{estimate_proportions, EmParams, Init, Stop};
 use crate::group::Grouping;
 use crate::io::{
     all_read_ids, load_fastq_forward, load_fastq_reverse, pair_reads, read_index_file,
@@ -49,6 +49,7 @@ pub struct AnalyzeParams<'a> {
     pub rho: EMProb,
     pub omega: EMProb,
     pub em_threshold: EMProb,
+    pub em_stop: Stop,
     pub use_penalty: bool,
     pub threads: usize,
     pub seq2taxid: Option<&'a str>,
@@ -196,6 +197,7 @@ fn query_meta(
             rho: p.rho,
             omega: p.omega,
             em_threshold: p.em_threshold,
+            em_stop: p.em_stop.name().to_string(),
             init: p.init.name().to_string(),
             penalty: p.use_penalty,
         },
@@ -389,7 +391,7 @@ pub fn run_analyze(
     let rho_eff = if p.use_penalty { p.rho } else { 0.0 };
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-    let log_str = format!("Timestamp: {}\nNum Threads: {}\nMin matching run: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e}\nRho: {}\nOmega: {:e}\nInit: {}{}{}",
+    let log_str = format!("Timestamp: {}\nNum Threads: {}\nMin matching run: {}\nEps_1: {:e} ({:.2})\nEps_2: {:e} ({:.2})\nEM Iterations: {}\nEM Threshold: {:e} ({})\nRho: {}\nOmega: {:e}\nInit: {}{}{}",
         timestamp,
         num_threads,
         p.mem_seed_length,
@@ -399,6 +401,7 @@ pub fn run_analyze(
         p.eps_2.ln(),
         p.num_iter,
         p.em_threshold,
+        p.em_stop.name(),
         rho_eff,
         p.omega,
         p.init.name(),
@@ -442,6 +445,7 @@ pub fn run_analyze(
             rho: rho_eff,
             omega: p.omega,
             em_threshold: p.em_threshold,
+            stop: p.em_stop,
         },
         progress.clone(),
     );

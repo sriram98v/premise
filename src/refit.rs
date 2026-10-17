@@ -3,7 +3,9 @@
 //! the EM over the report's alignment likelihoods with other penalty parameters.
 
 use crate::analyze::{basename, fit_head, log_fit, peak_rss_kb, read_candidates, same_file};
-use crate::em::{estimate_proportions, CsrBuilder, EmParams, Init};
+use crate::em::{
+    estimate_proportions, estimate_proportions_traced, CsrBuilder, EmParams, Init, Stop,
+};
 use crate::report::export::props_nexus;
 use crate::report::nexus::{open_report, Sink};
 use crate::report::posterior::{leaf_by_seq, pi_tilde_by_seq};
@@ -19,7 +21,7 @@ use chrono::Local;
 use phylo::node::NodeID;
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufRead, BufWriter, Write};
+use std::io::{self, BufRead, BufWriter, Write};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -31,6 +33,7 @@ pub struct RefitParams {
     pub omega: Option<EMProb>,
     pub iter: Option<usize>,
     pub em_threshold: Option<EMProb>,
+    pub em_stop: Option<Stop>,
     pub init: Option<Init>,
     pub no_penalty: bool,
 }
@@ -41,6 +44,7 @@ impl RefitParams {
             || self.omega.is_some()
             || self.iter.is_some()
             || self.em_threshold.is_some()
+            || self.em_stop.is_some()
             || self.init.is_some()
             || self.no_penalty
     }
@@ -66,6 +70,9 @@ impl RefitParams {
         if let Some(t) = self.em_threshold {
             p.em_threshold = t;
         }
+        if let Some(stop) = self.em_stop {
+            p.em_stop = stop.name().to_string();
+        }
         if let Some(init) = self.init {
             p.init = init.name().to_string();
         }
@@ -78,6 +85,9 @@ impl RefitParams {
         nonneg(p.rho, "--rho")?;
         nonneg(p.omega, "--omega")?;
         nonneg(p.em_threshold, "--em_threshold")?;
+        if self.em_threshold.is_some() && p.em_stop == Stop::None.name() {
+            bail!("--em_threshold needs a stopping criterion: give --em_stop loglik or props");
+        }
         if p.iter == 0 {
             bail!("--iter must be at least 1");
         }
@@ -93,6 +103,8 @@ pub struct TableRequest<'a> {
     pub gamma: EMProb,
     pub matches: bool,
     pub props: bool,
+    /// `π̃_s` of every reference at each EM iteration (runs the EM).
+    pub em_props: bool,
     /// The refit report.
     pub report: bool,
     pub compress: bool,
@@ -123,7 +135,14 @@ impl TableRequest<'_> {
         if self.props {
             v.push(self.path("props"));
         }
+        if self.em_props {
+            v.push(self.em_props_path());
+        }
         v
+    }
+
+    fn em_props_path(&self) -> String {
+        self.path("em_props.tsv")
     }
 }
 
@@ -214,11 +233,11 @@ pub fn analyze_report(
         .build_global();
     let paths = req.paths();
     if paths.is_empty() {
-        bail!("analyze: nothing to do; give --matches, --props or --write-report");
+        bail!("analyze: nothing to do; give --matches, --props, --em-props or --write-report");
     }
     if req.report && !refit.is_refit() {
         bail!(
-            "analyze: --write-report without EM parameters would only copy the input; give --rho, --omega, --iter, --em_threshold, --init or --no-penalty to refit"
+            "analyze: --write-report without EM parameters would only copy the input; give --rho, --omega, --iter, --em_threshold, --em_stop, --init or --no-penalty to refit"
         );
     }
     if let Some(clobber) = paths.iter().find(|o| same_file(o, report_path)) {
@@ -231,15 +250,36 @@ pub fn analyze_report(
         n_reads,
         stamp,
     };
-    let (head, reader) = if refit.is_refit() {
-        let head = refit_from_report(report_path, &head0, n_reads, reader, refit, threads)?;
-        // Pass 2 re-reads the file (it must be a regular file, not a pipe).
-        (head, source.reopen()?)
-    } else {
-        (head0, reader)
-    };
     let mut created: Vec<String> = Vec::new();
-    let result = write_outputs(&head, &source, reader, req, t_start, &mut created);
+    let result = (|| {
+        // The stored fit has no per-iteration proportions: --em-props runs the EM again,
+        // with the report's parameters unless overridden.
+        let (head, reader) = if refit.is_refit() || req.em_props {
+            let mut trace = if req.em_props {
+                Some(create(req.em_props_path(), &mut created)?)
+            } else {
+                None
+            };
+            let head = refit_from_report(
+                report_path,
+                &head0,
+                n_reads,
+                reader,
+                refit,
+                threads,
+                trace.as_mut().map(|w| w as &mut dyn Write),
+            )?;
+            if let Some(mut w) = trace {
+                w.flush()
+                    .with_context(|| format!("failed to write '{}'", req.em_props_path()))?;
+            }
+            // Pass 2 re-reads the file (it must be a regular file, not a pipe).
+            (head, source.reopen()?)
+        } else {
+            (head0, reader)
+        };
+        write_outputs(&head, &source, reader, req, t_start, &mut created)
+    })();
     if result.is_err() {
         // Never leave a half-written file behind (only what this run opened).
         for p in &created {
@@ -281,6 +321,7 @@ fn refit_from_report(
     mut reader: Reader,
     refit: &RefitParams,
     threads: usize,
+    em_props: Option<&mut dyn Write>,
 ) -> Result<ReportHead> {
     let t_load = Instant::now();
     let num_threads = resolve_thread_count(threads);
@@ -291,15 +332,18 @@ fn refit_from_report(
     let params = refit.apply(&head0.meta.params)?;
     let init = Init::parse(&params.init)
         .ok_or_else(|| anyhow::anyhow!("report PARAMS: unknown init '{}'", params.init))?;
+    let stop = Stop::parse(&params.em_stop)
+        .ok_or_else(|| anyhow::anyhow!("report PARAMS: unknown em_stop '{}'", params.em_stop))?;
     let rho_eff = if params.penalty { params.rho } else { 0.0 };
     let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     println!(
-        "Refit of {}\nTimestamp: {}\nNum Threads: {}\nEM Iterations: {}\nEM Threshold: {:e}\nRho: {}\nOmega: {:e}\nInit: {}",
+        "Refit of {}\nTimestamp: {}\nNum Threads: {}\nEM Iterations: {}\nEM Threshold: {:e} ({})\nRho: {}\nOmega: {:e}\nInit: {}",
         basename(report_path),
         timestamp,
         num_threads,
         params.iter,
         params.em_threshold,
+        stop.name(),
         rho_eff,
         params.omega,
         init.name()
@@ -353,19 +397,39 @@ fn refit_from_report(
         );
     }
     let mut part = Partition::new(tip_of_col.clone());
-    let mut fit = estimate_proportions(
-        &csr,
-        &mut tree,
-        &mut part,
-        &EmParams {
-            init,
-            num_iter: params.iter,
-            rho: rho_eff,
-            omega: params.omega,
-            em_threshold: params.em_threshold,
-        },
-        None,
-    );
+    let em_params = EmParams {
+        init,
+        num_iter: params.iter,
+        rho: rho_eff,
+        omega: params.omega,
+        em_threshold: params.em_threshold,
+        stop,
+    };
+    let mut fit = match em_props {
+        None => estimate_proportions(&csr, &mut tree, &mut part, &em_params, None),
+        Some(out) => {
+            let labels = head0.tree.labels();
+            write_em_props_header(out, tip_of_col.iter().map(|t| labels.get(t).copied()))?;
+            let (mut row, mut failed) = (0usize, None);
+            let fit = estimate_proportions_traced(
+                &csr,
+                &mut tree,
+                &mut part,
+                &em_params,
+                None,
+                &mut |pi| {
+                    if failed.is_none() {
+                        failed = write_em_props_row(out, row, pi).err();
+                    }
+                    row += 1;
+                },
+            );
+            if let Some(e) = failed {
+                return Err(e).context("failed to write the EM proportions");
+            }
+            fit
+        }
+    };
     log_fit(&fit, &tree, rho_eff);
     let em_s = t_em.elapsed().as_secs_f64();
 
@@ -390,6 +454,30 @@ fn refit_from_report(
         &csr,
         &mut fit,
     ))
+}
+
+/// `.em_props.tsv` header: `iteration` then one column per reference, in REFMAP order,
+/// named by its tip's label.
+fn write_em_props_header<'a>(
+    out: &mut dyn Write,
+    labels: impl Iterator<Item = Option<&'a str>>,
+) -> Result<()> {
+    write!(out, "iteration")?;
+    for l in labels {
+        write!(out, "\t{}", l.unwrap_or(""))?;
+    }
+    writeln!(out)?;
+    Ok(())
+}
+
+/// One `.em_props.tsv` row: the iteration (0 = the initial state) and `π̃_s` per
+/// reference.
+fn write_em_props_row(out: &mut dyn Write, iteration: usize, pi: &[EMProb]) -> io::Result<()> {
+    write!(out, "{}", iteration)?;
+    for p in pi {
+        write!(out, "\t{:e}", p)?;
+    }
+    writeln!(out)
 }
 
 /// Open an output for writing, remembering it for cleanup.
@@ -523,6 +611,7 @@ mod tests {
             rho: 150.0,
             omega: 1e-10,
             em_threshold: 1e-6,
+            em_stop: "loglik".into(),
             init: "split".into(),
             penalty: false,
         }
@@ -587,6 +676,31 @@ mod tests {
         let mut b = base();
         b.rho = -5.0;
         assert!(RefitParams::default().apply(&b).is_err());
+        // A threshold means nothing without a criterion, given or inherited.
+        let threshold_only = RefitParams {
+            em_threshold: Some(1e-4),
+            em_stop: Some(Stop::None),
+            ..Default::default()
+        };
+        assert!(bad(threshold_only).contains("--em_stop"));
+        let mut b = base();
+        b.em_stop = "none".into();
+        let err = RefitParams {
+            em_threshold: Some(1e-4),
+            ..Default::default()
+        }
+        .apply(&b)
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--em_stop"), "{err}");
+        let p = RefitParams {
+            em_threshold: Some(1e-4),
+            em_stop: Some(Stop::Props),
+            ..Default::default()
+        }
+        .apply(&b)
+        .unwrap();
+        assert_eq!((p.em_threshold, p.em_stop.as_str()), (1e-4, "props"));
     }
 
     #[test]
@@ -596,15 +710,20 @@ mod tests {
             gamma: 0.6,
             matches: true,
             props: true,
+            em_props: true,
             report: true,
             compress: true,
         };
-        assert_eq!(req.paths(), vec!["x.report.zst", "x.matches", "x.props"]);
+        assert_eq!(
+            req.paths(),
+            vec!["x.report.zst", "x.matches", "x.props", "x.em_props.tsv"]
+        );
         let props = TableRequest {
             out: "x",
             gamma: 0.6,
             matches: false,
             props: true,
+            em_props: false,
             report: false,
             compress: false,
         };

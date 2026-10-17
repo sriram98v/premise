@@ -7,6 +7,7 @@ use super::{
     AlignRow, EmIter, EmStats, PhaseTimes, ReadRows, RefMap, ReportHead, ReportMeta, ReportTree,
     ReportVertex, RunParams, TaxonomyStats, VertexStatus,
 };
+use crate::em::Stop;
 use crate::utils::EMProb;
 use crate::SeqId;
 use anyhow::{anyhow, bail, Context, Result};
@@ -164,6 +165,10 @@ impl MetaBuilder {
                         num(get(&pairs, "em_threshold", "PARAMS")?, "em_threshold")?,
                         "em_threshold",
                     )?,
+                    // Absent from reports written before the criterion was a choice.
+                    em_stop: get(&pairs, "em_stop", "PARAMS")
+                        .unwrap_or(Stop::Loglik.name())
+                        .to_string(),
                     init: get(&pairs, "init", "PARAMS")?.to_string(),
                     penalty: flag(get(&pairs, "penalty", "PARAMS")?, "penalty")?,
                 })
@@ -942,6 +947,7 @@ pub(crate) mod tests {
                     rho: 150.0,
                     omega: 1e-10,
                     em_threshold: 1e-6,
+                    em_stop: "loglik".into(),
                     init: "split".into(),
                     penalty: true,
                 },
@@ -1106,6 +1112,26 @@ pub(crate) mod tests {
         assert_eq!(got, head);
         assert_eq!(n, 0);
         assert_eq!(sample_head().meta.source, None);
+    }
+
+    #[test]
+    fn em_stop_round_trips_and_defaults_to_loglik() {
+        let mut head = sample_head();
+        head.meta.params.em_stop = "props".into();
+        let mut w = ReportWriter::begin(Vec::new(), &head, 0).unwrap();
+        w.end_alignments().unwrap();
+        let text = String::from_utf8(w.finish(&Profile::default()).unwrap()).unwrap();
+        assert!(
+            text.contains(" em_threshold=1e-6 em_stop=props init="),
+            "{text}"
+        );
+        let (got, _, _) = ReportReader::parse_head(text.as_bytes()).unwrap();
+        assert_eq!(got, head);
+        // Reports written before the criterion was a choice stopped on the log-likelihood.
+        let old = text.replacen(" em_stop=props", "", 1);
+        assert_ne!(old, text);
+        let (got, _, _) = ReportReader::parse_head(old.as_bytes()).unwrap();
+        assert_eq!(got.meta.params.em_stop, "loglik");
     }
 
     /// `PREMISE_TIMING_REPORT=x.report.zst cargo test --release -- --ignored

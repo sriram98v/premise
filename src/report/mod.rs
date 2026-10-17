@@ -300,6 +300,8 @@ pub struct RunParams {
     pub rho: EMProb,
     pub omega: EMProb,
     pub em_threshold: EMProb,
+    /// What `em_threshold` measures: `loglik` or `props` ([`crate::em::Stop`]).
+    pub em_stop: String,
     pub init: String,
     pub penalty: bool,
 }
@@ -382,13 +384,14 @@ impl ReportMeta {
             format!(", refit of {}", s.replace(['[', ']'], "_"))
         });
         format!(
-            "{} EM: init={} iter={} rho={:e} omega={:e} em_threshold={:e} penalty={}; {} iterations, final penalized log-likelihood {}{}",
+            "{} EM: init={} iter={} rho={:e} omega={:e} em_threshold={:e} em_stop={} penalty={}; {} iterations, final penalized log-likelihood {}{}",
             self.tool.replace(['[', ']'], "_"),
             p.init,
             p.iter,
             p.rho,
             p.omega,
             p.em_threshold,
+            p.em_stop,
             u8::from(p.penalty),
             e.iterations,
             final_ll,

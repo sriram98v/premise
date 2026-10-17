@@ -94,7 +94,7 @@ fn write_premise<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
     let p = &m.params;
     writeln!(
         out,
-        "\tPARAMS mem={} eps_1={:e} eps_2={:e} iter={} rho={:e} omega={:e} em_threshold={:e} init={} penalty={};",
+        "\tPARAMS mem={} eps_1={:e} eps_2={:e} iter={} rho={:e} omega={:e} em_threshold={:e} em_stop={} init={} penalty={};",
         p.mem,
         p.eps_1,
         p.eps_2,
@@ -102,6 +102,7 @@ fn write_premise<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
         p.rho,
         p.omega,
         p.em_threshold,
+        quote(&p.em_stop),
         quote(&p.init),
         u8::from(p.penalty)
     )?;

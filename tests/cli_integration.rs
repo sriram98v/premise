@@ -536,7 +536,15 @@ fn query_matches_file_has_data_rows() {
         .lines()
         .find(|l| l.trim_start().starts_with("PARAMS "))
         .expect("PARAMS line");
-    for key in ["iter", "rho", "omega", "em_threshold", "init", "penalty"] {
+    for key in [
+        "iter",
+        "rho",
+        "omega",
+        "em_threshold",
+        "em_stop",
+        "init",
+        "penalty",
+    ] {
         let value = |s: &str| {
             s.split(|c: char| c.is_whitespace() || c == ';')
                 .find_map(|t| t.strip_prefix(&format!("{key}=")).map(str::to_string))
@@ -573,6 +581,59 @@ fn query_matches_file_has_data_rows() {
 
 /// The report holds an ALIGNMENT_LIKELIHOODS block with every read, and ends with the
 /// PROFILE.
+#[test]
+fn query_em_runs_every_iteration_unless_a_criterion_is_given() {
+    let tmpdir = tempfile::tempdir().expect("could not create temp dir");
+    let index = build_index(tmpdir.path());
+    let r1 = fixtures().join("r1.fastq");
+    let r2 = fixtures().join("r2.fastq");
+    let query = |name: &str, extra: &[&str]| {
+        let out = tmpdir.path().join(name);
+        let mut args = vec![
+            "query",
+            "-s",
+            index.to_str().unwrap(),
+            "-1",
+            r1.to_str().unwrap(),
+            "-2",
+            r2.to_str().unwrap(),
+            "-m",
+            "5",
+            "-t",
+            "1",
+            "-i",
+            "300",
+            "-o",
+            out.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        (run(&args), out)
+    };
+    // The fixture converges at once: only a criterion stops it early.
+    let summary = |out: &Path| {
+        let props = fs::read_to_string(out.with_extension("props")).unwrap();
+        props.lines().nth(2).unwrap().to_string()
+    };
+    let (output, out) = query("full", &[]);
+    assert_success(&output);
+    let s = summary(&out);
+    assert!(
+        s.contains("em_stop=none") && s.contains("; 300 iterations,"),
+        "{s}"
+    );
+    let (output, out) = query("early", &["--em_stop", "loglik"]);
+    assert_success(&output);
+    let s = summary(&out);
+    assert!(
+        s.contains("em_stop=loglik") && s.contains("; 50 iterations,"),
+        "{s}"
+    );
+    // A threshold alone would be silently ignored.
+    let (output, _) = query("threshold", &["--em_threshold", "1e-3"]);
+    assert_failure(&output);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--em_stop"));
+}
+
 #[test]
 fn query_report_has_alignments_for_every_read() {
     let tmpdir = tempfile::tempdir().expect("could not create temp dir");

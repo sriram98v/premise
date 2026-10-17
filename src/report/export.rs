@@ -124,7 +124,7 @@ mod tests {
         let out = props_nexus(&head);
         assert!(
             out.starts_with(
-                "#NEXUS\n[PREMISE proportions v1]\n[PREMISE 0.6.0 EM: init=split iter=100 rho=1.5e2 omega=1e-10 em_threshold=1e-6 penalty=1; 1 iterations, final penalized log-likelihood -8e0]\n"
+                "#NEXUS\n[PREMISE proportions v1]\n[PREMISE 0.6.0 EM: init=split iter=100 rho=1.5e2 omega=1e-10 em_threshold=1e-6 em_stop=loglik penalty=1; 1 iterations, final penalized log-likelihood -8e0]\n"
             ),
             "{out}"
         );
