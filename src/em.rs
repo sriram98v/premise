@@ -416,8 +416,41 @@ impl Init {
     }
 }
 
-/// Iterations the EM always runs (up to `num_iter`) before the convergence threshold may
-/// stop it.
+/// What the convergence threshold measures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Stop {
+    /// No early stop: the EM runs all `num_iter` iterations.
+    #[default]
+    None,
+    /// Relative change in the penalized log-likelihood.
+    Loglik,
+    /// Euclidean distance between the leaf proportion vectors of consecutive iterations
+    /// in inverse-softmax (centred log-ratio) space, over the leaves holding at least one
+    /// read's worth of mass (`1 / N`) before or after the iteration.
+    Props,
+}
+
+impl Stop {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::None),
+            "loglik" => Some(Self::Loglik),
+            "props" => Some(Self::Props),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Loglik => "loglik",
+            Self::Props => "props",
+        }
+    }
+}
+
+/// Iterations the EM always runs (up to `num_iter`) before a stopping criterion may stop
+/// it.
 pub const MIN_EM_ITER: usize = 50;
 
 /// Settings of [`estimate_proportions`].
@@ -427,9 +460,10 @@ pub struct EmParams {
     /// Penalty weight; also the minimum expected reads a vertex needs to survive. 0 = plain EM.
     pub rho: EMProb,
     pub omega: EMProb,
-    /// Relative change in the penalized log-likelihood that stops the iteration, once
-    /// [`MIN_EM_ITER`] iterations have run.
+    /// Change (in what `stop` measures) that stops the iteration, once [`MIN_EM_ITER`]
+    /// iterations have run; unused with [`Stop::None`].
     pub em_threshold: EMProb,
+    pub stop: Stop,
 }
 
 /// Result of [`estimate_proportions`].
@@ -456,6 +490,20 @@ pub fn estimate_proportions(
     part: &mut Partition,
     p: &EmParams,
     progress: Option<Arc<QueryProgress>>,
+) -> EmFit {
+    estimate_proportions_traced(csr, tree, part, p, progress, &mut |_| {})
+}
+
+/// [`estimate_proportions`], handing `on_iter` the `π̃_s` of every column before each
+/// iteration and once more after the last: the initial state, then one call per
+/// iteration run.
+pub fn estimate_proportions_traced(
+    csr: &CsrLikelihood,
+    tree: &mut TaxTree,
+    part: &mut Partition,
+    p: &EmParams,
+    progress: Option<Arc<QueryProgress>>,
+    on_iter: &mut dyn FnMut(&[EMProb]),
 ) -> EmFit {
     if csr.n_refs() == 0 {
         return EmFit {
@@ -488,11 +536,15 @@ pub fn estimate_proportions(
     let mut ll_trace = vec![penalized(csr, tree, part)];
     let mut pi_trace: Vec<Vec<(NodeID, EMProb)>> = Vec::new();
     let (mut n_pruned, mut n_collapsed, mut root_collapsed) = (0, 0, false);
+    // One read's worth of mass: leaves below it on both sides of an iteration are ignored
+    // by `Stop::Props`, or a leaf decaying towards 0 would never let the EM stop.
+    let floor = 1.0 / csr.n_reads().max(1) as EMProb;
+    let mut node_pi = leaf_marginals(tree);
 
     for i in 0..p.num_iter {
-        let node_pi = leaf_marginals(tree);
         pi_trace.push(leaf_proportions(tree, &node_pi));
         let pi = contig_pi(part, &node_pi);
+        on_iter(&pi);
         let (ll, m, _) = csr.e_step(&pi);
         subtree_counts(tree, part, &m);
         let report = if p.rho > 0.0 {
@@ -504,18 +556,26 @@ pub fn estimate_proportions(
         n_collapsed += report.collapsed;
         root_collapsed |= report.root_collapsed;
         m_step(tree, p.rho, p.omega);
+        let next_pi = leaf_marginals(tree);
 
         let lp = ll - penalty(tree, p.rho, p.omega);
         let prev = *ll_trace.last().expect("seeded");
         ll_trace.push(lp);
-        let diff = lp - prev;
-        pb.set_message(format!("{diff:.3e}"));
+        let change = match p.stop {
+            Stop::None => None,
+            Stop::Loglik => Some((lp - prev).abs() / lp.abs().max(1.0)),
+            Stop::Props => Some(clr_distance(tree.get_leaf_ids(), &node_pi, &next_pi, floor)),
+        };
+        node_pi = next_pi;
+        pb.set_message(match change {
+            Some(c) => format!("{} change {c:.3e}", p.stop.name()),
+            None => format!("penalized LL {lp:.6e}"),
+        });
         pb.inc(1);
         if let Some(ref pr) = progress {
             pr.em_iter_done.store((i + 1) as u64, Ordering::Relaxed);
         }
-        let scale = lp.abs().max(1.0);
-        let converged = !report.changed() && diff.abs() <= p.em_threshold * scale;
+        let converged = change.is_some_and(|c| !report.changed() && c <= p.em_threshold);
         if i + 1 >= MIN_EM_ITER && converged {
             break;
         }
@@ -526,9 +586,9 @@ pub fn estimate_proportions(
         ll_trace.last().unwrap()
     ));
 
-    let node_pi = leaf_marginals(tree);
     pi_trace.push(leaf_proportions(tree, &node_pi));
     let pi_tilde = contig_pi(part, &node_pi);
+    on_iter(&pi_tilde);
     EmFit {
         node_pi,
         pi_tilde,
@@ -538,6 +598,36 @@ pub fn estimate_proportions(
         collapsed: n_collapsed,
         root_collapsed,
     }
+}
+
+/// Euclidean distance between `prev` and `next` in inverse-softmax space, over the
+/// `leaves` holding at least `floor` in either. The inverse softmax is fixed up to its
+/// additive constant by centring (the centred log-ratio `ln π_ℓ − mean ln π`), so this is
+/// `‖d − mean d‖` for `d_ℓ = ln π'_ℓ − ln π_ℓ`. Infinite when a kept leaf is 0 on one
+/// side.
+fn clr_distance(
+    leaves: impl Iterator<Item = NodeID>,
+    prev: &[EMProb],
+    next: &[EMProb],
+    floor: EMProb,
+) -> EMProb {
+    let mut d = Vec::new();
+    for l in leaves {
+        let a = prev.get(l).copied().unwrap_or(0.0);
+        let b = next.get(l).copied().unwrap_or(0.0);
+        if a.max(b) < floor {
+            continue;
+        }
+        if a <= 0.0 || b <= 0.0 {
+            return EMProb::INFINITY;
+        }
+        d.push(b.ln() - a.ln());
+    }
+    if d.is_empty() {
+        return 0.0;
+    }
+    let mean = d.iter().sum::<EMProb>() / d.len() as EMProb;
+    d.iter().map(|x| (x - mean).powi(2)).sum::<EMProb>().sqrt()
 }
 
 /// `(leaf, π_ℓ)` for every leaf with mass, by node id.
@@ -681,6 +771,7 @@ mod tests {
             rho,
             omega: 1e-10,
             em_threshold: 1e-9,
+            stop: Stop::Loglik,
         }
     }
 
@@ -975,21 +1066,145 @@ mod tests {
         rows.extend(std::iter::repeat_n(&[1.0, 0.0][..], 30));
         rows.extend(std::iter::repeat_n(&[0.0, 1.0][..], 10));
         let m = csr(&rows);
-        let run = |num_iter: usize| {
+        for stop in [Stop::Loglik, Stop::Props] {
+            let run = |num_iter: usize| {
+                let (mut t, mut part) = star(2);
+                let p = EmParams {
+                    num_iter,
+                    em_threshold: 1e-3,
+                    stop,
+                    ..params(0.0)
+                };
+                estimate_proportions(&m, &mut t, &mut part, &p, None)
+                    .ll_trace
+                    .len()
+                    - 1
+            };
+            assert_eq!(run(500), MIN_EM_ITER, "{stop:?}");
+            // --iter stays the cap below the minimum.
+            assert_eq!(run(20), 20, "{stop:?}");
+        }
+        // Without a criterion the EM runs every iteration, converged or not.
+        let (mut t, mut part) = star(2);
+        let p = EmParams {
+            num_iter: 500,
+            em_threshold: 1e-3,
+            stop: Stop::None,
+            ..params(0.0)
+        };
+        let fit = estimate_proportions(&m, &mut t, &mut part, &p, None);
+        assert_eq!(fit.ll_trace.len() - 1, 500);
+        assert_eq!(Stop::default(), Stop::None);
+        assert_eq!(Stop::parse("none"), Some(Stop::None));
+    }
+
+    #[test]
+    fn traced_em_reports_the_initial_state_and_every_iteration() {
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 1.0][..], 20));
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0][..], 10));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0][..], 5));
+        let m = csr(&rows);
+        let (mut t, mut part) = star(2);
+        let p = EmParams {
+            num_iter: 7,
+            ..params(0.0)
+        };
+        let mut trace: Vec<Vec<EMProb>> = Vec::new();
+        let fit = estimate_proportions_traced(&m, &mut t, &mut part, &p, None, &mut |pi| {
+            trace.push(pi.to_vec())
+        });
+        assert_eq!(trace.len(), 8);
+        // split init: the 20 tied reads share one count, so (10 + 10, 5 + 10) / 35
+        assert!((trace[0][0] - 20.0 / 35.0).abs() < 1e-12, "{:?}", trace[0]);
+        assert_eq!(trace.last().unwrap(), &fit.pi_tilde);
+        for row in &trace {
+            assert!((row.iter().sum::<EMProb>() - 1.0).abs() < 1e-12, "{row:?}");
+        }
+        // the EM moves towards the MLE (2/3, 1/3) every iteration
+        assert!(trace.windows(2).all(|w| w[1][0] > w[0][0]), "{trace:?}");
+        // the untraced EM is the same fit
+        let (mut t2, mut part2) = star(2);
+        let plain = estimate_proportions(&m, &mut t2, &mut part2, &p, None);
+        assert_eq!(plain.pi_tilde, fit.pi_tilde);
+    }
+
+    #[test]
+    fn clr_distance_is_euclidean_in_inverse_softmax_space() {
+        // (1/2, 1/2) → (2/3, 1/3): clr vectors ±ln(1)/2 and ±ln(2)/2, ln 2 / √2 apart.
+        let got = clr_distance(0..2, &[0.5, 0.5], &[2.0 / 3.0, 1.0 / 3.0], 1e-3);
+        let want = std::f64::consts::LN_2 / std::f64::consts::SQRT_2;
+        assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        // the softmax constant drops out: a common factor moves nothing
+        let prev = [0.0, 0.5, 0.3, 0.2];
+        let scaled: Vec<EMProb> = prev.iter().map(|p| p * 0.5).collect();
+        assert!(clr_distance(1..4, &prev, &scaled, 1e-3).abs() < 1e-12);
+        // a leaf below the floor on both sides is left out of the vectors
+        let prev = [0.0, 0.5, 0.25, 1e-4];
+        let next = [0.0, 0.5, 0.25, 5e-5];
+        assert_eq!(clr_distance(1..4, &prev, &next, 1e-3), 0.0);
+        assert!(clr_distance(1..4, &prev, &next, 1e-5) > 0.5);
+        // a leaf rising from 0 past the floor has not settled
+        assert_eq!(
+            clr_distance(1..4, &[0.0, 0.5, 0.25, 0.0], &[0.0, 0.5, 0.25, 0.01], 1e-3),
+            EMProb::INFINITY
+        );
+        assert_eq!(clr_distance(1..4, &prev, &prev, 1e-3), 0.0);
+    }
+
+    /// The `Stop::Props` change over the last iteration, from the fit's own trace.
+    fn last_props_change(fit: &EmFit, floor: EMProb) -> EMProb {
+        let n = fit.pi_trace.len();
+        let dense = |rows: &[(NodeID, EMProb)]| {
+            let mut v = vec![0.0; 16];
+            for &(l, p) in rows {
+                v[l] = p;
+            }
+            v
+        };
+        clr_distance(
+            0..16,
+            &dense(&fit.pi_trace[n - 2]),
+            &dense(&fit.pi_trace[n - 1]),
+            floor,
+        )
+    }
+
+    #[test]
+    fn props_stop_runs_until_the_proportions_settle() {
+        // Twins: most reads fit both references equally and only 15 tell them apart, so
+        // the EM creeps towards π = (2/3, 1/3) and the mass keeps drifting long after the
+        // log-likelihood has flattened.
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 1.0][..], 1000));
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0][..], 10));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0][..], 5));
+        let m = csr(&rows);
+        let floor = 1.0 / m.n_reads() as EMProb;
+        let run = |stop: Stop| {
             let (mut t, mut part) = star(2);
             let p = EmParams {
-                num_iter,
-                em_threshold: 1e-3,
+                num_iter: 100_000,
+                em_threshold: 1e-6,
+                stop,
                 ..params(0.0)
             };
             estimate_proportions(&m, &mut t, &mut part, &p, None)
-                .ll_trace
-                .len()
-                - 1
         };
-        assert_eq!(run(500), MIN_EM_ITER);
-        // --iter stays the cap below the minimum.
-        assert_eq!(run(20), 20);
+        let (ll, props) = (run(Stop::Loglik), run(Stop::Props));
+        let iters = |f: &EmFit| f.ll_trace.len() - 1;
+        assert!(
+            iters(&ll) < iters(&props),
+            "{} {}",
+            iters(&ll),
+            iters(&props)
+        );
+        assert!(iters(&props) < 100_000, "props stop never fired");
+        assert!(last_props_change(&ll, floor) > 1e-6);
+        assert!(last_props_change(&props, floor) <= 1e-6);
+        assert_eq!(Stop::parse("props"), Some(Stop::Props));
+        assert_eq!(Stop::parse(Stop::Loglik.name()), Some(Stop::Loglik));
+        assert_eq!(Stop::parse("tv"), None);
     }
 
     #[test]

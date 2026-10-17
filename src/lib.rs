@@ -23,8 +23,9 @@ use analyze::{run_analyze, AnalyzeOutputs, AnalyzeParams};
 use anyhow::{Context, Result};
 use bio::stats::LogProb;
 use chrono::Local;
+use clap::parser::ValueSource;
 use clap::{arg, Arg, ArgAction, Command};
-use em::Init;
+use em::{Init, Stop};
 use haystackfm::alphabet::decode_char;
 use io::{
     all_read_ids, load_fastq_forward, load_fastq_reverse, pair_reads, read_index_file,
@@ -111,7 +112,7 @@ pub fn run_alignment<W: Write>(
 
 /// The EM arguments, without defaults: `query` adds its own, `analyze` takes the
 /// report's for anything left unset.
-fn em_args() -> [Arg; 5] {
+fn em_args() -> [Arg; 6] {
     [
         arg!(-i --iter <ITER>"Number of iterations for EM")
             .value_parser(clap::value_parser!(usize)),
@@ -119,8 +120,10 @@ fn em_args() -> [Arg; 5] {
             .value_parser(clap::value_parser!(EMProb)),
         arg!(--rho <RHO>"Penalty weight rho: > 0 turns the penalty on, 0 leaves it off")
             .value_parser(clap::value_parser!(EMProb)),
-        arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold: relative change in the penalized log-likelihood, checked once 50 iterations have run")
+        arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold on the change --em_stop measures, checked once 50 iterations have run (needs --em_stop)")
             .value_parser(clap::value_parser!(EMProb)),
+        arg!(--em_stop <EM_STOP> "Stopping criterion: `none` (run all --iter iterations), `loglik` (relative change in the penalized log-likelihood) or `props` (Euclidean distance between consecutive leaf proportion vectors in inverse-softmax space, over leaves holding at least one read's worth of mass)")
+            .value_parser(["none", "loglik", "props"]),
         arg!(--init <INIT> "Initial conditionals: `split` (each read's best-scoring sequences share one count, ties split evenly) or `uniform` (1/|children| at every vertex)")
             .value_parser(["split", "uniform"]),
     ]
@@ -134,7 +137,7 @@ fn threads_arg() -> Arg {
 
 /// The `query` arguments (everything but `--gamma` and `--matches`).
 fn query_args(cmd: Command) -> Command {
-    let [iter, omega, rho, em_threshold, init] = em_args();
+    let [iter, omega, rho, em_threshold, em_stop, init] = em_args();
     cmd.arg(arg!(-s --source <SRC_FILE> "Source index file with reference sequences(.fmidx)")
             .required(true)
             .value_parser(clap::value_parser!(String))
@@ -167,6 +170,7 @@ fn query_args(cmd: Command) -> Command {
             .value_parser(clap::value_parser!(EMProb))
             )
         .arg(em_threshold.default_value("1e-6"))
+        .arg(em_stop.default_value("none"))
         .arg(threads_arg())
         .arg(arg!(--seq2taxid <MAP_FILE> "seqid2taxid.map (seqid<whitespace>taxid) assigning index sequences to taxa: every sequence becomes a leaf under its taxid, an internal vertex the EM can report; sequences without a taxid hang under the root")
             .required(false)
@@ -183,7 +187,7 @@ fn query_args(cmd: Command) -> Command {
 /// The `analyze` arguments: the report, the output prefix, which tables, and the EM
 /// overrides that make it a refit.
 fn analyze_args(cmd: Command) -> Command {
-    let [iter, omega, rho, em_threshold, init] = em_args();
+    let [iter, omega, rho, em_threshold, em_stop, init] = em_args();
     cmd.arg(arg!(-r --report <REPORT> "Report written by `query` or an earlier `analyze` (.report or .report.zst)")
             .required(true)
             .value_parser(clap::value_parser!(String))
@@ -197,6 +201,11 @@ fn analyze_args(cmd: Command) -> Command {
         .arg(Arg::new("props")
             .long("props")
             .help("Write <OUT_FILE>.props: the fitted taxonomy as NEXUS, with the proportion of every vertex that has any")
+            .num_args(0)
+            .action(ArgAction::SetTrue))
+        .arg(Arg::new("em-props")
+            .long("em-props")
+            .help("Write <OUT_FILE>.em_props.tsv: one row per EM iteration (0 = the initial state), one column per reference with its proportion. Runs the EM (with the report's parameters unless overridden)")
             .num_args(0)
             .action(ArgAction::SetTrue))
         .arg(Arg::new("write-report")
@@ -216,6 +225,7 @@ fn analyze_args(cmd: Command) -> Command {
         .arg(rho.help("Refit: penalty weight rho; > 0 turns the penalty on, 0 turns it off (default: the report's)")
             .conflicts_with("no-penalty"))
         .arg(em_threshold.help("Refit: EM convergence threshold (default: the report's)"))
+        .arg(em_stop.help("Refit: stopping criterion, none, loglik or props (default: the report's)"))
         .arg(init.help("Refit: initial conditionals, split or uniform (default: the report's)"))
         .arg(Arg::new("no-penalty")
             .long("no-penalty")
@@ -264,6 +274,8 @@ fn analyze_params(sub_m: &clap::ArgMatches) -> AnalyzeParams<'_> {
         rho: *sub_m.get_one::<EMProb>("rho").expect("defaulted"),
         omega: *sub_m.get_one::<EMProb>("omega").expect("defaulted"),
         em_threshold: *sub_m.get_one::<EMProb>("em_threshold").expect("defaulted"),
+        em_stop: Stop::parse(sub_m.get_one::<String>("em_stop").expect("defaulted"))
+            .expect("clap restricts the values"),
         use_penalty: *sub_m.get_one::<EMProb>("rho").expect("defaulted") > 0.0,
         threads: *sub_m.get_one::<usize>("threads").expect("defaulted"),
         seq2taxid: sub_m.get_one::<String>("seq2taxid").map(String::as_str),
@@ -483,6 +495,13 @@ pub fn run() -> Result<()> {
             let no_report = sub_m.get_flag("no-report");
             let compress = sub_m.get_flag("compress");
             let params = analyze_params(sub_m);
+            if params.em_stop == Stop::None
+                && sub_m.value_source("em_threshold") == Some(ValueSource::CommandLine)
+            {
+                anyhow::bail!(
+                    "--em_threshold needs a stopping criterion: give --em_stop loglik or props"
+                );
+            }
             let report_path = if compress {
                 format!("{}.report.zst", outfile)
             } else {
@@ -549,6 +568,7 @@ pub fn run() -> Result<()> {
                 gamma: parse_gamma(sub_m)?,
                 matches: sub_m.get_flag("matches"),
                 props: sub_m.get_flag("props"),
+                em_props: sub_m.get_flag("em-props"),
                 report: sub_m.get_flag("write-report"),
                 compress: sub_m.get_flag("compress"),
             };
@@ -557,6 +577,9 @@ pub fn run() -> Result<()> {
                 omega: sub_m.get_one::<EMProb>("omega").copied(),
                 iter: sub_m.get_one::<usize>("iter").copied(),
                 em_threshold: sub_m.get_one::<EMProb>("em_threshold").copied(),
+                em_stop: sub_m
+                    .get_one::<String>("em_stop")
+                    .map(|s| Stop::parse(s).expect("clap restricts the values")),
                 init: sub_m
                     .get_one::<String>("init")
                     .map(|i| Init::parse(i).expect("clap restricts the values")),

@@ -460,6 +460,7 @@ fn handle_query_run(
             rho,
             omega,
             em_threshold,
+            em_stop: crate::em::Stop::Loglik,
             use_penalty,
             threads,
             seq2taxid: None,

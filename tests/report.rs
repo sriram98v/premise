@@ -159,7 +159,15 @@ fn kv(text: &str, key: &str) -> String {
 /// The EM settings of a summary are the report's PARAMS.
 fn assert_summary_params(summary: &str, report: &str) {
     let params = premise_line(report, "PARAMS");
-    for key in ["init", "iter", "rho", "omega", "em_threshold", "penalty"] {
+    for key in [
+        "init",
+        "iter",
+        "rho",
+        "omega",
+        "em_threshold",
+        "em_stop",
+        "penalty",
+    ] {
         assert_eq!(kv(summary, key), kv(&params, key), "{summary}\nvs {params}");
     }
 }
@@ -1063,7 +1071,7 @@ fn analyze_needs_an_output_and_a_valid_gamma() {
     let no_output = run(&["analyze", "-r", r, "-o", o]);
     assert!(!no_output.status.success());
     assert!(String::from_utf8_lossy(&no_output.stderr)
-        .contains("analyze: nothing to do; give --matches, --props or --write-report"));
+        .contains("analyze: nothing to do; give --matches, --props, --em-props or --write-report"));
     let bad_gamma = run(&["analyze", "-r", r, "--matches", "--gamma", "1", "-o", o]);
     assert!(!bad_gamma.status.success());
     assert!(String::from_utf8_lossy(&bad_gamma.stderr).contains("--gamma must be in [0.5, 1)"));
@@ -1409,6 +1417,93 @@ fn report_omits_what_the_em_regenerates() {
     );
 }
 
+/// `.em_props.tsv` as its header and rows of `(iteration, proportions)`.
+fn em_props(path: &Path) -> (Vec<String>, Vec<(usize, Vec<f64>)>) {
+    let text = read(path);
+    let mut lines = text.lines();
+    let header: Vec<String> = lines
+        .next()
+        .unwrap()
+        .split('\t')
+        .map(String::from)
+        .collect();
+    assert_eq!(header[0], "iteration", "{text}");
+    let rows = lines
+        .map(|l| {
+            let mut c = l.split('\t');
+            let it = c.next().unwrap().parse().unwrap();
+            let pi: Vec<f64> = c.map(|v| v.parse().unwrap()).collect();
+            assert_eq!(pi.len(), header.len() - 1, "{l}");
+            (it, pi)
+        })
+        .collect();
+    (header, rows)
+}
+
+#[test]
+fn em_props_traces_every_reference_at_every_iteration() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = build_index(tmp.path());
+    let q = tmp.path().join("q");
+    let cfg = Cfg {
+        tree: false,
+        rho: None,
+    };
+    ok(&run_owned(&query_args(&index, tmp.path(), &q, &cfg)));
+    let q_report = with_ext(&q, "report");
+    let e = tmp.path().join("e");
+    let out = run(&[
+        "analyze",
+        "-r",
+        q_report.to_str().unwrap(),
+        "-o",
+        e.to_str().unwrap(),
+        "--em-props",
+        "--props",
+    ]);
+    ok(&out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("e.em_props.tsv"));
+    let (header, rows) = em_props(&with_ext(&e, "em_props.tsv"));
+    // One column per REFMAP reference, named by its sequence.
+    let report = read(&q_report);
+    let n_refs = matrix_lines(&block(&report, "REFMAP")).len();
+    assert_eq!(header.len() - 1, n_refs, "{header:?}");
+    assert!(header.iter().any(|h| h == "ref_A"), "{header:?}");
+    // The query ran its 20 iterations (no stopping criterion): the initial state + 20.
+    assert_eq!(
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        (0..=20).collect::<Vec<_>>()
+    );
+    for (it, pi) in &rows {
+        let s: f64 = pi.iter().sum();
+        assert!((s - 1.0).abs() < 1e-9, "iteration {it} sums to {s}");
+    }
+    // The last row is the fit the tables of the same call come from.
+    let last = &rows.last().unwrap().1;
+    for (label, p) in props_map(&read(&with_ext(&e, "props"))) {
+        let col = header.iter().position(|h| *h == label).unwrap() - 1;
+        assert!(
+            (last[col] - p).abs() < 1e-12,
+            "{label}: {} vs {p}",
+            last[col]
+        );
+    }
+    // Refit overrides apply: 7 iterations, 8 rows.
+    let e7 = tmp.path().join("e7");
+    ok(&run(&[
+        "analyze",
+        "-r",
+        q_report.to_str().unwrap(),
+        "-o",
+        e7.to_str().unwrap(),
+        "--em-props",
+        "--iter",
+        "7",
+    ]));
+    assert_eq!(em_props(&with_ext(&e7, "em_props.tsv")).1.len(), 8);
+    assert!(!with_ext(&e7, "props").exists());
+}
+
 #[test]
 fn refit_with_the_reports_parameters_reproduces_the_fit() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1639,6 +1734,8 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
             "1",
             "--em_threshold",
             "1e-3",
+            "--em_stop",
+            "props",
             "--init",
             "uniform",
         ],
@@ -1649,6 +1746,7 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
         "rho=2e0",
         "omega=1e-5",
         "em_threshold=1e-3",
+        "em_stop=props",
         "init=uniform",
         "penalty=1",
         "mem=5 ",
