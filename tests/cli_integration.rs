@@ -57,18 +57,79 @@ fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Regenerate the legacy `.props` / `.nodes` tables of a query from its report.
-fn export_tables(prefix: &Path) {
-    let p = prefix.display();
-    assert_success(&run(&[
-        "analyze",
-        "-r",
-        &format!("{p}.report"),
-        "-o",
-        &p.to_string(),
-        "--props",
-        "--nodes",
-    ]));
+/// Split a NEXUS row into tokens, keeping `'quoted labels'` together (`''` inside quotes
+/// is a literal quote).
+fn nexus_tokens(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                cur.push('\'');
+            }
+            '\'' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The PROPORTIONS rows of a query's NEXUS `.props`, in pre-order: (label, parent label
+/// or `-`, rank, proportion). Checks that the first row is the root with all the mass and
+/// that every other row's parent is an earlier row.
+fn props_rows(prefix: &Path) -> Vec<(String, String, String, f64)> {
+    let path = format!("{}.props", prefix.display());
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert!(
+        text.starts_with("#NEXUS\n[PREMISE proportions v1]\n"),
+        "{text}"
+    );
+    let start = text.find("BEGIN PROPORTIONS;").expect("PROPORTIONS block");
+    let rows: Vec<(String, String, String, f64)> = text[start..]
+        .lines()
+        .skip_while(|l| !l.contains("MATRIX"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .map(|l| {
+            let c = nexus_tokens(l);
+            assert_eq!(c.len(), 4, "malformed props row: {l}");
+            let p = c[3]
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("non-numeric proportion in props row: {l}"));
+            (c[0].clone(), c[1].clone(), c[2].clone(), p)
+        })
+        .collect();
+    let (root, rest) = rows.split_first().expect("a root row");
+    assert_eq!((root.1.as_str(), root.2.as_str()), ("-", "root"), "{text}");
+    assert!((root.3 - 1.0).abs() < 1e-9, "{text}");
+    for (i, (label, parent, ..)) in rest.iter().enumerate() {
+        assert!(
+            rows[..=i].iter().any(|r| r.0 == *parent),
+            "{label}: parent {parent} not an earlier row\n{text}"
+        );
+    }
+    rows
+}
+
+/// The leaves of the `.props` tree (rows that are no other row's parent): the final EM
+/// leaves with mass, label → proportion.
+fn props_leaves(prefix: &Path) -> std::collections::BTreeMap<String, f64> {
+    let rows = props_rows(prefix);
+    rows.iter()
+        .filter(|(label, ..)| !rows.iter().any(|r| r.1 == *label))
+        .map(|(label, _, _, p)| (label.clone(), *p))
+        .collect()
 }
 
 /// The ALIGNMENT_LIKELIHOODS block of a report (between its `BEGIN` and `END;`).
@@ -108,11 +169,14 @@ fn aligns_no_pos(prefix: &Path) -> String {
 }
 
 /// A `.matches` table without its position columns: where a mate has equal-likelihood
-/// placements, which one is reported varies from run to run.
+/// placements, which one is reported varies from run to run. The leading `#` EM summary
+/// is dropped too: its full-precision log-likelihood is a float sum whose order is not
+/// fixed between two separate runs.
 fn matches_no_pos(path: &Path) -> String {
     fs::read_to_string(path)
         .unwrap()
         .lines()
+        .filter(|l| !l.starts_with('#'))
         .map(|l| l.split('\t').take(3).collect::<Vec<_>>().join("\t"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -329,10 +393,9 @@ fn query_end_to_end_produces_output_files() {
 
     assert_success(&output);
 
-    // The report and the matches table must exist, and the legacy tables must be
-    // recoverable from the report.
-    export_tables(&outprefix);
-    for ext in &["matches", "report", "props", "nodes"] {
+    // The report, the matches table and the proportions tree must exist; there is no
+    // `.nodes` table any more.
+    for ext in &["matches", "report", "props"] {
         let path = tmpdir.path().join(format!("results.{}", ext));
         assert!(
             path.exists(),
@@ -340,9 +403,10 @@ fn query_end_to_end_produces_output_files() {
             ext
         );
     }
+    assert!(!tmpdir.path().join("results.nodes").exists());
 
-    // matches, report and nodes always have at least a header row
-    for ext in &["matches", "report", "nodes"] {
+    // matches, report and props always have at least a header
+    for ext in &["matches", "report", "props"] {
         let path = tmpdir.path().join(format!("results.{}", ext));
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("could not read {}", path.display()));
@@ -354,11 +418,10 @@ fn query_end_to_end_produces_output_files() {
     }
 }
 
-/// The `.props` output file must exist after a successful query.
+/// `query` always writes the `.props` tree, and names it in its stdout.
 ///
-/// Note: the props file has no header row. Its content may be empty when the
-/// EM assigns zero proportion to all references (a valid outcome for small
-/// datasets under the default penalized EM). We only assert the file exists.
+/// The file is NEXUS: the root (all of the mass) and every final EM vertex with mass
+/// below it, each with a numeric proportion.
 #[test]
 fn query_props_file_exists_after_query() {
     let tmpdir = tempfile::tempdir().expect("could not create temp dir");
@@ -388,27 +451,38 @@ fn query_props_file_exists_after_query() {
         "5",
     ]);
     assert_success(&output);
-    export_tables(&outprefix);
 
-    // File must exist (may be empty — EM can collapse all proportions to 0).
     let props_path = tmpdir.path().join("results.props");
     assert!(
         props_path.exists(),
         "expected results.props to be created by query"
     );
-    // Any non-empty lines that appear must contain a ref_id and a numeric proportion.
+    let out = stdout(&output);
+    assert!(
+        out.contains(props_path.to_str().unwrap()),
+        "expected the .props path in stdout\nactual: {}",
+        out
+    );
+    // Every row parses (props_rows checks the root and the parents); the TAXA block lists
+    // the same labels in the same order.
+    let rows = props_rows(&outprefix);
     let content = fs::read_to_string(&props_path).expect("could not read results.props");
-    for line in content.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        assert_eq!(
-            cols.len(),
-            2,
-            "expected 2 tab-separated columns in props row, got: {}",
-            line
-        );
-        cols[1].parse::<f64>().unwrap_or_else(|_| {
-            panic!("expected numeric proportion in props row, got: {}", cols[1])
-        });
+    let taxa = &content[content.find("BEGIN TAXA;").expect("TAXA block")..];
+    let labels: Vec<String> = taxa
+        .lines()
+        .skip_while(|l| !l.contains("TAXLABELS"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .flat_map(nexus_tokens)
+        .collect();
+    assert_eq!(
+        labels,
+        rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "{content}"
+    );
+    assert!(content.contains("BEGIN TREES;"), "{content}");
+    for (label, _, _, p) in &rows {
+        assert!(*p > 0.0 && *p <= 1.0 + 1e-9, "{label}: {p}");
     }
 }
 
@@ -447,9 +521,54 @@ fn query_matches_file_has_data_rows() {
     let content = fs::read_to_string(&matches_path).expect("could not read results.matches");
     let lines: Vec<&str> = content.lines().collect();
     assert!(
-        !lines.is_empty(),
-        "expected at least a header row in results.matches"
+        lines.len() >= 2,
+        "expected an EM summary and a header row in results.matches"
     );
+
+    // The first line is the EM summary: the report's PARAMS (iter=5 from `-i 5`, rho=0
+    // with the penalty off by default), then the gamma the table was cut at.
+    let summary = lines[0];
+    assert!(summary.starts_with("# PREMISE "), "{summary}");
+    assert!(summary.contains(" EM: init="), "{summary}");
+    assert!(summary.ends_with("; gamma=0.6"), "{summary}");
+    let report = fs::read_to_string(tmpdir.path().join("results.report")).unwrap();
+    let params = report
+        .lines()
+        .find(|l| l.trim_start().starts_with("PARAMS "))
+        .expect("PARAMS line");
+    for key in ["iter", "rho", "omega", "em_threshold", "init", "penalty"] {
+        let value = |s: &str| {
+            s.split(|c: char| c.is_whitespace() || c == ';')
+                .find_map(|t| t.strip_prefix(&format!("{key}=")).map(str::to_string))
+                .unwrap_or_else(|| panic!("no {key}= in {s}"))
+        };
+        assert_eq!(
+            value(summary),
+            value(params),
+            "{key}: {summary} vs {params}"
+        );
+    }
+    assert!(summary.contains(" iter=5 "), "{summary}");
+    assert!(summary.contains("penalty=0"), "{summary}");
+    assert!(lines[1].starts_with("ReadID\t"), "{}", lines[1]);
+
+    // The .props carries the same summary, without the gamma, as its second comment.
+    let props = fs::read_to_string(tmpdir.path().join("results.props")).unwrap();
+    let props_summary = props.lines().nth(2).expect("props EM summary");
+    assert!(
+        props.starts_with("#NEXUS\n[PREMISE proportions v1]\n"),
+        "{props}"
+    );
+    assert!(
+        props_summary.starts_with('[') && props_summary.ends_with(']'),
+        "{props_summary}"
+    );
+    assert!(props_summary.contains("EM: init="), "{props_summary}");
+    let without_gamma = summary
+        .strip_prefix("# ")
+        .and_then(|s| s.strip_suffix("; gamma=0.6"))
+        .unwrap();
+    assert_eq!(&props_summary[1..props_summary.len() - 1], without_gamma);
 }
 
 /// The report holds an ALIGNMENT_LIKELIHOODS block with every read, and ends with the
@@ -624,8 +743,13 @@ fn query_penalty_is_off_by_default() {
         report.contains(" rho=0e0 ") && report.contains(" penalty=0;"),
         "{report}"
     );
-    export_tables(&outprefix);
     assert!(tmpdir.path().join("results_nopenalty.props").exists());
+    // Unpenalized, both references keep their own leaf.
+    let leaves = props_leaves(&outprefix);
+    assert!(
+        leaves.contains_key("ref_A") && leaves.contains_key("ref_B"),
+        "{leaves:?}"
+    );
 
     let output = run(&[
         "query",
@@ -798,37 +922,28 @@ fn query_props_agree_with_corrected_matches() {
         "5",
     ]);
     assert_success(&output);
-    export_tables(&outprefix);
 
     let matches = fs::read_to_string(tmpdir.path().join("agree.matches"))
         .expect("could not read agree.matches");
-    let props =
-        fs::read_to_string(tmpdir.path().join("agree.props")).expect("could not read agree.props");
 
     // Reference -> number of classified reads, straight from .matches (skipping the header).
     let mut matched: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
-    for line in matches.lines().skip(1) {
+    for line in matches.lines().filter(|l| !l.starts_with('#')).skip(1) {
         let cols: Vec<&str> = line.split('\t').collect();
         if cols.len() >= 2 && cols[1] != "unclassified" {
             *matched.entry(cols[1]).or_insert(0) += 1;
         }
     }
 
-    let mut listed: std::collections::BTreeMap<&str, f64> = std::collections::BTreeMap::new();
-    for line in props.lines() {
-        let cols: Vec<&str> = line.split('\t').collect();
-        assert_eq!(cols.len(), 2, "malformed props row: {}", line);
-        listed.insert(
-            cols[0],
-            cols[1].parse::<f64>().expect("non-numeric proportion"),
-        );
-    }
+    // The leaves of the .props tree are the final EM leaves with mass.
+    let listed = props_leaves(&outprefix);
 
-    // A reference can survive EM without winning any read's MAP assignment, so .props is a
-    // superset of the references classified in .matches — never the other way round.
+    // A reference can survive EM without winning any read's assignment, so the leaves of
+    // .props are a superset of the references classified in .matches — never the other
+    // way round.
     for ref_id in matched.keys() {
         assert!(
-            listed.contains_key(ref_id),
+            listed.contains_key(*ref_id),
             "{} is classified in .matches but absent from .props",
             ref_id
         );
@@ -1011,7 +1126,7 @@ fn build_lookup_depth_gives_same_query_results() {
 
     let r1 = fixtures().join("r1.fastq");
     let r2 = fixtures().join("r2.fastq");
-    let query = |index: &Path, tag: &str| -> Vec<String> {
+    let query = |index: &Path, tag: &str| {
         let out = tmpdir.path().join(tag);
         assert_success(&run(&[
             "query",
@@ -1033,15 +1148,21 @@ fn build_lookup_depth_gives_same_query_results() {
             "-i",
             "5",
         ]));
-        export_tables(&out);
-        let mut tables = vec![
+        let tables = vec![
             matches_no_pos(&tmpdir.path().join(format!("{tag}.matches"))),
-            fs::read_to_string(tmpdir.path().join(format!("{tag}.props"))).unwrap(),
+            aligns_no_pos(&out),
         ];
-        tables.push(aligns_no_pos(&out));
-        tables
+        (tables, props_rows(&out))
     };
-    assert_eq!(query(&tabled, "tabled"), query(&plain, "plain"));
+    let (tabled_tables, tabled_props) = query(&tabled, "tabled");
+    let (plain_tables, plain_props) = query(&plain, "plain");
+    assert_eq!(tabled_tables, plain_tables);
+    // The same .props tree; proportions agree up to float summation order between runs.
+    assert_eq!(tabled_props.len(), plain_props.len());
+    for (a, b) in tabled_props.iter().zip(&plain_props) {
+        assert_eq!((&a.0, &a.1, &a.2), (&b.0, &b.1, &b.2));
+        assert!((a.3 - b.3).abs() <= 1e-9, "{a:?} vs {b:?}");
+    }
 }
 
 /// Lookup tables grow as 4^k; a depth past the cap must be rejected, not attempted.

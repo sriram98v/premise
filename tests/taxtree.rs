@@ -114,26 +114,11 @@ fn query(
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(&argv);
     ok(&output);
-    export_tables(&out);
     (out, output)
 }
 
 fn read(prefix: &Path, ext: &str) -> String {
     fs::read_to_string(format!("{}.{}", prefix.display(), ext)).expect("output file")
-}
-
-/// Regenerate the legacy `.props` / `.nodes` tables from the report.
-fn export_tables(prefix: &Path) {
-    let p = prefix.display();
-    ok(&run(&[
-        "analyze",
-        "-r",
-        &format!("{p}.report"),
-        "-o",
-        &p.to_string(),
-        "--props",
-        "--nodes",
-    ]));
 }
 
 /// One block of the report, from `BEGIN <name>;` to its `END;`.
@@ -172,13 +157,19 @@ fn aligns_no_pos(prefix: &Path) -> String {
     out.join("\n")
 }
 
-/// Split a NEXUS row into tokens, keeping `'quoted labels'` together.
+/// Split a NEXUS row into tokens, keeping `'quoted labels'` together (`''` inside quotes
+/// is a literal quote).
 fn nexus_tokens(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
-    for ch in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
+            '\'' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                cur.push('\'');
+            }
             '\'' => quoted = !quoted,
             c if c.is_whitespace() && !quoted => {
                 if !cur.is_empty() {
@@ -194,66 +185,159 @@ fn nexus_tokens(line: &str) -> Vec<String> {
     out
 }
 
-/// Status of every vertex of the report's NODES block, by label (labels come from
-/// TAXLABELS, in NODES order).
-fn vertex_status(prefix: &Path) -> HashMap<String, String> {
-    let labels: Vec<String> = block(prefix, "TAXA")
+/// The token rows of a block's MATRIX, up to its closing `;`.
+fn matrix_rows(block: &str) -> Vec<Vec<String>> {
+    block
+        .lines()
+        .skip_while(|l| !l.contains("MATRIX"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .map(nexus_tokens)
+        .collect()
+}
+
+/// The TAXLABELS of a TAXA block, in order.
+fn taxlabels(block: &str) -> Vec<String> {
+    block
         .lines()
         .skip_while(|l| !l.contains("TAXLABELS"))
         .skip(1)
         .take_while(|l| l.trim() != ";")
         .flat_map(nexus_tokens)
-        .collect();
-    let statuses: Vec<String> = block(prefix, "NODES")
-        .lines()
-        .skip_while(|l| !l.contains("MATRIX"))
-        .skip(1)
-        .filter_map(|l| {
-            let c = nexus_tokens(l);
-            (c.len() == 8).then(|| c[3].clone())
-        })
-        .collect();
-    assert_eq!(labels.len(), statuses.len());
-    labels.into_iter().zip(statuses).collect()
+        .collect()
 }
 
-/// `.nodes` rows keyed by TaxID: (Parent, Rank, Contigs, Count, Proportion, Conditional).
+/// The report's NODES rows with their TAXLABELS label: `(label, row tokens)`.
+fn nodes_rows(prefix: &Path) -> Vec<(String, Vec<String>)> {
+    let labels = taxlabels(&block(prefix, "TAXA"));
+    let rows = matrix_rows(&block(prefix, "NODES"));
+    assert_eq!(labels.len(), rows.len());
+    assert!(rows.iter().all(|r| r.len() == 8), "{rows:?}");
+    labels.into_iter().zip(rows).collect()
+}
+
+/// Status of every vertex of the report's NODES block, by label (labels come from
+/// TAXLABELS, in NODES order).
+fn vertex_status(prefix: &Path) -> HashMap<String, String> {
+    nodes_rows(prefix)
+        .into_iter()
+        .map(|(label, r)| (label, r[3].clone()))
+        .collect()
+}
+
+/// The final tree of the report's NODES block (the `active` and `collapsed` vertices),
+/// keyed by label: (parent label or `-`, rank, contigs, count, proportion, conditional).
 fn nodes_table(prefix: &Path) -> HashMap<String, (String, String, usize, f64, f64, f64)> {
-    read(prefix, "nodes")
-        .lines()
-        .skip(1)
-        .map(|l| {
-            let c: Vec<&str> = l.split('\t').collect();
-            assert_eq!(c.len(), 7, "{l}");
+    let rows = nodes_rows(prefix);
+    let label_of: HashMap<&str, &str> = rows
+        .iter()
+        .map(|(label, r)| (r[0].as_str(), label.as_str()))
+        .collect();
+    let num = |v: &str| -> f64 {
+        if v == "-" {
+            0.0
+        } else {
+            v.parse().unwrap()
+        }
+    };
+    rows.iter()
+        .filter(|(_, r)| r[3] == "active" || r[3] == "collapsed")
+        .map(|(label, r)| {
+            let parent = if r[1] == "-" {
+                "-"
+            } else {
+                label_of[r[1].as_str()]
+            };
             (
-                c[0].to_string(),
+                label.clone(),
                 (
-                    c[1].to_string(),
-                    c[2].to_string(),
-                    c[3].parse().unwrap(),
-                    c[4].parse().unwrap(),
-                    c[5].parse().unwrap(),
-                    c[6].parse().unwrap(),
+                    parent.to_string(),
+                    r[2].clone(),
+                    r[4].parse().unwrap(),
+                    num(&r[5]),
+                    num(&r[6]),
+                    num(&r[7]),
                 ),
             )
         })
         .collect()
 }
 
-fn props(prefix: &Path) -> HashMap<String, f64> {
-    read(prefix, "props")
-        .lines()
-        .map(|l| {
-            let (n, p) = l.split_once('\t').unwrap();
-            (n.to_string(), p.parse().unwrap())
+/// Every row of the NEXUS `.props` tree in pre-order: (label, parent label or `-`, rank,
+/// proportion). Checks the shape on the way: TAXLABELS and DIMENSIONS agree with the
+/// rows, the first row is the root with all the mass, every other row's parent is an
+/// earlier row, and no proportion exceeds its parent's.
+fn props_tree(prefix: &Path) -> Vec<(String, String, String, f64)> {
+    let text = read(prefix, "props");
+    assert!(
+        text.starts_with("#NEXUS\n[PREMISE proportions v1]\n"),
+        "{text}"
+    );
+    let section = |name: &str| -> String {
+        let start = text
+            .find(&format!("BEGIN {name};"))
+            .unwrap_or_else(|| panic!("no {name} block"));
+        let end = text[start..].find("END;").expect("block end") + start;
+        text[start..end].to_string()
+    };
+    let rows: Vec<(String, String, String, f64)> = matrix_rows(&section("PROPORTIONS"))
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.len(), 4, "{r:?}");
+            (
+                r[0].clone(),
+                r[1].clone(),
+                r[2].clone(),
+                r[3].parse().unwrap(),
+            )
         })
+        .collect();
+    let labels = taxlabels(&section("TAXA"));
+    assert_eq!(
+        labels,
+        rows.iter().map(|r| r.0.clone()).collect::<Vec<_>>(),
+        "{text}"
+    );
+    assert!(
+        section("PROPORTIONS").contains(&format!("DIMENSIONS N={};", rows.len())),
+        "{text}"
+    );
+    let (root, rest) = rows.split_first().expect("a root row");
+    assert_eq!((root.1.as_str(), root.2.as_str()), ("-", "root"), "{text}");
+    assert!((root.3 - 1.0).abs() < 1e-9, "{text}");
+    let mut seen: HashMap<&str, f64> = HashMap::from([(root.0.as_str(), root.3)]);
+    for (label, parent, _, p) in rest {
+        let up = seen
+            .get(parent.as_str())
+            .unwrap_or_else(|| panic!("{label}: parent {parent} not an earlier row\n{text}"));
+        assert!(
+            *p > 0.0 && *p <= up + 1e-9,
+            "{label}: {p} under {up}\n{text}"
+        );
+        seen.insert(label.as_str(), *p);
+    }
+    rows
+}
+
+/// The leaves of the `.props` tree (the rows that are no other row's parent): label →
+/// proportion, i.e. the final EM leaves with mass.
+fn props(prefix: &Path) -> HashMap<String, f64> {
+    let rows = props_tree(prefix);
+    rows.iter()
+        .filter(|(label, ..)| !rows.iter().any(|r| r.1 == *label))
+        .map(|(label, _, _, p)| (label.clone(), *p))
         .collect()
+}
+
+/// The rows of a `.matches` table after its leading `#` EM summary: the column header,
+/// then one row per read.
+fn table_lines(table: &str) -> impl Iterator<Item = &str> {
+    table.lines().filter(|l| !l.starts_with('#'))
 }
 
 /// Assigned ids of `.matches`, excluding unclassified reads.
 fn matches(prefix: &Path) -> Vec<String> {
-    read(prefix, "matches")
-        .lines()
+    table_lines(&read(prefix, "matches"))
         .skip(1)
         .filter_map(|l| l.split('\t').nth(1))
         .filter(|r| *r != "unclassified")
@@ -308,7 +392,7 @@ fn gamma_outside_half_open_unit_interval_is_an_error() {
 }
 
 #[test]
-fn plain_query_writes_star_nodes_table() {
+fn plain_query_fits_a_star_tree() {
     let tmp = tempfile::tempdir().unwrap();
     let index = build_index(tmp.path());
     let (out, output) = query(tmp.path(), &index, "plain", &Opts::default());
@@ -333,6 +417,20 @@ fn plain_query_writes_star_nodes_table() {
     let p = props(&out);
     assert!((p.values().sum::<f64>() - 1.0).abs() < 1e-6, "{p:?}");
     assert!((p["ref_A"] - nodes["ref_A"].4).abs() < 1e-9);
+    // .props is the same star: the root over the two sequences.
+    let tree: Vec<(String, String, String)> = props_tree(&out)
+        .into_iter()
+        .map(|(l, parent, rank, _)| (l, parent, rank))
+        .collect();
+    let row = |l: &str, p: &str, r: &str| (l.to_string(), p.to_string(), r.to_string());
+    assert_eq!(
+        tree,
+        vec![
+            row("root", "-", "root"),
+            row("ref_A", "root", "sequence"),
+            row("ref_B", "root", "sequence"),
+        ]
+    );
 }
 
 #[test]
@@ -517,11 +615,12 @@ fn ties_never_descend_below_the_genus() {
     }
 }
 
-/// Without a taxonomy PREMISE classifies to strains as before: every read goes to its most
-/// probable sequence (ties to the first), so gamma changes nothing. Twin references split
-/// every read 0.5 / 0.5, which no gamma in [0.5, 1) would descend into.
+/// Without a taxonomy the tree is the root over the sequences, and `.matches` descends
+/// from the root like any other tree: twin references split every read 0.5 / 0.5, which
+/// no gamma in [0.5, 1) descends into, so every read is unclassified. With the twins as
+/// sibling species the same reads stop at their genus instead.
 #[test]
-fn without_a_taxonomy_gamma_has_no_effect() {
+fn without_a_taxonomy_twins_stay_unclassified_at_every_gamma() {
     let tmp = tempfile::tempdir().unwrap();
     let ref_a = fs::read_to_string(fixtures().join("ref.fasta")).unwrap();
     let seq_a: String = ref_a
@@ -534,10 +633,11 @@ fn without_a_taxonomy_gamma_has_no_effect() {
     let index = build_index_from(tmp.path(), &fasta_path);
 
     let (out, _) = query(tmp.path(), &index, "plain", &Opts::default());
-    let ids = matches(&out);
-    assert!(!ids.is_empty());
-    assert!(ids.iter().all(|i| i == "twin_1"), "{ids:?}");
-    // the same report at two gammas: byte-identical tables
+    assert!(matches(&out).is_empty(), "{}", read(&out, "matches"));
+    let p = props(&out);
+    assert_eq!(p.len(), 2, "{p:?}");
+    assert!((p["twin_1"] - 0.5).abs() < 1e-6 && (p["twin_2"] - 0.5).abs() < 1e-6);
+    // the same report at two gammas: byte-identical tables, every read unclassified
     let report = format!("{}.report", out.display());
     let at = |gamma: &str| {
         let o = tmp.path().join(format!("a{gamma}"));
@@ -554,17 +654,41 @@ fn without_a_taxonomy_gamma_has_no_effect() {
         read(&o, "matches")
     };
     let (lo, hi) = (at("0.5"), at("0.99"));
-    assert_eq!(lo, hi);
-    // reads 4 and 5 come from ref_B, absent from the twins: unclassified at any gamma
-    let classified: Vec<&str> = lo
-        .lines()
-        .skip(1)
-        .filter(|l| !l.contains("\tunclassified\t"))
-        .collect();
-    assert_eq!(classified.len(), 3, "{lo}");
-    for line in classified {
-        let cols: Vec<&str> = line.split('\t').collect();
-        assert_eq!(&cols[1..3], ["twin_1", "5.00000e-1"], "{line}");
+    // The same EM summary but for the gamma it names, then identical tables.
+    let summary = |t: &str| t.lines().next().unwrap().to_string();
+    let (s_lo, s_hi) = (summary(&lo), summary(&hi));
+    assert!(
+        s_lo.starts_with("# PREMISE ") && s_lo.contains(" EM: init="),
+        "{s_lo}"
+    );
+    assert_eq!(
+        s_lo.strip_suffix("; gamma=0.5"),
+        s_hi.strip_suffix("; gamma=0.99"),
+        "{s_lo}\n{s_hi}"
+    );
+    assert!(s_lo.strip_suffix("; gamma=0.5").is_some(), "{s_lo}");
+    let body = |t: &str| table_lines(t).collect::<Vec<_>>().join("\n");
+    assert_eq!(body(&lo), body(&hi));
+    assert_eq!(lo.lines().count(), 7, "{lo}");
+    for line in table_lines(&lo).skip(1) {
+        assert!(line.ends_with("\tunclassified\t-\t-\t-"), "{line}");
+    }
+
+    // the twins as sibling species of genus 10: the reads of the twins go to the genus
+    let map = tmp.path().join("twins.map");
+    fs::write(&map, "twin_1\t11\ntwin_2\t12\n").unwrap();
+    let nodes = nodes_fixture();
+    for gamma in ["0.5", "0.99"] {
+        let opts = Opts {
+            map: Some(&map),
+            nodes: Some(&nodes),
+            gamma: Some(gamma),
+            ..Default::default()
+        };
+        let (out, _) = query(tmp.path(), &index, &format!("tree{gamma}"), &opts);
+        let ids = matches(&out);
+        // reads 4 and 5 come from ref_B, absent from the twins
+        assert_eq!(ids, vec!["10"; 3], "gamma {gamma}");
     }
 }
 

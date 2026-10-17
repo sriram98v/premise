@@ -9,14 +9,14 @@ use crate::io::{
     all_read_ids, load_fastq_forward, load_fastq_reverse, pair_reads, read_index_file,
 };
 use crate::report::posterior::{leaf_by_seq, pi_tilde_by_seq, row_posteriors};
-use crate::report::tables::{Candidate, MatchesWriter, Placement};
+use crate::report::tables::{Candidate, MatchesWriter};
 use crate::report::write::ReportWriter;
 use crate::report::{
     AlignRow, EmIter, EmStats, PhaseTimes, Profile, RefMap, ReportHead, ReportMeta, ReportTree,
     RunParams, TaxonomyStats, FORMAT_VERSION,
 };
 use crate::tree::{
-    contract_to_observed, label, reference_tree, Partition, RefTree, TaxNodes, TaxTree, NO_NODE,
+    contract_to_observed, reference_tree, Partition, RefTree, TaxNodes, TaxTree, NO_NODE,
 };
 use crate::utils::{EMProb, QueryProgress, ReadAlignments, ReadID};
 use crate::{query_fastq, resolve_thread_count, CsrLikelihood};
@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 /// The confidence level reads are classified at when none is given (`--gamma`).
-pub const DEFAULT_GAMMA: EMProb = 0.5;
+pub const DEFAULT_GAMMA: EMProb = 0.6;
 
 /// Everything `query` / `analyze` take on the command line except `gamma`.
 #[derive(Clone, Debug)]
@@ -228,15 +228,6 @@ pub(crate) fn fit_head(
     csr: &CsrLikelihood,
     fit: &mut EmFit,
 ) -> ReportHead {
-    let mut props: Vec<(NodeID, &str, EMProb)> = tree
-        .get_leaf_ids()
-        .filter_map(|leaf| {
-            let pi = fit.node_pi.get(leaf).copied().unwrap_or(0.0);
-            (pi > 0.0).then(|| (leaf, label(tree, leaf), pi))
-        })
-        .collect();
-    props.sort_by(|a, b| a.1.cmp(b.1));
-    let props: Vec<(NodeID, EMProb)> = props.into_iter().map(|(n, _, p)| (n, p)).collect();
     let em_trace: Vec<EmIter> = fit
         .ll_trace
         .iter()
@@ -256,9 +247,9 @@ pub(crate) fn fit_head(
     ReportHead {
         meta,
         em_trace,
+        props: report_tree.final_leaf_props(),
         tree: report_tree,
         refmap: RefMap::new(csr.refs(), tip_of_col),
-        props,
     }
 }
 
@@ -294,6 +285,7 @@ fn stream_alignments<W: Write>(
     let mut posts: Vec<EMProb> = Vec::new();
     let mut cands: Vec<Candidate> = Vec::new();
     for read_id in read_ids {
+        // Every finite alignment of the read, in sequence order: what the report stores.
         rows.clear();
         if let Some(read_idx) = aligns.read_idx(read_id) {
             let (refs, als) = aligns.row(read_idx);
@@ -325,8 +317,18 @@ fn stream_alignments<W: Write>(
     Ok(())
 }
 
+/// A read's posterior on each of its rows, from `π̃` indexed by sequence
+/// ([`row_posteriors`]).
+pub(crate) fn seq_posteriors(rows: &[AlignRow], pi_tilde: &[EMProb], posts: &mut Vec<EMProb>) {
+    row_posteriors(
+        |s| pi_tilde.get(s.index()).copied().unwrap_or(0.0),
+        rows,
+        posts,
+    );
+}
+
 /// The candidates of one read for [`MatchesWriter::push`]: its unpruned rows with the
-/// posteriors from [`row_posteriors`].
+/// posteriors from [`seq_posteriors`].
 pub(crate) fn read_candidates(
     rows: &[AlignRow],
     pi_tilde: &[EMProb],
@@ -334,11 +336,7 @@ pub(crate) fn read_candidates(
     posts: &mut Vec<EMProb>,
     cands: &mut Vec<Candidate>,
 ) {
-    row_posteriors(
-        |s| pi_tilde.get(s.index()).copied().unwrap_or(0.0),
-        rows,
-        posts,
-    );
+    seq_posteriors(rows, pi_tilde, posts);
     cands.clear();
     for (r, &posterior) in rows.iter().zip(posts.iter()) {
         let leaf = leaf_of.get(r.seq.index()).copied().unwrap_or(NO_NODE);
@@ -477,9 +475,10 @@ pub fn run_analyze(
     let matches = match out.matches {
         Some((w, gamma)) => Some(MatchesWriter::new(
             w,
+            &head.meta.em_summary(),
             grouping.label_header(),
             head.tree.to_tax_tree(),
-            Placement::new(p.seq2taxid.is_some(), gamma),
+            gamma,
         )?),
         None => None,
     };

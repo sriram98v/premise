@@ -1,10 +1,80 @@
-//! The legacy `.props` and `.nodes` tables, regenerated from a report head.
+//! Tables regenerated from a report head: the NEXUS `.props` tree, and the flat leaf
+//! proportions the web UI charts.
 
-use super::{ReportHead, VertexStatus};
+use super::nexus::quote;
+use super::write::newick;
+use super::{ReportHead, ReportTree};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-/// `.props`: `label\tπ_ℓ` per final-tree leaf with mass, sorted by label, no header.
+/// Version of the `.props` layout, in its `[PREMISE proportions vN]` header comment.
+pub const PROPS_VERSION: u32 = 1;
+
+/// The final-tree vertices with `π_v > 0`, in pre-order. `π` never grows down the tree,
+/// so the parent of every kept vertex is kept and the result is a tree under the root.
+fn weighted_tree(head: &ReportHead) -> ReportTree {
+    ReportTree {
+        vertices: head
+            .tree
+            .vertices
+            .iter()
+            .filter(|v| v.status.is_final() && v.proportion > 0.0)
+            .cloned()
+            .collect(),
+    }
+}
+
+/// `.props`: the taxonomy as NEXUS (TAXA, TREES, PROPORTIONS) with the end-of-EM `π_v`,
+/// the mass of the subtree under `v`, on every final-tree vertex that has any.
+pub fn props_nexus(head: &ReportHead) -> String {
+    let tree = weighted_tree(head);
+    let label_of: HashMap<usize, &str> = tree
+        .vertices
+        .iter()
+        .map(|v| (v.id, v.label.as_str()))
+        .collect();
+    let mut out = String::new();
+    // Writing into a String cannot fail.
+    let _ = writeln!(
+        out,
+        "#NEXUS\n[PREMISE proportions v{}]\n[{}]\n",
+        PROPS_VERSION,
+        head.meta.em_summary()
+    );
+    let _ = writeln!(out, "BEGIN TAXA;");
+    let _ = writeln!(out, "\tDIMENSIONS NTAX={};", tree.vertices.len());
+    let _ = writeln!(out, "\tTAXLABELS");
+    for v in &tree.vertices {
+        let _ = writeln!(out, "\t\t{}", quote(&v.label));
+    }
+    let _ = writeln!(out, "\t;\nEND;\n");
+    let _ = writeln!(out, "BEGIN TREES;");
+    let _ = writeln!(out, "\tTREE proportions = [&R] {};", newick(&tree));
+    let _ = writeln!(out, "END;\n");
+    let _ = writeln!(out, "BEGIN PROPORTIONS;");
+    let _ = writeln!(out, "\tDIMENSIONS N={};", tree.vertices.len());
+    let _ = writeln!(
+        out,
+        "\t[label parent rank proportion; row i is TAXLABELS i, proportion the mass of the subtree under it]"
+    );
+    let _ = writeln!(out, "\tMATRIX");
+    for v in &tree.vertices {
+        let parent = v.parent.and_then(|p| label_of.get(&p).copied());
+        let _ = writeln!(
+            out,
+            "\t{} {} {} {:e}",
+            quote(&v.label),
+            parent.map_or_else(|| "-".into(), quote),
+            quote(&v.rank),
+            v.proportion
+        );
+    }
+    let _ = writeln!(out, "\t;\nEND;");
+    out
+}
+
+/// `label\tπ_ℓ` per final-tree leaf with mass, sorted by label, no header: what the web
+/// UI charts.
 pub fn props_tsv(head: &ReportHead) -> String {
     let labels = head.tree.labels();
     let mut rows: Vec<(&str, f64)> = head
@@ -15,41 +85,7 @@ pub fn props_tsv(head: &ReportHead) -> String {
     rows.sort_by(|a, b| a.0.cmp(b.0));
     let mut out = String::new();
     for (label, p) in rows {
-        // Writing into a String cannot fail.
         let _ = writeln!(out, "{}\t{:.10e}", label, p);
-    }
-    out
-}
-
-/// `.nodes`: every final-tree vertex in pre-order with the columns `query` used to
-/// write (`TaxID Parent Rank Contigs Count Proportion Conditional`).
-pub fn nodes_tsv(head: &ReportHead) -> String {
-    let label_of: HashMap<usize, &str> = head
-        .tree
-        .vertices
-        .iter()
-        .map(|v| (v.id, v.label.as_str()))
-        .collect();
-    let mut out = String::from("TaxID\tParent\tRank\tContigs\tCount\tProportion\tConditional\n");
-    for v in &head.tree.vertices {
-        if !matches!(v.status, VertexStatus::Active | VertexStatus::Collapsed) {
-            continue;
-        }
-        let parent = v
-            .parent
-            .and_then(|p| label_of.get(&p).copied())
-            .unwrap_or("-");
-        let _ = writeln!(
-            out,
-            "{}\t{}\t{}\t{}\t{:.3}\t{:.10e}\t{:.10e}",
-            v.label,
-            parent,
-            v.rank,
-            v.contigs,
-            v.count.unwrap_or(0.0),
-            v.proportion,
-            v.conditional.unwrap_or(0.0),
-        );
     }
     out
 }
@@ -57,10 +93,11 @@ pub fn nodes_tsv(head: &ReportHead) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::report::nexus::tokens;
     use crate::report::read::tests::sample_head;
 
     #[test]
-    fn props_are_sorted_by_label_without_header() {
+    fn props_tsv_is_sorted_by_label_without_header() {
         let head = sample_head();
         assert_eq!(
             props_tsv(&head),
@@ -68,35 +105,67 @@ mod tests {
         );
     }
 
+    /// The token rows of a block's MATRIX.
+    fn matrix(text: &str, block: &str) -> Vec<Vec<String>> {
+        let start = text.find(&format!("BEGIN {block};")).unwrap();
+        let body = &text[start..];
+        let m = body.find("MATRIX").unwrap() + "MATRIX".len();
+        let end = body[m..].find("\t;").unwrap() + m;
+        body[m..end]
+            .lines()
+            .map(|l| tokens(l).unwrap())
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
     #[test]
-    fn nodes_lists_only_final_vertices_in_preorder() {
+    fn props_nexus_holds_every_final_vertex_with_mass() {
         let head = sample_head();
-        let out = nodes_tsv(&head);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(
-            lines[0],
-            "TaxID\tParent\tRank\tContigs\tCount\tProportion\tConditional"
+        let out = props_nexus(&head);
+        assert!(
+            out.starts_with(
+                "#NEXUS\n[PREMISE proportions v1]\n[PREMISE 0.6.0 EM: init=split iter=100 rho=1.5e2 omega=1e-10 em_threshold=1e-6 penalty=1; 1 iterations, final penalized log-likelihood -8e0]\n"
+            ),
+            "{out}"
         );
-        assert_eq!(
-            lines[1],
-            "root\t-\troot\t0\t55.000\t1.0000000000e0\t1.0000000000e0"
+        // A refit names the report it started from; brackets cannot end the comment.
+        let mut refit = sample_head();
+        refit.meta.source = Some("base [1].report".into());
+        let summary = refit.meta.em_summary();
+        assert!(
+            summary.ends_with("-8e0, refit of base _1_.report"),
+            "{summary}"
         );
+        let rows = matrix(&out, "PROPORTIONS");
+        let flat: Vec<Vec<&str>> = rows
+            .iter()
+            .map(|r| r.iter().map(String::as_str).collect())
+            .collect();
         assert_eq!(
-            lines[2].split('\t').take(4).collect::<Vec<_>>(),
-            ["A", "root", "genus", "0"]
+            flat,
+            vec![
+                vec!["root", "-", "root", "1e0"],
+                vec!["A", "root", "genus", "1e0"],
+                vec!["sp1", "A", "species", "4e-1"],
+                vec!["sp2", "A", "species", "6e-1"],
+                vec!["s2|x", "sp2", "sequence", "6e-1"],
+            ]
         );
-        assert_eq!(
-            lines[3].split('\t').take(4).collect::<Vec<_>>(),
-            ["sp1", "A", "species", "2"]
+        // pruned genus B and the pooled sequences under sp1 are absent
+        assert!(!out.contains("\tB ") && !out.contains("s0"), "{out}");
+        assert!(out.contains("\tDIMENSIONS NTAX=5;") && out.contains("\tDIMENSIONS N=5;"));
+        // TAXA labels in row order, quoted where NEXUS needs it
+        let taxa = &out[out.find("TAXLABELS").unwrap()..out.find("BEGIN TREES").unwrap()];
+        let labels: Vec<String> = taxa
+            .lines()
+            .skip(1)
+            .flat_map(|l| tokens(l).unwrap())
+            .collect();
+        assert_eq!(labels, ["root", "A", "sp1", "sp2", "s2|x", ";", "END", ";"]);
+        assert!(taxa.contains("'s2|x'"));
+        assert!(
+            out.contains("\tTREE proportions = [&R] ((3,(5)4)2)1;"),
+            "{out}"
         );
-        assert_eq!(
-            lines[4].split('\t').take(2).collect::<Vec<_>>(),
-            ["sp2", "A"]
-        );
-        assert_eq!(
-            lines[5].split('\t').take(2).collect::<Vec<_>>(),
-            ["s2|x", "sp2"]
-        );
-        assert_eq!(lines.len(), 6);
     }
 }

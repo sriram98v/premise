@@ -1,15 +1,14 @@
 //! `analyze`: everything that starts from a report instead of the index and the reads.
-//! The legacy tables (`.matches`, `.posteriors`, `.props`, `.nodes`) at a `gamma` from
-//! the stored fit, or from a refit of the EM over the report's alignment likelihoods
-//! with other penalty parameters.
+//! `.matches` at a `gamma` and the NEXUS `.props` from the stored fit, or from a refit of
+//! the EM over the report's alignment likelihoods with other penalty parameters.
 
 use crate::analyze::{basename, fit_head, log_fit, peak_rss_kb, read_candidates, same_file};
 use crate::em::{estimate_proportions, CsrBuilder, EmParams, Init};
-use crate::report::export::{nodes_tsv, props_tsv};
+use crate::report::export::props_nexus;
 use crate::report::nexus::{open_report, Sink};
 use crate::report::posterior::{leaf_by_seq, pi_tilde_by_seq};
-use crate::report::read::ReportReader;
-use crate::report::tables::{Candidate, Placement, TableWriters};
+use crate::report::read::{RawRead, ReportReader};
+use crate::report::tables::{Candidate, Classifier, Scratch};
 use crate::report::write::ReportWriter;
 use crate::report::{PhaseTimes, Profile, ReadRows, ReportHead, ReportMeta, RunParams};
 use crate::tree::{children, Partition};
@@ -18,8 +17,10 @@ use crate::{resolve_thread_count, SeqId};
 use anyhow::{bail, Context, Result};
 use chrono::Local;
 use phylo::node::NodeID;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufRead, BufWriter, Write};
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// EM parameters given on the `analyze` command line. Any of them asks for a refit;
@@ -88,12 +89,10 @@ impl RefitParams {
 #[derive(Clone, Copy, Debug)]
 pub struct TableRequest<'a> {
     pub out: &'a str,
-    /// The confidence level `.matches` and `.posteriors` classify reads at.
+    /// The confidence level `.matches` classifies reads at.
     pub gamma: EMProb,
     pub matches: bool,
-    pub posteriors: bool,
     pub props: bool,
-    pub nodes: bool,
     /// The refit report.
     pub report: bool,
     pub compress: bool,
@@ -121,20 +120,69 @@ impl TableRequest<'_> {
         if self.matches {
             v.push(self.path("matches"));
         }
-        if self.posteriors {
-            v.push(self.path("posteriors"));
-        }
         if self.props {
             v.push(self.path("props"));
-        }
-        if self.nodes {
-            v.push(self.path("nodes"));
         }
         v
     }
 }
 
 type Reader = ReportReader<Box<dyn BufRead>>;
+
+/// Reads of a parallel chunk, and the text a chunk may hold before it is parsed.
+const CHUNK_READS: usize = 16_384;
+const CHUNK_BYTES: usize = 64 << 20;
+
+/// Every remaining read of ALIGNMENT_LIKELIHOODS, in chunks: reads are cut from the
+/// stream in order, then parsed and handed to `map` on the rayon pool (with a per-thread
+/// state from `init`), and `consume` sees each read and its result in file order, so the
+/// outputs, and the first error, are the sequential ones. Returns the number of reads.
+fn par_reads<S: Send, T: Send>(
+    reader: &mut Reader,
+    init: impl Fn() -> S,
+    map: impl Fn(&mut S, &ReadRows) -> Result<T> + Sync,
+    mut consume: impl FnMut(&ReadRows, T) -> Result<()>,
+) -> Result<usize> {
+    let states: Vec<Mutex<(S, Vec<EMProb>)>> = (0..rayon::current_num_threads())
+        .map(|_| Mutex::new((init(), Vec::new())))
+        .collect();
+    let mut raws: Vec<RawRead> = Vec::new();
+    let mut n = 0usize;
+    loop {
+        let (mut filled, mut bytes, mut done) = (0, 0, false);
+        while filled < CHUNK_READS && bytes < CHUNK_BYTES {
+            if filled == raws.len() {
+                raws.push(RawRead::default());
+            }
+            if !reader.next_raw_read(&mut raws[filled])? {
+                done = true;
+                break;
+            }
+            bytes += raws[filled].text_len();
+            filled += 1;
+        }
+        let parsed: Vec<Result<(ReadRows, T)>> = raws[..filled]
+            .par_iter()
+            .map(|raw| {
+                let slot = rayon::current_thread_index().unwrap_or(0) % states.len();
+                let mut state = states[slot].lock().unwrap_or_else(|e| e.into_inner());
+                let (s, palette) = &mut *state;
+                let mut rows = ReadRows::default();
+                raw.parse(&mut rows, palette)?;
+                let t = map(s, &rows)?;
+                Ok((rows, t))
+            })
+            .collect();
+        for r in parsed {
+            let (rows, t) = r?;
+            consume(&rows, t)?;
+            n += 1;
+        }
+        if done {
+            return Ok(n);
+        }
+    }
+}
 
 /// Parse a report's head; the reader is left on its first read.
 fn parse(report_path: &str) -> Result<(ReportHead, usize, Reader)> {
@@ -159,11 +207,14 @@ pub fn analyze_report(
     threads: usize,
 ) -> Result<Vec<String>> {
     let t_start = Instant::now();
+    // Every pass parses on this pool. Fails when a pool already exists (a library
+    // caller); its size is then kept.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(resolve_thread_count(threads))
+        .build_global();
     let paths = req.paths();
     if paths.is_empty() {
-        bail!(
-            "analyze: nothing to do; give --matches, --posteriors, --props, --nodes or --write-report"
-        );
+        bail!("analyze: nothing to do; give --matches, --props or --write-report");
     }
     if req.report && !refit.is_refit() {
         bail!(
@@ -175,22 +226,20 @@ pub fn analyze_report(
     }
     let stamp = fingerprint(report_path)?;
     let (head0, n_reads, reader) = parse(report_path)?;
+    let source = Source {
+        path: report_path,
+        n_reads,
+        stamp,
+    };
     let (head, reader) = if refit.is_refit() {
         let head = refit_from_report(report_path, &head0, n_reads, reader, refit, threads)?;
         // Pass 2 re-reads the file (it must be a regular file, not a pipe).
-        let (_, n_again, reader) = parse(report_path)?;
-        if n_again != n_reads || fingerprint(report_path)? != stamp {
-            bail!(
-                "report '{}' changed while it was being analysed",
-                report_path
-            );
-        }
-        (head, reader)
+        (head, source.reopen()?)
     } else {
         (head0, reader)
     };
     let mut created: Vec<String> = Vec::new();
-    let result = write_outputs(&head, n_reads, reader, req, t_start, &mut created);
+    let result = write_outputs(&head, &source, reader, req, t_start, &mut created);
     if result.is_err() {
         // Never leave a half-written file behind (only what this run opened).
         for p in &created {
@@ -257,13 +306,18 @@ fn refit_from_report(
     );
 
     let mut builder = CsrBuilder::new(n_reads);
-    let mut buf = ReadRows::default();
     let mut n = 0usize;
-    while reader.next_read(&mut buf)? {
-        check_refmap(head0, &buf)?;
-        builder.push(ReadIdx(n), buf.rows.iter().map(|r| (r.seq, r.loglik)));
-        n += 1;
-    }
+    par_reads(
+        &mut reader,
+        || (),
+        |_, _| Ok(()),
+        |rows, ()| {
+            check_refmap(head0, rows)?;
+            builder.push(ReadIdx(n), rows.rows.iter().map(|r| (r.seq, r.loglik)));
+            n += 1;
+            Ok(())
+        },
+    )?;
     check_count(n, n_reads)?;
     drop(reader);
     let csr = builder.finish();
@@ -346,29 +400,43 @@ fn create(path: String, created: &mut Vec<String>) -> Result<BufWriter<File>> {
         .with_context(|| format!("failed to create '{}'", path))
 }
 
-/// The tables from `head`: the head-only ones first, then one stream over the reads
-/// for the report copy and the per-read tables. `created` lists every file opened.
+/// The report being analysed: where it is, its read count and its fingerprint, so a
+/// later pass can re-read it and notice a change.
+struct Source<'a> {
+    path: &'a str,
+    n_reads: usize,
+    stamp: (u64, Option<std::time::SystemTime>),
+}
+
+impl Source<'_> {
+    /// A fresh reader on the first read of ALIGNMENT_LIKELIHOODS.
+    fn reopen(&self) -> Result<Reader> {
+        let (_, n_again, reader) = parse(self.path)?;
+        if n_again != self.n_reads || fingerprint(self.path)? != self.stamp {
+            bail!("report '{}' changed while it was being analysed", self.path);
+        }
+        Ok(reader)
+    }
+}
+
+/// The tables from `head`: `.props` first, then one stream over the reads for the
+/// report copy and `.matches`. `created` lists every file opened.
 fn write_outputs(
     head: &ReportHead,
-    n_reads: usize,
+    source: &Source<'_>,
     mut reader: Reader,
     req: &TableRequest<'_>,
     t_start: Instant,
     created: &mut Vec<String>,
 ) -> Result<()> {
+    let n_reads = source.n_reads;
     if req.props {
         let path = req.path("props");
         created.push(path.clone());
-        std::fs::write(&path, props_tsv(head))
+        std::fs::write(&path, props_nexus(head))
             .with_context(|| format!("failed to write '{}'", path))?;
     }
-    if req.nodes {
-        let path = req.path("nodes");
-        created.push(path.clone());
-        std::fs::write(&path, nodes_tsv(head))
-            .with_context(|| format!("failed to write '{}'", path))?;
-    }
-    if !req.matches && !req.posteriors && !req.report {
+    if !req.matches && !req.report {
         return Ok(());
     }
     let t_write = Instant::now();
@@ -384,44 +452,52 @@ fn write_outputs(
         }
         false => None,
     };
-    let mut tables = match req.matches || req.posteriors {
+    let classifier = Classifier::new(head.tree.to_tax_tree(), req.gamma);
+    let mut matches = match req.matches {
         true => {
-            let matches = match req.matches {
-                true => Some(create(req.path("matches"), created)?),
-                false => None,
-            };
-            let posteriors = match req.posteriors {
-                true => Some(create(req.path("posteriors"), created)?),
-                false => None,
-            };
-            Some(TableWriters::new(
-                &head.meta.label_header,
-                head.tree.to_tax_tree(),
-                Placement::new(head.meta.seq2taxid.is_some(), req.gamma),
-                matches,
-                posteriors,
-            )?)
+            let mut out = create(req.path("matches"), created)?;
+            classifier.write_header(&mut out, &head.meta.em_summary(), &head.meta.label_header)?;
+            Some(out)
         }
         false => None,
     };
     let pi_tilde = pi_tilde_by_seq(head);
     let leaf_of = leaf_by_seq(head);
-    let mut buf = ReadRows::default();
-    let mut posts: Vec<EMProb> = Vec::new();
-    let mut cands: Vec<Candidate> = Vec::new();
-    let mut n = 0usize;
-    while reader.next_read(&mut buf)? {
-        check_refmap(head, &buf)?;
-        if let Some(w) = report.as_mut() {
-            w.push_read(&buf.read_id, &buf.rows)?;
-        }
-        if let Some(t) = tables.as_mut() {
-            read_candidates(&buf.rows, &pi_tilde, &leaf_of, &mut posts, &mut cands);
-            t.push(&buf.read_id, &cands)?;
-        }
-        n += 1;
-    }
+    let want_matches = matches.is_some();
+    // Each read's `.matches` row is classified and formatted in parallel, then written
+    // in order.
+    let n = par_reads(
+        &mut reader,
+        || {
+            (
+                Scratch::new(&classifier),
+                Vec::<EMProb>::new(),
+                Vec::<Candidate>::new(),
+            )
+        },
+        |(scratch, posts, cands), rows| {
+            let mut line = Vec::new();
+            if want_matches {
+                read_candidates(&rows.rows, &pi_tilde, &leaf_of, posts, cands);
+                classifier.write_row(scratch, &mut line, &rows.read_id, cands)?;
+            }
+            Ok(line)
+        },
+        |rows, line| {
+            check_refmap(head, rows)?;
+            if let Some(w) = report.as_mut() {
+                w.push_read(&rows.read_id, &rows.rows)?;
+            }
+            if let Some(m) = matches.as_mut() {
+                m.write_all(&line)?;
+            }
+            Ok(())
+        },
+    )?;
     check_count(n, n_reads)?;
+    if let Some(mut m) = matches {
+        m.flush()?;
+    }
     if let Some(mut w) = report {
         w.end_alignments()?;
         let sink = w.finish(&Profile {
@@ -430,12 +506,6 @@ fn write_outputs(
             peak_rss_kb: peak_rss_kb(),
         })?;
         sink.finish()?;
-    }
-    if let Some(t) = tables {
-        let (matches, posteriors) = t.finish()?;
-        for mut out in matches.into_iter().chain(posteriors) {
-            out.flush()?;
-        }
     }
     Ok(())
 }
@@ -525,30 +595,23 @@ mod tests {
             out: "x",
             gamma: 0.6,
             matches: true,
-            posteriors: true,
             props: true,
-            nodes: false,
             report: true,
             compress: true,
         };
-        assert_eq!(
-            req.paths(),
-            vec!["x.report.zst", "x.matches", "x.posteriors", "x.props"]
-        );
-        let posteriors = TableRequest {
+        assert_eq!(req.paths(), vec!["x.report.zst", "x.matches", "x.props"]);
+        let props = TableRequest {
             out: "x",
-            gamma: 0.5,
+            gamma: 0.6,
             matches: false,
-            posteriors: true,
-            props: false,
-            nodes: false,
+            props: true,
             report: false,
             compress: false,
         };
-        assert_eq!(posteriors.paths(), vec!["x.posteriors"]);
+        assert_eq!(props.paths(), vec!["x.props"]);
         let none = TableRequest {
-            posteriors: false,
-            ..posteriors
+            props: false,
+            ..props
         };
         assert!(none.paths().is_empty());
     }

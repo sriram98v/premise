@@ -742,22 +742,24 @@ pub fn assign_read(tree: &TaxTree, hits: &[(NodeID, EMProb)], gamma: EMProb) -> 
 
 /// Pre-order intervals for O(1) subtree membership tests.
 pub struct SubtreeIndex {
-    tin: HashMap<NodeID, usize>,
-    tout: HashMap<NodeID, usize>,
+    /// Entry and exit clock of every vertex by id; `usize::MAX` for an id not in the tree.
+    tin: Vec<usize>,
+    tout: Vec<usize>,
 }
 
 impl SubtreeIndex {
     pub fn new(tree: &TaxTree) -> Self {
-        let mut tin = HashMap::new();
-        let mut tout = HashMap::new();
+        let n = arena_len(tree);
+        let mut tin = vec![usize::MAX; n];
+        let mut tout = vec![usize::MAX; n];
         let mut clock = 0;
         let mut stack: Vec<(NodeID, bool)> = vec![(tree.get_root_id(), false)];
         while let Some((v, done)) = stack.pop() {
             if done {
-                tout.insert(v, clock);
+                tout[v] = clock;
                 continue;
             }
-            tin.insert(v, clock);
+            tin[v] = clock;
             clock += 1;
             stack.push((v, true));
             for c in children(tree, v) {
@@ -769,14 +771,13 @@ impl SubtreeIndex {
 
     /// True when `node` is `ancestor` or lies in its subtree.
     pub fn contains(&self, ancestor: NodeID, node: NodeID) -> bool {
-        match (
-            self.tin.get(&ancestor),
-            self.tout.get(&ancestor),
-            self.tin.get(&node),
-        ) {
-            (Some(&a_in), Some(&a_out), Some(&n_in)) => a_in <= n_in && n_in < a_out,
-            _ => false,
-        }
+        let at = |v: &[usize], id: NodeID| v.get(id).copied().unwrap_or(usize::MAX);
+        let (a_in, a_out, n_in) = (
+            at(&self.tin, ancestor),
+            at(&self.tout, ancestor),
+            at(&self.tin, node),
+        );
+        a_in != usize::MAX && n_in != usize::MAX && a_in <= n_in && n_in < a_out
     }
 }
 

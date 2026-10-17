@@ -416,6 +416,10 @@ impl Init {
     }
 }
 
+/// Iterations the EM always runs (up to `num_iter`) before the convergence threshold may
+/// stop it.
+pub const MIN_EM_ITER: usize = 50;
+
 /// Settings of [`estimate_proportions`].
 pub struct EmParams {
     pub init: Init,
@@ -423,7 +427,8 @@ pub struct EmParams {
     /// Penalty weight; also the minimum expected reads a vertex needs to survive. 0 = plain EM.
     pub rho: EMProb,
     pub omega: EMProb,
-    /// Relative change in the penalized log-likelihood that stops the iteration.
+    /// Relative change in the penalized log-likelihood that stops the iteration, once
+    /// [`MIN_EM_ITER`] iterations have run.
     pub em_threshold: EMProb,
 }
 
@@ -474,7 +479,7 @@ pub fn estimate_proportions(
         pr.em_iter_done.store(0, Ordering::Relaxed);
     }
     let pb = ProgressBar::with_draw_target(Some(p.num_iter as u64), ProgressDrawTarget::stderr());
-    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {percent}% ({eta}) ({msg})").unwrap());
+    pb.set_style(ProgressStyle::with_template("Running EM: {spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] iteration {pos}/{len} ({eta}) ({msg})").unwrap());
 
     let penalized = |csr: &CsrLikelihood, tree: &TaxTree, part: &Partition| -> EMProb {
         let (ll, _, _) = csr.e_step(&contig_pi(part, &leaf_marginals(tree)));
@@ -510,11 +515,16 @@ pub fn estimate_proportions(
             pr.em_iter_done.store((i + 1) as u64, Ordering::Relaxed);
         }
         let scale = lp.abs().max(1.0);
-        if !report.changed() && diff.abs() <= p.em_threshold * scale {
+        let converged = !report.changed() && diff.abs() <= p.em_threshold * scale;
+        if i + 1 >= MIN_EM_ITER && converged {
             break;
         }
     }
-    pb.finish_with_message(format!("Final penalized LL: {}", ll_trace.last().unwrap()));
+    pb.finish_with_message(format!(
+        "{} iterations, final penalized LL: {}",
+        ll_trace.len() - 1,
+        ll_trace.last().unwrap()
+    ));
 
     let node_pi = leaf_marginals(tree);
     pi_trace.push(leaf_proportions(tree, &node_pi));
@@ -847,7 +857,7 @@ mod tests {
     #[test]
     fn matches_writer_agrees_with_assign_reads() {
         use crate::report::posterior::row_posteriors;
-        use crate::report::tables::{Candidate, MatchesWriter, Placement};
+        use crate::report::tables::{Candidate, MatchesWriter};
         use crate::report::{AlignRow, ReportTree};
         use crate::tree::{is_synthetic_root, label};
 
@@ -875,9 +885,10 @@ mod tests {
             let oracle = assign_reads(&m, &t, &part, &post, gamma);
             let mut w = MatchesWriter::new(
                 Vec::new(),
+                "EM test",
                 "RefID",
                 report_tree.to_tax_tree(),
-                Placement::Descend(gamma),
+                gamma,
             )
             .unwrap();
             let mut posts = Vec::new();
@@ -917,7 +928,8 @@ mod tests {
                 w.push(&format!("r{r}"), &cands).unwrap();
             }
             let out = String::from_utf8(w.finish().unwrap()).unwrap();
-            for (r, line) in out.lines().skip(1).enumerate() {
+            // The `#` comment line, then the column header.
+            for (r, line) in out.lines().skip(2).enumerate() {
                 let cols: Vec<&str> = line.split('\t').collect();
                 match oracle.get(&ReadIdx(r)) {
                     Some(&(v, h)) if !is_synthetic_root(&t, v) => {
@@ -953,6 +965,31 @@ mod tests {
         assert_eq!(m.lik, vec![(-1.0f64).exp(), 1.0, 1.0]);
         assert_eq!(m.col_ptr, vec![0, 2, 3]);
         assert_eq!(m.row_idx, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn convergence_is_checked_only_after_the_minimum_iterations() {
+        // Unambiguous reads: the split init is already the fixed point, so the
+        // likelihood stops changing at once.
+        let mut rows: Vec<&[EMProb]> = Vec::new();
+        rows.extend(std::iter::repeat_n(&[1.0, 0.0][..], 30));
+        rows.extend(std::iter::repeat_n(&[0.0, 1.0][..], 10));
+        let m = csr(&rows);
+        let run = |num_iter: usize| {
+            let (mut t, mut part) = star(2);
+            let p = EmParams {
+                num_iter,
+                em_threshold: 1e-3,
+                ..params(0.0)
+            };
+            estimate_proportions(&m, &mut t, &mut part, &p, None)
+                .ll_trace
+                .len()
+                - 1
+        };
+        assert_eq!(run(500), MIN_EM_ITER);
+        // --iter stays the cap below the minimum.
+        assert_eq!(run(20), 20);
     }
 
     #[test]

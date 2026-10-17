@@ -689,8 +689,13 @@ function qRecompute() {
   qRenderTablePage();
 }
 
+// Lines of a .matches table without its leading `#` comment (the EM settings).
+function matchesLines(tsv) {
+  return tsv.trim().split('\n').filter(l => !l.startsWith('#'));
+}
+
 function initQueryTable(tsv) {
-  const lines = tsv.trim().split('\n');
+  const lines = matchesLines(tsv);
   if (lines.length < 2) { _qTsvRows = []; _qFilteredRows = []; _qSortedRows = []; return; }
   _qTsvHeaders  = lines[0].split('\t');
   _qTsvRows     = lines.slice(1).map(l => l.split('\t')); // parse once, not per sort/filter
@@ -1232,7 +1237,7 @@ document.getElementById('query-btn').addEventListener('click', async () => {
     document.getElementById('query-dl-report').href  = _qReportUrl;
     document.getElementById('query-dl-props').href   = _qPropsUrl;
 
-    const rowCount = data.matches.trim().split('\n').length - 1;
+    const rowCount = matchesLines(data.matches).length - 1;
     document.getElementById('query-stats').textContent =
       `${rowCount.toLocaleString()} assignment row${rowCount !== 1 ? 's' : ''}`;
 

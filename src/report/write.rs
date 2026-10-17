@@ -4,6 +4,7 @@
 use super::nexus::quote;
 use super::{AlignRow, Profile, ReportHead, ReportTree};
 use crate::utils::EMProb;
+use crate::SeqId;
 use anyhow::{anyhow, bail, Result};
 use phylo::node::NodeID;
 use std::collections::HashMap;
@@ -208,24 +209,15 @@ fn write_tree_blocks<W: Write>(out: &mut W, tree: &ReportTree) -> Result<()> {
     Ok(())
 }
 
-fn write_refmap_props<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
+/// REFMAP. The proportions of the final leaves are not written: they are the NODES
+/// proportions of the final tree's leaves, and the reader takes them from there.
+fn write_refmap<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
     writeln!(out, "BEGIN REFMAP;")?;
     writeln!(out, "\tDIMENSIONS N={};", head.refmap.entries.len())?;
     writeln!(out, "\t[seqid node]")?;
     writeln!(out, "\tMATRIX")?;
     for (seq, node) in &head.refmap.entries {
         writeln!(out, "\t{} {}", seq.index(), node)?;
-    }
-    writeln!(out, "\t;")?;
-    writeln!(out, "END;")?;
-    writeln!(out)?;
-
-    writeln!(out, "BEGIN PROPS;")?;
-    writeln!(out, "\tDIMENSIONS N={};", head.props.len())?;
-    writeln!(out, "\t[node proportion]")?;
-    writeln!(out, "\tMATRIX")?;
-    for (node, p) in &head.props {
-        writeln!(out, "\t{} {:e}", node, p)?;
     }
     writeln!(out, "\t;")?;
     writeln!(out, "END;")?;
@@ -241,7 +233,43 @@ pub fn write_head<W: Write>(out: &mut W, head: &ReportHead) -> Result<()> {
     write_premise(out, head)?;
     write_em_trace(out, head)?;
     write_tree_blocks(out, &head.tree)?;
-    write_refmap_props(out, head)
+    write_refmap(out, head)
+}
+
+/// Write `seqs` as the first id then the difference to the previous one; the ids must
+/// be strictly ascending.
+fn write_seqids<W: Write>(
+    out: &mut W,
+    read_id: &str,
+    seqs: impl Iterator<Item = SeqId>,
+) -> Result<()> {
+    let mut prev: u32 = 0;
+    for (i, s) in seqs.enumerate() {
+        let seq = u32::try_from(s.index())
+            .map_err(|_| anyhow!("sequence id {} does not fit u32", s.index()))?;
+        if i == 0 {
+            write!(out, "{}", seq)?;
+        } else {
+            let delta = seq.checked_sub(prev).filter(|&d| d > 0).ok_or_else(|| {
+                anyhow!(
+                    "read '{}': rows are not in strictly ascending sequence order ({} after {})",
+                    read_id,
+                    seq,
+                    prev
+                )
+            })?;
+            write!(out, " {}", delta)?;
+        }
+        prev = seq;
+    }
+    Ok(())
+}
+
+/// Where a [`ReportWriter`] is: streaming reads, or past ALIGNMENT_LIKELIHOODS.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Phase {
+    Alignments,
+    Done,
 }
 
 /// Streams ALIGNMENT_LIKELIHOODS after [`write_head`].
@@ -249,6 +277,7 @@ pub struct ReportWriter<W: Write> {
     out: W,
     expected: usize,
     pushed: usize,
+    phase: Phase,
     /// Per-read scratch: the distinct log-likelihoods (as bits, first-appearance order),
     /// each row's index into them, and each row's insert offset.
     palette: Vec<u64>,
@@ -272,6 +301,7 @@ impl<W: Write> ReportWriter<W> {
             out,
             expected: n_reads,
             pushed: 0,
+            phase: Phase::Alignments,
             palette: Vec::new(),
             slot: HashMap::new(),
             index: Vec::new(),
@@ -279,8 +309,16 @@ impl<W: Write> ReportWriter<W> {
         })
     }
 
-    /// One read's alignments, in [`crate::SeqId`] order.
+    fn expect_phase(&self, phase: Phase, what: &str) -> Result<()> {
+        if self.phase != phase {
+            bail!("report writer: {} out of order", what);
+        }
+        Ok(())
+    }
+
+    /// One read's alignments, in [`SeqId`] order.
     pub fn push_read(&mut self, read_id: &str, rows: &[AlignRow]) -> Result<()> {
+        self.expect_phase(Phase::Alignments, "ALIGNMENT_LIKELIHOODS read")?;
         self.encode(read_id, rows)?;
         self.out.write_all(b"\t")?;
         write_quoted(&mut self.out, read_id)?;
@@ -291,28 +329,7 @@ impl<W: Write> ReportWriter<W> {
         }
         writeln!(self.out, " {} {}", rows.len(), self.palette.len())?;
         self.out.write_all(b"\t")?;
-        let mut prev: u32 = 0;
-        for (i, r) in rows.iter().enumerate() {
-            let seq = u32::try_from(r.seq.index())
-                .map_err(|_| anyhow!("sequence id {} does not fit u32", r.seq.index()))?;
-            if i == 0 {
-                write!(self.out, "{}", seq)?;
-            } else {
-                let delta = seq
-                    .checked_sub(prev)
-                    .filter(|&d| d > 0)
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "read '{}': alignments are not in strictly ascending sequence order ({} after {})",
-                            read_id,
-                            seq,
-                            prev
-                        )
-                    })?;
-                write!(self.out, " {}", delta)?;
-            }
-            prev = seq;
-        }
+        write_seqids(&mut self.out, read_id, rows.iter().map(|r| r.seq))?;
         self.out.write_all(b"\n\t")?;
         write_joined(&mut self.out, self.palette.iter(), |o, &b| {
             write!(o, "{:e}", EMProb::from_bits(b))
@@ -368,7 +385,9 @@ impl<W: Write> ReportWriter<W> {
         Ok(())
     }
 
+    /// Close ALIGNMENT_LIKELIHOODS, checking every announced read was pushed.
     pub fn end_alignments(&mut self) -> Result<()> {
+        self.expect_phase(Phase::Alignments, "end of ALIGNMENT_LIKELIHOODS")?;
         if self.pushed != self.expected {
             bail!(
                 "ALIGNMENT_LIKELIHOODS: {} reads pushed, {} announced",
@@ -379,11 +398,14 @@ impl<W: Write> ReportWriter<W> {
         writeln!(self.out, "\t;")?;
         writeln!(self.out, "END;")?;
         writeln!(self.out)?;
+        self.phase = Phase::Done;
         Ok(())
     }
 
-    /// The PROFILE block; returns the sink so the caller can finish it.
+    /// The PROFILE block, after [`Self::end_alignments`]; returns the sink so the caller
+    /// can finish it.
     pub fn finish(mut self, profile: &Profile) -> Result<W> {
+        self.expect_phase(Phase::Done, "PROFILE")?;
         writeln!(self.out, "BEGIN PROFILE;")?;
         writeln!(
             self.out,
@@ -458,7 +480,27 @@ mod tests {
                 peak_rss_kb: None,
             })
             .unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("peak_rss_kb=-;"));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("peak_rss_kb=-;"));
+        // Only what the EM cannot regenerate: no PROPS, no READ_POSTERIORS.
+        assert!(
+            !text.contains("BEGIN PROPS;") && !text.contains("READ_POSTERIORS"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn blocks_are_written_in_order() {
+        use crate::report::read::tests::sample_head;
+        let head = sample_head();
+        let profile = Profile::default();
+        let w = ReportWriter::begin(Vec::new(), &head, 0).unwrap();
+        assert!(w.finish(&profile).is_err(), "PROFILE before the reads");
+        let mut w = ReportWriter::begin(Vec::new(), &head, 1).unwrap();
+        w.push_read("r", &[]).unwrap();
+        w.end_alignments().unwrap();
+        assert!(w.push_read("late", &[]).is_err());
+        assert!(w.end_alignments().is_err());
     }
 
     #[test]
@@ -515,6 +557,46 @@ mod tests {
                 "\tempty 0\n\t;\nEND;\n"
             )),
             "{block}"
+        );
+    }
+
+    /// `cargo test --release -- --ignored --nocapture report_writer_timing`: per-read cost
+    /// of ALIGNMENT_LIKELIHOODS for reads with many alignments.
+    #[test]
+    #[ignore]
+    fn report_writer_timing() {
+        use crate::report::read::tests::sample_head;
+        use crate::SeqId;
+        let head = sample_head();
+        let (n_reads, per_read) = (20_000, 1000);
+        let rows: Vec<AlignRow> = (0..per_read)
+            .map(|i| AlignRow {
+                seq: SeqId::new(3 * i as u32 + 1),
+                loglik: -((i % 7) as EMProb) - 0.5,
+                pos: (i, i + 300),
+            })
+            .collect();
+        /// Counts bytes, so every value is really formatted (`io::sink` may skip it).
+        struct Count(usize);
+        impl Write for Count {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = ReportWriter::begin(Count(0), &head, n_reads).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..n_reads {
+            w.push_read("read", &rows).unwrap();
+        }
+        let aligns = t.elapsed().as_secs_f64();
+        w.end_alignments().unwrap();
+        eprintln!(
+            "{n_reads} reads x {per_read} rows: ALIGNMENT_LIKELIHOODS {:.1} us/read",
+            aligns * 1e6 / n_reads as f64
         );
     }
 
