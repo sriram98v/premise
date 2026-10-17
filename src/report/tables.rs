@@ -1,13 +1,12 @@
-//! The legacy per-read tables, written from `(EM leaf, posterior, likelihood, position)`
-//! candidates: `.matches` (the vertex each read is assigned to, see [`Placement`]) and
-//! `.posteriors` (the read's posterior on every EM leaf). `query` feeds them straight
-//! from the fit and `analyze` from a report, so both produce the same bytes for the
-//! same placement.
+//! `.matches`, written from `(EM leaf, posterior, likelihood, position)` candidates: the
+//! vertex each read is assigned to at `gamma`. `query` feeds it straight from the fit and
+//! `analyze` from a report, so both produce the same bytes for the same `gamma`.
 
-use crate::tree::{assign_read, is_synthetic_root, label, SubtreeIndex, TaxTree};
+use crate::tree::{arena_len, children, is_synthetic_root, label, SubtreeIndex, TaxTree, NO_NODE};
 use crate::utils::EMProb;
 use anyhow::Result;
 use phylo::node::NodeID;
+use phylo::prelude::*;
 use std::io::Write;
 
 /// One sequence a read aligned to: the EM leaf owning it, the read's posterior on it,
@@ -20,30 +19,6 @@ pub struct Candidate {
     pub pos: (usize, usize),
 }
 
-/// How a read is placed on the final EM tree.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Placement {
-    /// Without a taxonomy (no `--seq2taxid`): the sequence with the largest posterior, ties
-    /// to the first in index order, as PREMISE classified before taxonomies; gamma plays no
-    /// part.
-    BestSequence,
-    /// With a taxonomy: descend from the root while the largest child's subtree posterior
-    /// exceeds gamma.
-    Descend(EMProb),
-}
-
-impl Placement {
-    /// [`Placement::Descend`] at `gamma` for a run with a taxonomy, else
-    /// [`Placement::BestSequence`].
-    pub fn new(taxonomy: bool, gamma: EMProb) -> Self {
-        if taxonomy {
-            Self::Descend(gamma)
-        } else {
-            Self::BestSequence
-        }
-    }
-}
-
 /// Where a classified read landed: the vertex, its subtree posterior `h`, and the
 /// position of the read's best-scoring sequence beneath it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -53,49 +28,142 @@ pub struct Assignment {
     pub pos: (usize, usize),
 }
 
-/// Assigns reads on the final EM tree by a [`Placement`]; one classification feeds every
-/// table.
+/// Assigns reads on the final EM tree: from the root, descend to the child with the
+/// largest subtree posterior while that posterior exceeds `gamma` (on a tie, the later
+/// child, as [`crate::tree::assign_read`]). Without a taxonomy the tree is the root over
+/// the sequences, so a read reaches a sequence only when its posterior on it exceeds
+/// `gamma`.
+///
+/// A read costs O(hits × depth): the subtree posteriors live in dense scratch arrays
+/// reset after each read, and the descent looks only at the vertices the read touched,
+/// never at every child of a vertex (a species of a per-contig reference has thousands).
+/// The sums are added in the order `assign_read` adds them, so the result is bitwise its.
+///
+/// The classifier is immutable and shared between threads; each thread classifies with
+/// its own [`Scratch`].
 pub struct Classifier {
     tree: TaxTree,
     subtree: SubtreeIndex,
-    placement: Placement,
-    /// Posterior per EM leaf of the last read, in first-appearance order.
-    hits: Vec<(NodeID, EMProb)>,
+    gamma: EMProb,
+    root: NodeID,
+    /// Parent of every vertex by id ([`NO_NODE`] at the root and for unused ids).
+    parent: Vec<NodeID>,
+    /// Position of every vertex among its parent's children.
+    order: Vec<usize>,
+}
+
+/// Per-thread working memory of a [`Classifier`], all zero between reads.
+pub struct Scratch {
+    /// Posterior per EM leaf of the current read.
+    leaf_mass: Vec<EMProb>,
+    /// The current read's EM leaves with mass, in first-appearance order.
+    hits: Vec<NodeID>,
+    /// Subtree posterior per vertex of the current read.
+    h: Vec<EMProb>,
+    /// The vertices with `h > 0`, in first-touch order.
+    touched: Vec<NodeID>,
+}
+
+impl Scratch {
+    pub fn new(classifier: &Classifier) -> Self {
+        let n = classifier.parent.len();
+        Self {
+            leaf_mass: vec![0.0; n],
+            hits: Vec::new(),
+            h: vec![0.0; n],
+            touched: Vec::new(),
+        }
+    }
+
+    /// Zero what the last read used.
+    fn reset(&mut self) {
+        for &v in &self.touched {
+            self.h[v] = 0.0;
+        }
+        for &l in &self.hits {
+            self.leaf_mass[l] = 0.0;
+        }
+        self.touched.clear();
+        self.hits.clear();
+    }
 }
 
 impl Classifier {
     /// `tree` is the final EM tree (collapsed vertices are leaves).
-    pub fn new(tree: TaxTree, placement: Placement) -> Self {
+    pub fn new(tree: TaxTree, gamma: EMProb) -> Self {
         let subtree = SubtreeIndex::new(&tree);
+        let n = arena_len(&tree);
+        let mut parent = vec![NO_NODE; n];
+        let mut order = vec![0; n];
+        for v in tree.get_node_ids() {
+            for (i, c) in children(&tree, v).into_iter().enumerate() {
+                parent[c] = v;
+                order[c] = i;
+            }
+        }
         Self {
+            root: tree.get_root_id(),
             tree,
             subtree,
-            placement,
-            hits: Vec::new(),
+            gamma,
+            parent,
+            order,
         }
     }
 
+    /// The deepest vertex the read loaded in `s` descends to, and its subtree posterior.
+    fn descend(&self, s: &mut Scratch) -> (NodeID, EMProb) {
+        for &leaf in &s.hits {
+            let p = s.leaf_mass[leaf];
+            let mut v = leaf;
+            while v != NO_NODE {
+                if s.h[v] == 0.0 {
+                    s.touched.push(v);
+                }
+                s.h[v] += p;
+                v = self.parent[v];
+            }
+        }
+        let (mut v, mut hv) = (self.root, s.h[self.root]);
+        loop {
+            // The touched child with the largest h; ties to the later child.
+            let best = s
+                .touched
+                .iter()
+                .filter(|&&c| self.parent[c] == v)
+                .max_by(|&&a, &&b| {
+                    s.h[a]
+                        .total_cmp(&s.h[b])
+                        .then(self.order[a].cmp(&self.order[b]))
+                });
+            match best {
+                Some(&c) if s.h[c] > 0.0 && s.h[c] > self.gamma => {
+                    v = c;
+                    hv = s.h[c];
+                }
+                _ => break,
+            }
+        }
+        (v, hv)
+    }
+
     /// Classify one read from its candidates (in [`crate::SeqId`] order): `None` when
-    /// the read is unclassified (no mass, or stopped at the synthetic root). Afterwards
-    /// [`Classifier::hits`] holds its posterior per EM leaf.
-    pub fn classify(&mut self, candidates: &[Candidate]) -> Option<Assignment> {
-        self.hits.clear();
+    /// the read is unclassified (no mass, or stopped at the synthetic root).
+    pub fn classify(&self, s: &mut Scratch, candidates: &[Candidate]) -> Option<Assignment> {
         for c in candidates {
             if c.posterior == 0.0 {
                 continue;
             }
-            match self.hits.iter_mut().find(|(l, _)| *l == c.leaf) {
-                Some((_, p)) => *p += c.posterior,
-                None => self.hits.push((c.leaf, c.posterior)),
+            if s.leaf_mass[c.leaf] == 0.0 {
+                s.hits.push(c.leaf);
             }
+            s.leaf_mass[c.leaf] += c.posterior;
         }
-        if self.hits.is_empty() {
+        if s.hits.is_empty() {
             return None;
         }
-        let (vertex, h) = match self.placement {
-            Placement::Descend(gamma) => assign_read(&self.tree, &self.hits, gamma),
-            Placement::BestSequence => best_hit(&self.hits),
-        };
+        let (vertex, h) = self.descend(s);
+        s.reset();
         if is_synthetic_root(&self.tree, vertex) {
             return None;
         }
@@ -110,127 +178,90 @@ impl Classifier {
         })
     }
 
-    /// Posterior per EM leaf of the last classified read (pooled sequences summed).
-    pub fn hits(&self) -> &[(NodeID, EMProb)] {
-        &self.hits
-    }
-
     pub fn label(&self, v: NodeID) -> &str {
         label(&self.tree, v)
     }
-}
 
-/// The EM leaf with the largest posterior; ties go to the first in `hits` (index order).
-fn best_hit(hits: &[(NodeID, EMProb)]) -> (NodeID, EMProb) {
-    hits.iter()
-        .copied()
-        .fold(hits[0], |best, h| if h.1 > best.1 { h } else { best })
-}
-
-/// `.matches` and / or `.posteriors`, written read by read from one classification.
-pub struct TableWriters<W: Write> {
-    classifier: Classifier,
-    matches: Option<W>,
-    posteriors: Option<W>,
-}
-
-impl<W: Write> TableWriters<W> {
-    /// Writes the headers. `label_header` is `RefID` or `TaxID`.
-    pub fn new(
+    /// The `.matches` header line.
+    /// The `.matches` head: a `#` comment line with the EM that produced the proportions
+    /// ([`crate::report::ReportMeta::em_summary`]) and the gamma, then the column header.
+    pub fn write_header<W: Write>(
+        &self,
+        out: &mut W,
+        em_summary: &str,
         label_header: &str,
-        tree: TaxTree,
-        placement: Placement,
-        mut matches: Option<W>,
-        mut posteriors: Option<W>,
-    ) -> Result<Self> {
-        if let Some(out) = matches.as_mut() {
-            writeln!(
-                out,
-                "ReadID\t{}\tPosterior\tForward Position\tReverse Position",
-                label_header
-            )?;
-        }
-        if let Some(out) = posteriors.as_mut() {
-            writeln!(out, "ReadID\t{}\tPosterior", label_header)?;
-        }
-        Ok(Self {
-            classifier: Classifier::new(tree, placement),
-            matches,
-            posteriors,
-        })
-    }
-
-    /// One read's rows in every table.
-    pub fn push(&mut self, read_id: &str, candidates: &[Candidate]) -> Result<()> {
-        let assigned = self.classifier.classify(candidates);
-        if let Some(out) = self.matches.as_mut() {
-            match assigned {
-                Some(a) => writeln!(
-                    out,
-                    "{}\t{}\t{:.5e}\t{}\t{}",
-                    read_id,
-                    self.classifier.label(a.vertex),
-                    a.h,
-                    a.pos.0,
-                    a.pos.1
-                )?,
-                None => writeln!(out, "{}\tunclassified\t-\t-\t-", read_id)?,
-            }
-        }
-        if let Some(out) = self.posteriors.as_mut() {
-            if assigned.is_none() {
-                writeln!(out, "{}\tunclassified\t-", read_id)?;
-            } else {
-                let mut rows: Vec<(&str, EMProb)> = self
-                    .classifier
-                    .hits()
-                    .iter()
-                    .map(|&(leaf, p)| (self.classifier.label(leaf), p))
-                    .collect();
-                rows.sort_by(|a, b| a.0.cmp(b.0));
-                for (name, p) in rows {
-                    writeln!(out, "{}\t{}\t{:.5e}", read_id, name, p)?;
-                }
-            }
-        }
+    ) -> Result<()> {
+        writeln!(out, "# {}; gamma={}", em_summary, self.gamma)?;
+        writeln!(
+            out,
+            "ReadID\t{}\tPosterior\tForward Position\tReverse Position",
+            label_header
+        )?;
         Ok(())
     }
 
-    /// Flush both tables and hand back their sinks `(matches, posteriors)`.
-    pub fn finish(mut self) -> Result<(Option<W>, Option<W>)> {
-        if let Some(out) = self.matches.as_mut() {
-            out.flush()?;
+    /// Classify one read from its candidates (in [`crate::SeqId`] order) and write its
+    /// `.matches` row.
+    pub fn write_row<W: Write>(
+        &self,
+        s: &mut Scratch,
+        out: &mut W,
+        read_id: &str,
+        candidates: &[Candidate],
+    ) -> Result<()> {
+        match self.classify(s, candidates) {
+            Some(a) => writeln!(
+                out,
+                "{}\t{}\t{:.5e}\t{}\t{}",
+                read_id,
+                self.label(a.vertex),
+                a.h,
+                a.pos.0,
+                a.pos.1
+            )?,
+            None => writeln!(out, "{}\tunclassified\t-\t-\t-", read_id)?,
         }
-        if let Some(out) = self.posteriors.as_mut() {
-            out.flush()?;
-        }
-        Ok((self.matches, self.posteriors))
+        Ok(())
     }
 }
 
-/// The `.matches` table alone.
-pub struct MatchesWriter<W: Write>(TableWriters<W>);
+/// The `.matches` table, written read by read on one thread.
+pub struct MatchesWriter<W: Write> {
+    classifier: Classifier,
+    scratch: Scratch,
+    out: W,
+}
 
 impl<W: Write> MatchesWriter<W> {
-    /// Writes the header. `tree` is the final EM tree (collapsed vertices are leaves).
-    pub fn new(out: W, label_header: &str, tree: TaxTree, placement: Placement) -> Result<Self> {
-        Ok(Self(TableWriters::new(
-            label_header,
-            tree,
-            placement,
-            Some(out),
-            None,
-        )?))
+    /// Writes the head ([`Classifier::write_header`]). `label_header` is `RefID` or
+    /// `TaxID`; `tree` is the final EM tree (collapsed vertices are leaves).
+    pub fn new(
+        mut out: W,
+        em_summary: &str,
+        label_header: &str,
+        tree: TaxTree,
+        gamma: EMProb,
+    ) -> Result<Self> {
+        let classifier = Classifier::new(tree, gamma);
+        classifier.write_header(&mut out, em_summary, label_header)?;
+        let scratch = Scratch::new(&classifier);
+        Ok(Self {
+            classifier,
+            scratch,
+            out,
+        })
     }
 
     /// Classify one read from its candidates (in [`crate::SeqId`] order).
     pub fn push(&mut self, read_id: &str, candidates: &[Candidate]) -> Result<()> {
-        self.0.push(read_id, candidates)
+        self.classifier
+            .write_row(&mut self.scratch, &mut self.out, read_id, candidates)
     }
 
-    pub fn finish(self) -> Result<W> {
-        let (matches, _) = self.0.finish()?;
-        Ok(matches.expect("the matches sink was given"))
+    /// Flush the table and hand back its sink.
+    pub fn finish(mut self) -> Result<W> {
+        self.out.flush()?;
+        Ok(self.out)
     }
 }
 
@@ -239,6 +270,7 @@ mod tests {
     use super::*;
     use crate::report::fixtures::fitted;
     use crate::report::ReportTree;
+    use crate::tree::{assign_read, new_node, new_tree};
 
     fn c(leaf: NodeID, posterior: EMProb, loglik: EMProb, pos: (usize, usize)) -> Candidate {
         Candidate {
@@ -249,39 +281,39 @@ mod tests {
         }
     }
 
+    /// root → genus A (1) → sp1 (3, collapsed over two sequences), sp2 (4) → s2|x (8).
     fn final_tree() -> TaxTree {
         let (stored, tips, fit_tree, part, fit) = fitted();
         ReportTree::from_fit(&stored, &tips, &fit_tree, &part, &fit).to_tax_tree()
     }
 
-    /// Both tables of a few reads: `(matches, posteriors)`.
-    fn write_both(gamma: EMProb, reads: &[(&str, Vec<Candidate>)]) -> (String, String) {
-        let mut w = TableWriters::new(
-            "TaxID",
-            final_tree(),
-            Placement::Descend(gamma),
-            Some(Vec::new()),
-            Some(Vec::new()),
-        )
-        .unwrap();
-        for (id, cands) in reads {
-            w.push(id, cands).unwrap();
-        }
-        let (m, p) = w.finish().unwrap();
-        (
-            String::from_utf8(m.unwrap()).unwrap(),
-            String::from_utf8(p.unwrap()).unwrap(),
-        )
+    /// The tree of a run without a taxonomy: the root over sequences s0 (1) and s1 (2).
+    fn flat_tree() -> TaxTree {
+        let mut t = new_tree();
+        t.add_child(0, new_node(1, "s0", "sequence"));
+        t.add_child(0, new_node(2, "s1", "sequence"));
+        t
     }
 
-    fn write(gamma: EMProb, reads: &[(&str, Vec<Candidate>)]) -> String {
-        let mut w =
-            MatchesWriter::new(Vec::new(), "TaxID", final_tree(), Placement::Descend(gamma))
-                .unwrap();
+    fn write_on(tree: TaxTree, gamma: EMProb, reads: &[(&str, Vec<Candidate>)]) -> String {
+        let mut w = MatchesWriter::new(Vec::new(), "EM test", "TaxID", tree, gamma).unwrap();
         for (id, cands) in reads {
             w.push(id, cands).unwrap();
         }
         String::from_utf8(w.finish().unwrap()).unwrap()
+    }
+
+    fn write(gamma: EMProb, reads: &[(&str, Vec<Candidate>)]) -> String {
+        write_on(final_tree(), gamma, reads)
+    }
+
+    /// The data row of a single read.
+    fn row(tree: TaxTree, gamma: EMProb, cands: Vec<Candidate>) -> String {
+        write_on(tree, gamma, &[("r", cands)])
+            .lines()
+            .nth(2)
+            .unwrap()
+            .to_string()
     }
 
     #[test]
@@ -292,7 +324,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "ReadID\tTaxID\tPosterior\tForward Position\tReverse Position\nr0\tunclassified\t-\t-\t-\nr1\tunclassified\t-\t-\t-\n"
+            "# EM test; gamma=0.6\nReadID\tTaxID\tPosterior\tForward Position\tReverse Position\nr0\tunclassified\t-\t-\t-\nr1\tunclassified\t-\t-\t-\n"
         );
     }
 
@@ -305,47 +337,34 @@ mod tests {
             c(8, 0.3, 1e-7, (9, 10)),
         ];
         // gamma 0.6: genus 1 holds 1.0, species 3 holds 0.7 → stop at 3, best position under 3.
-        let out = write(0.6, &[("r", cands.clone())]);
-        assert_eq!(out.lines().nth(1).unwrap(), "r\tsp1\t7.00000e-1\t7\t8");
+        assert_eq!(
+            row(final_tree(), 0.6, cands.clone()),
+            "r\tsp1\t7.00000e-1\t7\t8"
+        );
         // gamma 0.8: 3 has 0.7 < 0.8 → stop at genus A with 1.0; best position over all.
-        let out = write(0.8, &[("r", cands.clone())]);
-        assert_eq!(out.lines().nth(1).unwrap(), "r\tA\t1.00000e0\t9\t10");
+        assert_eq!(
+            row(final_tree(), 0.8, cands.clone()),
+            "r\tA\t1.00000e0\t9\t10"
+        );
         // gamma 0.7: 3 has exactly 0.7, which does not exceed it → the genus.
-        let out = write(0.7, &[("r", cands)]);
-        assert_eq!(out.lines().nth(1).unwrap(), "r\tA\t1.00000e0\t9\t10");
+        assert_eq!(row(final_tree(), 0.7, cands), "r\tA\t1.00000e0\t9\t10");
     }
 
     #[test]
-    fn without_a_taxonomy_the_most_probable_sequence_wins_whatever_gamma() {
-        let best = |cands: Vec<Candidate>| {
-            let mut w =
-                MatchesWriter::new(Vec::new(), "RefID", final_tree(), Placement::BestSequence)
-                    .unwrap();
-            w.push("r", &cands).unwrap();
-            let out = String::from_utf8(w.finish().unwrap()).unwrap();
-            out.lines().nth(1).unwrap().to_string()
-        };
-        // a split no gamma in [0.5, 1) descends into: still the more probable sequence
+    fn without_a_taxonomy_a_sequence_needs_a_posterior_above_gamma() {
+        let cands = vec![c(1, 0.8, 1e-9, (5, 6)), c(2, 0.2, 1e-7, (9, 10))];
         assert_eq!(
-            best(vec![c(3, 0.45, 1e-9, (5, 6)), c(8, 0.55, 1e-7, (9, 10))]),
-            "r\ts2|x\t5.50000e-1\t9\t10"
+            row(flat_tree(), 0.6, cands.clone()),
+            "r\ts0\t8.00000e-1\t5\t6"
         );
-        // pooled rows of one leaf add up, and ties go to the first in index order
         assert_eq!(
-            best(vec![
-                c(3, 0.25, 1e-9, (5, 6)),
-                c(3, 0.25, 1e-8, (7, 8)),
-                c(8, 0.5, 1e-7, (9, 10))
-            ]),
-            "r\tsp1\t5.00000e-1\t7\t8"
-        );
-        // no posterior mass: unclassified
-        assert_eq!(
-            best(vec![c(3, 0.0, 1e-9, (5, 6))]),
+            row(flat_tree(), 0.8, cands.clone()),
             "r\tunclassified\t-\t-\t-"
         );
-        assert_eq!(Placement::new(false, 0.9), Placement::BestSequence);
-        assert_eq!(Placement::new(true, 0.9), Placement::Descend(0.9));
+        assert_eq!(row(flat_tree(), 0.9, cands), "r\tunclassified\t-\t-\t-");
+        // twins split every read 0.5 / 0.5: unclassified at the default gamma
+        let twins = vec![c(1, 0.5, 1e-9, (5, 6)), c(2, 0.5, 1e-9, (9, 10))];
+        assert_eq!(row(flat_tree(), 0.6, twins), "r\tunclassified\t-\t-\t-");
     }
 
     #[test]
@@ -353,75 +372,134 @@ mod tests {
         // Only sequence 8 carries mass, but a zero-weight row under 8's subtree with a
         // higher likelihood still supplies the position (as `write_matches` did).
         let cands = vec![c(8, 0.0, 1e-2, (1, 1)), c(8, 1.0, 1e-5, (2, 2))];
-        let out = write(0.6, &[("r", cands)]);
-        assert_eq!(out.lines().nth(1).unwrap(), "r\ts2|x\t1.00000e0\t1\t1");
+        assert_eq!(row(final_tree(), 0.6, cands), "r\ts2|x\t1.00000e0\t1\t1");
     }
 
     #[test]
     fn loglik_ties_go_to_the_later_row() {
         let cands = vec![c(8, 0.5, 1e-2, (1, 1)), c(8, 0.5, 1e-2, (2, 2))];
-        let out = write(0.6, &[("r", cands)]);
-        assert_eq!(out.lines().nth(1).unwrap(), "r\ts2|x\t1.00000e0\t2\t2");
+        assert_eq!(row(final_tree(), 0.6, cands), "r\ts2|x\t1.00000e0\t2\t2");
+    }
+
+    /// root → genus 1 → species 2, 3, each over `per_species` sequence leaves: the shape
+    /// of a per-contig reference, where a species holds thousands of tips.
+    fn wide_tree(per_species: usize) -> TaxTree {
+        let mut t = new_tree();
+        t.add_child(0, new_node(1, "g", "genus"));
+        t.add_child(1, new_node(2, "s1", "species"));
+        t.add_child(1, new_node(3, "s2", "species"));
+        for i in 0..2 * per_species {
+            let id = 4 + i;
+            t.add_child(2 + i % 2, new_node(id, &format!("c{id}"), "sequence"));
+        }
+        t
+    }
+
+    /// Deterministic pseudo-random candidates of `n_reads` reads over the leaves 4.., with
+    /// some exact posterior ties.
+    fn wide_reads(n_reads: usize, per_read: usize, n_leaves: usize) -> Vec<Vec<Candidate>> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..n_reads)
+            .map(|_| {
+                let mut leaves: Vec<NodeID> = (0..per_read)
+                    .map(|_| 4 + (next() as usize) % n_leaves)
+                    .collect();
+                leaves.sort_unstable();
+                let w: Vec<EMProb> = leaves.iter().map(|_| (next() % 4 + 1) as EMProb).collect();
+                let total: EMProb = w.iter().sum();
+                leaves
+                    .iter()
+                    .zip(&w)
+                    .enumerate()
+                    .map(|(i, (&leaf, &w))| c(leaf, w / total, -((next() % 3) as EMProb), (i, i)))
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
-    fn split_mass_stops_at_the_root() {
+    fn classifier_matches_the_reference_descent_bit_for_bit() {
+        let tree = wide_tree(50);
+        for gamma in [0.5, 0.6, 0.9, 0.99] {
+            let cls = Classifier::new(tree.clone(), gamma);
+            let mut s = Scratch::new(&cls);
+            for (r, cands) in wide_reads(2000, 6, 100)
+                .into_iter()
+                .chain([vec![], vec![c(4, 0.0, 0.0, (0, 0))]])
+                .enumerate()
+            {
+                let mut hits: Vec<(NodeID, EMProb)> = Vec::new();
+                for x in cands.iter().filter(|x| x.posterior != 0.0) {
+                    match hits.iter_mut().find(|(l, _)| *l == x.leaf) {
+                        Some((_, p)) => *p += x.posterior,
+                        None => hits.push((x.leaf, x.posterior)),
+                    }
+                }
+                let want = (!hits.is_empty())
+                    .then(|| assign_read(&tree, &hits, gamma))
+                    .filter(|&(v, _)| !is_synthetic_root(&tree, v));
+                let got = cls.classify(&mut s, &cands);
+                assert_eq!(
+                    got.map(|a| (a.vertex, a.h.to_bits())),
+                    want.map(|(v, h)| (v, h.to_bits())),
+                    "gamma {gamma} read {r}: {cands:?}"
+                );
+            }
+        }
+    }
+
+    /// `cargo test --release -- --ignored --nocapture classify_wide`: per-read cost on a
+    /// per-contig-shaped tree.
+    #[test]
+    #[ignore]
+    fn classify_wide_tree_timing() {
+        let per_species = 5000;
+        for per_read in [200, 1000] {
+            let reads = wide_reads(20_000, per_read, 2 * per_species);
+            let cls = Classifier::new(wide_tree(per_species), 0.6);
+            let mut s = Scratch::new(&cls);
+            let t = std::time::Instant::now();
+            let n = reads.iter().filter_map(|r| cls.classify(&mut s, r)).count();
+            let s = t.elapsed().as_secs_f64();
+            eprintln!(
+                "{} reads x {per_read} hits: {:.3} s ({:.1} us/read), {n} classified",
+                reads.len(),
+                s,
+                s * 1e6 / reads.len() as f64
+            );
+            // The previous classifier: per-leaf sums by linear search, then assign_read.
+            let tree = wide_tree(per_species);
+            let t = std::time::Instant::now();
+            let mut hits: Vec<(NodeID, EMProb)> = Vec::new();
+            for r in &reads {
+                hits.clear();
+                for x in r.iter().filter(|x| x.posterior != 0.0) {
+                    match hits.iter_mut().find(|(l, _)| *l == x.leaf) {
+                        Some((_, p)) => *p += x.posterior,
+                        None => hits.push((x.leaf, x.posterior)),
+                    }
+                }
+                std::hint::black_box(assign_read(&tree, &hits, 0.6));
+            }
+            let s = t.elapsed().as_secs_f64();
+            eprintln!(
+                "  previous: {:.3} s ({:.1} us/read)",
+                s,
+                s * 1e6 / reads.len() as f64
+            );
+        }
+    }
+
+    #[test]
+    fn split_mass_stops_at_the_genus() {
         let cands = vec![c(3, 0.5, 1e-2, (1, 1)), c(8, 0.5, 1e-2, (2, 2))];
-        // Both under genus A (1.0) → A; make the root split instead by giving mass to a
-        // vertex outside A: there is none in the fitted tree, so A always wins here.
-        let out = write(0.6, &[("r", cands)]);
-        assert!(out.lines().nth(1).unwrap().starts_with("r\tA\t1.00000e0"));
-    }
-
-    #[test]
-    fn posteriors_list_every_leaf_by_label_and_follow_the_matches_verdict() {
-        let classified = vec![
-            c(8, 0.3, 1e-7, (9, 10)),
-            c(3, 0.35, 1e-9, (5, 6)),
-            c(3, 0.35, 1e-8, (7, 8)),
-        ];
-        let (m, p) = write_both(
-            0.6,
-            &[
-                ("r0", classified),
-                ("r1", vec![]),
-                ("r2", vec![c(8, 0.0, 1e-2, (1, 1))]),
-            ],
-        );
-        assert_eq!(
-            m,
-            "ReadID\tTaxID\tPosterior\tForward Position\tReverse Position\n\
-             r0\tsp1\t7.00000e-1\t7\t8\n\
-             r1\tunclassified\t-\t-\t-\n\
-             r2\tunclassified\t-\t-\t-\n"
-        );
-        // Pooled sequences 6, 7 are summed into species 3; rows sorted by label.
-        assert_eq!(
-            p,
-            "ReadID\tTaxID\tPosterior\n\
-             r0\ts2|x\t3.00000e-1\n\
-             r0\tsp1\t7.00000e-1\n\
-             r1\tunclassified\t-\n\
-             r2\tunclassified\t-\n"
-        );
-    }
-
-    #[test]
-    fn posteriors_alone_need_no_matches_sink() {
-        let mut w = TableWriters::new(
-            "RefID",
-            final_tree(),
-            Placement::Descend(0.9),
-            None,
-            Some(Vec::new()),
-        )
-        .unwrap();
-        w.push("r", &[c(8, 1.0, 1e-2, (1, 1))]).unwrap();
-        let (m, p) = w.finish().unwrap();
-        assert!(m.is_none());
-        assert_eq!(
-            String::from_utf8(p.unwrap()).unwrap(),
-            "ReadID\tRefID\tPosterior\nr\ts2|x\t1.00000e0\n"
-        );
+        // Both under genus A (1.0), neither species above 0.6 → A.
+        assert!(row(final_tree(), 0.6, cands).starts_with("r\tA\t1.00000e0"));
     }
 }

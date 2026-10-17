@@ -17,7 +17,7 @@
 
       premise-pkg = pkgs.rustPlatform.buildRustPackage {
         pname = "premise";
-        version = "0.5.0";
+        version = "0.6.0";
         src = self;
 
         cargoLock = {

@@ -1,8 +1,9 @@
 //! The run report: a NEXUS file holding the fitted taxonomy (down to the index
-//! sequences), the sequence → vertex map, every alignment log-likelihood of every read,
-//! the proportions, the EM trace and the run metadata. Posteriors are derived from the
-//! likelihoods and the proportions ([`posterior`]), so `.matches` for any `gamma` can be
-//! regenerated without the index or the reads ([`tables`]).
+//! sequences) with the fitted proportions, the sequence → vertex map, every alignment
+//! log-likelihood of every read, the EM trace and the run metadata. Only what the EM
+//! cannot regenerate is stored: the posteriors follow from the likelihoods and the
+//! proportions ([`posterior`]), so `.matches` for any `gamma` can be regenerated without
+//! the index or the reads ([`tables`]).
 
 pub mod export;
 pub mod nexus;
@@ -24,7 +25,7 @@ use phylo::prelude::*;
 use std::collections::{HashMap, HashSet};
 
 /// Format version written in the PREMISE block.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// What the EM did to a vertex of the contracted tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +165,30 @@ impl ReportTree {
 
     pub fn root(&self) -> NodeID {
         self.vertices.first().map_or(0, |v| v.id)
+    }
+
+    /// `(leaf, π_ℓ)` of the final tree's leaves with mass, sorted by label: the
+    /// proportions the EM ends with. A final vertex is a leaf when no final vertex hangs
+    /// below it, and its `proportion` is the EM's `π_ℓ`, so the report need not store
+    /// these separately.
+    pub fn final_leaf_props(&self) -> Vec<(NodeID, EMProb)> {
+        let status: HashMap<NodeID, VertexStatus> =
+            self.vertices.iter().map(|v| (v.id, v.status)).collect();
+        let has_final_child: HashSet<NodeID> = self
+            .vertices
+            .iter()
+            .filter(|v| v.status.is_final())
+            .filter_map(|v| v.parent)
+            .filter(|p| status.get(p).is_some_and(|s| s.is_final()))
+            .collect();
+        let mut leaves: Vec<&ReportVertex> = self
+            .vertices
+            .iter()
+            .filter(|v| v.status.is_final() && !has_final_child.contains(&v.id))
+            .filter(|v| v.proportion > 0.0)
+            .collect();
+        leaves.sort_by(|a, b| a.label.cmp(&b.label));
+        leaves.into_iter().map(|v| (v.id, v.proportion)).collect()
     }
 
     /// Label of every vertex by id.
@@ -341,6 +366,37 @@ pub struct EmIter {
     pub leaves: Vec<(NodeID, EMProb)>,
 }
 
+impl ReportMeta {
+    /// The EM that produced the proportions, on one line for the head of `.props` and
+    /// `.matches`: its settings (as in PARAMS), the iterations it ran, its final penalized
+    /// log-likelihood, and for a refit the report it started from. Holds no `[` or `]`, so
+    /// it fits in a NEXUS comment.
+    pub fn em_summary(&self) -> String {
+        let (p, e) = (&self.params, &self.em);
+        let final_ll = if e.final_ll.is_finite() {
+            format!("{:e}", e.final_ll)
+        } else {
+            "-".to_string()
+        };
+        let source = self.source.as_deref().map_or_else(String::new, |s| {
+            format!(", refit of {}", s.replace(['[', ']'], "_"))
+        });
+        format!(
+            "{} EM: init={} iter={} rho={:e} omega={:e} em_threshold={:e} penalty={}; {} iterations, final penalized log-likelihood {}{}",
+            self.tool.replace(['[', ']'], "_"),
+            p.init,
+            p.iter,
+            p.rho,
+            p.omega,
+            p.em_threshold,
+            u8::from(p.penalty),
+            e.iterations,
+            final_ll,
+            source
+        )
+    }
+}
+
 /// Everything in the report before the per-read blocks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReportHead {
@@ -348,7 +404,8 @@ pub struct ReportHead {
     pub em_trace: Vec<EmIter>,
     pub tree: ReportTree,
     pub refmap: RefMap,
-    /// `(node, π_ℓ)` of the final-tree leaves with mass, sorted by label.
+    /// `(node, π_ℓ)` of the final-tree leaves with mass, sorted by label: always
+    /// [`ReportTree::final_leaf_props`] of `tree`, never written to the report.
     pub props: Vec<(NodeID, EMProb)>,
 }
 

@@ -1,5 +1,5 @@
-//! Parse a report: the head blocks into memory, then ALIGNMENT_LIKELIHOODS one read at a
-//! time.
+//! Parse a report: the head blocks into memory, then ALIGNMENT_LIKELIHOODS and
+//! READ_POSTERIORS one read at a time.
 
 use super::nexus::tokens;
 use super::FORMAT_VERSION;
@@ -249,6 +249,212 @@ impl MetaBuilder {
     }
 }
 
+/// One array line of a read, `line` (line `line_no` of the report): `n` whitespace
+/// tokens, each handed to `f` with its index; with `allow_one` a single token (a value
+/// shared by every row) is accepted too. Returns the number of tokens.
+fn parse_array(
+    line: &str,
+    line_no: usize,
+    n: usize,
+    allow_one: bool,
+    what: &str,
+    read_id: &str,
+    f: &mut impl FnMut(usize, &str) -> Result<()>,
+) -> Result<usize> {
+    let mut i = 0;
+    for tok in line.split_ascii_whitespace() {
+        if i == n {
+            bail!(
+                "line {}: more than {} {} for read '{}'",
+                line_no,
+                n,
+                what,
+                read_id
+            );
+        }
+        f(i, tok).with_context(|| format!("line {}: {} of read '{}'", line_no, what, read_id))?;
+        i += 1;
+    }
+    if i != n && !(allow_one && i == 1) {
+        bail!(
+            "line {}: {} {} for read '{}', {} announced",
+            line_no,
+            i,
+            what,
+            read_id,
+            n
+        );
+    }
+    Ok(i)
+}
+
+/// One read of ALIGNMENT_LIKELIHOODS cut out of the stream but not yet parsed: its id,
+/// row and log-likelihood counts, and its array lines as text. Cutting is cheap and
+/// sequential; [`RawRead::parse`] does the work and can run on any thread.
+#[derive(Clone, Debug, Default)]
+pub struct RawRead {
+    read_id: String,
+    n: usize,
+    k: usize,
+    /// Report line number of the first array line.
+    first_line: usize,
+    /// The array lines back to back, and the end of each in `text`.
+    text: String,
+    ends: Vec<usize>,
+}
+
+impl RawRead {
+    pub fn read_id(&self) -> &str {
+        &self.read_id
+    }
+
+    /// Bytes of text held, a measure of the parse work left.
+    pub fn text_len(&self) -> usize {
+        self.text.len()
+    }
+
+    /// What each array line holds, in order.
+    fn line_names(k: usize) -> &'static [&'static str] {
+        if k == 1 {
+            &[
+                "seqids",
+                "log-likelihoods",
+                "forward positions",
+                "insert offsets",
+            ]
+        } else {
+            &[
+                "seqids",
+                "log-likelihoods",
+                "log-likelihood indices",
+                "forward positions",
+                "insert offsets",
+            ]
+        }
+    }
+
+    /// Parse the read into `buf`; `palette` is scratch.
+    pub fn parse(&self, buf: &mut ReadRows, palette: &mut Vec<EMProb>) -> Result<()> {
+        buf.read_id.clear();
+        buf.read_id.push_str(&self.read_id);
+        buf.rows.clear();
+        let (n, k) = (self.n, self.k);
+        if n == 0 {
+            return Ok(());
+        }
+        buf.rows.reserve(n.min(MAX_PREALLOC));
+        let rows = &mut buf.rows;
+        let read_id: &str = &self.read_id;
+        let mut lines = self.ends.iter().enumerate().map(|(i, &end)| {
+            let start = if i == 0 { 0 } else { self.ends[i - 1] };
+            (&self.text[start..end], self.first_line + i)
+        });
+        let mut next = || lines.next().expect("RawRead holds every array line");
+        let (line, no) = next();
+        let mut prev: u32 = 0;
+        parse_array(line, no, n, false, "seqids", read_id, &mut |i, tok| {
+            let v: u32 = num(tok, "seqid")?;
+            let seq = if i == 0 {
+                v
+            } else {
+                if v == 0 {
+                    bail!("seqid difference 0 (duplicate sequence)");
+                }
+                prev.checked_add(v)
+                    .ok_or_else(|| anyhow!("seqid overflows u32"))?
+            };
+            prev = seq;
+            rows.push(AlignRow {
+                seq: SeqId::new(seq),
+                loglik: 0.0,
+                pos: (0, 0),
+            });
+            Ok(())
+        })?;
+        palette.clear();
+        let (line, no) = next();
+        parse_array(
+            line,
+            no,
+            k,
+            false,
+            "log-likelihoods",
+            read_id,
+            &mut |_, tok| {
+                let ll: EMProb = num(tok, "log-likelihood")?;
+                if !ll.is_finite() {
+                    bail!("log-likelihood is not finite: {}", tok);
+                }
+                palette.push(ll);
+                Ok(())
+            },
+        )?;
+        if k == 1 {
+            rows.iter_mut().for_each(|r| r.loglik = palette[0]);
+        } else {
+            let (line, no) = next();
+            parse_array(
+                line,
+                no,
+                n,
+                false,
+                "log-likelihood indices",
+                read_id,
+                &mut |i, tok| {
+                    let j: usize = num(tok, "log-likelihood index")?;
+                    rows[i].loglik = *palette
+                        .get(j)
+                        .ok_or_else(|| anyhow!("log-likelihood index {} is not below {}", j, k))?;
+                    Ok(())
+                },
+            )?;
+        }
+        let (line, no) = next();
+        parse_array(
+            line,
+            no,
+            n,
+            false,
+            "forward positions",
+            read_id,
+            &mut |i, tok| {
+                rows[i].pos.0 = num(tok, "forward position")?;
+                Ok(())
+            },
+        )?;
+        let reverse = |fwd: usize, off: i64| {
+            i64::try_from(fwd)
+                .ok()
+                .and_then(|f| f.checked_add(off))
+                .and_then(|r| usize::try_from(r).ok())
+                .ok_or_else(|| anyhow!("reverse position {} {:+} is out of range", fwd, off))
+        };
+        let mut shared: i64 = 0;
+        let (line, no) = next();
+        let got = parse_array(
+            line,
+            no,
+            n,
+            true,
+            "insert offsets",
+            read_id,
+            &mut |i, tok| {
+                let off: i64 = num(tok, "insert offset")?;
+                shared = off;
+                rows[i].pos.1 = reverse(rows[i].pos.0, off)?;
+                Ok(())
+            },
+        )?;
+        if got == 1 {
+            for r in rows.iter_mut().skip(1) {
+                r.pos.1 = reverse(r.pos.0, shared)
+                    .with_context(|| format!("insert offset of read '{}'", read_id))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Line reader that tokenises and skips blank lines.
 pub struct ReportReader<R: BufRead> {
     r: R,
@@ -256,6 +462,8 @@ pub struct ReportReader<R: BufRead> {
     line_no: usize,
     /// The current read's distinct log-likelihoods.
     palette: Vec<EMProb>,
+    /// Scratch for [`Self::next_read`].
+    raw: RawRead,
 }
 
 impl<R: BufRead> ReportReader<R> {
@@ -520,25 +728,6 @@ impl<R: BufRead> ReportReader<R> {
         Ok(RefMap { entries })
     }
 
-    fn props_block(&mut self) -> Result<Vec<(NodeID, EMProb)>> {
-        let n = self.matrix_header("PROPS", "N")?;
-        let rows = self.matrix_rows("PROPS", n)?;
-        if rows.len() != n {
-            bail!("PROPS: {} rows, {} announced", rows.len(), n);
-        }
-        rows.into_iter()
-            .map(|r| {
-                if r.len() != 2 {
-                    bail!("PROPS: expected 'node proportion', got {:?}", r);
-                }
-                Ok((
-                    num(&r[0], "PROPS node")?,
-                    unit(num(&r[1], "PROPS pi")?, "PROPS pi")?,
-                ))
-            })
-            .collect()
-    }
-
     /// Parse every block before ALIGNMENT_LIKELIHOODS and stop right after its `MATRIX`
     /// line. Returns the announced read count with the reader positioned on the first read.
     pub fn parse_head(r: R) -> Result<(ReportHead, usize, Self)> {
@@ -547,6 +736,7 @@ impl<R: BufRead> ReportReader<R> {
             line: String::new(),
             line_no: 0,
             palette: Vec::new(),
+            raw: RawRead::default(),
         };
         let first = me.expect_tokens("header")?;
         if first.len() != 1 || !first[0].eq_ignore_ascii_case("#NEXUS") {
@@ -557,7 +747,6 @@ impl<R: BufRead> ReportReader<R> {
         let mut taxa: Option<Vec<String>> = None;
         let mut tree = None;
         let mut refmap = None;
-        let mut props = None;
         loop {
             let Some(toks) = me.next_tokens()? else {
                 bail!("report ends before an ALIGNMENT_LIKELIHOODS block");
@@ -576,7 +765,6 @@ impl<R: BufRead> ReportReader<R> {
                 "TAXA" => taxa = Some(me.taxa_block()?),
                 "NODES" => tree = Some(me.nodes_block()?),
                 "REFMAP" => refmap = Some(me.refmap_block()?),
-                "PROPS" => props = Some(me.props_block()?),
                 "ALIGNMENT_LIKELIHOODS" => {
                     let n = me.matrix_header("ALIGNMENT_LIKELIHOODS", "NREADS")?;
                     let need = |what: &str| anyhow!("report has no {} block", what);
@@ -595,9 +783,9 @@ impl<R: BufRead> ReportReader<R> {
                     let head = ReportHead {
                         meta: meta.ok_or_else(|| need("PREMISE"))?,
                         em_trace: em_trace.ok_or_else(|| need("EM_TRACE"))?,
+                        props: tree.final_leaf_props(),
                         tree,
                         refmap: refmap.ok_or_else(|| need("REFMAP"))?,
-                        props: props.ok_or_else(|| need("PROPS"))?,
                     };
                     let known: HashSet<NodeID> = head.tree.vertices.iter().map(|v| v.id).collect();
                     if let Some((seq, node)) =
@@ -609,32 +797,12 @@ impl<R: BufRead> ReportReader<R> {
                             node
                         );
                     }
-                    let status_of: HashMap<NodeID, VertexStatus> = head
-                        .tree
-                        .vertices
-                        .iter()
-                        .map(|v| (v.id, v.status))
-                        .collect();
-                    let mut seen: HashSet<NodeID> = HashSet::new();
-                    for (node, _) in &head.props {
-                        match status_of.get(node) {
-                            None => bail!("PROPS: unknown vertex {}", node),
-                            Some(s) if !s.is_final() => {
-                                bail!(
-                                    "PROPS: vertex {} is {}, not a leaf of the final tree",
-                                    node,
-                                    s.as_str()
-                                )
-                            }
-                            Some(_) => {}
-                        }
-                        if !seen.insert(*node) {
-                            bail!("PROPS: vertex {} listed twice", node);
-                        }
-                    }
                     let total: EMProb = head.props.iter().map(|(_, p)| p).sum();
                     if !head.props.is_empty() && (total - 1.0).abs() > 1e-6 {
-                        bail!("PROPS: proportions sum to {}, not 1", total);
+                        bail!(
+                            "NODES: the final tree's leaves have proportions summing to {}, not 1",
+                            total
+                        );
                     }
                     return Ok((head, n, me));
                 }
@@ -643,73 +811,13 @@ impl<R: BufRead> ReportReader<R> {
         }
     }
 
-    /// One array line of a read: `n` whitespace tokens, each handed to `f` with its index.
-    fn array_line(
-        &mut self,
-        n: usize,
-        what: &str,
-        read_id: &str,
-        f: impl FnMut(usize, &str) -> Result<()>,
-    ) -> Result<()> {
-        self.array_line_of(n, false, what, read_id, f).map(|_| ())
-    }
-
-    /// [`Self::array_line`] that, with `allow_one`, also accepts a single token (a value
-    /// shared by every row); returns the number of tokens.
-    fn array_line_of(
-        &mut self,
-        n: usize,
-        allow_one: bool,
-        what: &str,
-        read_id: &str,
-        mut f: impl FnMut(usize, &str) -> Result<()>,
-    ) -> Result<usize> {
-        self.line.clear();
-        self.line_no += 1;
-        if self.r.read_line(&mut self.line)? == 0 {
-            bail!(
-                "ALIGNMENT_LIKELIHOODS: truncated {} of read '{}'",
-                what,
-                read_id
-            );
-        }
-        let mut i = 0;
-        for tok in self.line.split_ascii_whitespace() {
-            if i == n {
-                bail!(
-                    "line {}: more than {} {} for read '{}'",
-                    self.line_no,
-                    n,
-                    what,
-                    read_id
-                );
-            }
-            f(i, tok).with_context(|| {
-                format!("line {}: {} of read '{}'", self.line_no, what, read_id)
-            })?;
-            i += 1;
-        }
-        if i != n && !(allow_one && i == 1) {
-            bail!(
-                "line {}: {} {} for read '{}', {} announced",
-                self.line_no,
-                i,
-                what,
-                read_id,
-                n
-            );
-        }
-        Ok(i)
-    }
-
-    /// The next read of ALIGNMENT_LIKELIHOODS into `buf`; `false` once the matrix is
-    /// exhausted.
-    pub fn next_read(&mut self, buf: &mut ReadRows) -> Result<bool> {
-        // Read-id lines are `'id' n` or `id n`; the fast path skips the tokenizer when
-        // nothing needs it.
+    /// The tokens of the next read-id line of `block`, or `None` at the matrix end (the
+    /// block's `END;` consumed). Read-id lines are `'id' n …` or `id n …`; the fast path
+    /// skips the tokenizer when nothing needs it.
+    fn read_id_tokens(&mut self, block: &str) -> Result<Option<Vec<String>>> {
         let toks: Vec<String> = loop {
             if !self.read_line()? {
-                bail!("unexpected end of report while reading ALIGNMENT_LIKELIHOODS");
+                bail!("unexpected end of report while reading {}", block);
             }
             let t = self.line.trim();
             if t.is_empty() {
@@ -724,12 +832,34 @@ impl<R: BufRead> ReportReader<R> {
             }
         };
         if Self::is_matrix_end(&toks) {
-            let end = self.expect_tokens("ALIGNMENT_LIKELIHOODS")?;
+            let end = self.expect_tokens(block)?;
             if !Self::is_end(&end) {
-                bail!("ALIGNMENT_LIKELIHOODS: expected END; after the matrix");
+                bail!("{}: expected END; after the matrix", block);
             }
-            return Ok(false);
+            return Ok(None);
         }
+        Ok(Some(toks))
+    }
+
+    /// The next read of ALIGNMENT_LIKELIHOODS into `buf`; `false` once the matrix is
+    /// exhausted.
+    pub fn next_read(&mut self, buf: &mut ReadRows) -> Result<bool> {
+        let mut raw = std::mem::take(&mut self.raw);
+        let more = self.next_raw_read(&mut raw);
+        let parsed = match more {
+            Ok(true) => raw.parse(buf, &mut self.palette).map(|()| true),
+            other => other,
+        };
+        self.raw = raw;
+        parsed
+    }
+
+    /// Cut the next read of ALIGNMENT_LIKELIHOODS out of the stream into `raw` without
+    /// parsing its arrays ([`RawRead::parse`]); `false` once the matrix is exhausted.
+    pub fn next_raw_read(&mut self, raw: &mut RawRead) -> Result<bool> {
+        let Some(toks) = self.read_id_tokens("ALIGNMENT_LIKELIHOODS")? else {
+            return Ok(false);
+        };
         let n: usize = match toks.len() {
             2 | 3 => num(&toks[1], "ALIGNMENT_LIKELIHOODS n_rows")?,
             _ => bail!(
@@ -745,9 +875,12 @@ impl<R: BufRead> ReportReader<R> {
                 toks
             );
         }
-        buf.read_id.clear();
-        buf.read_id.push_str(&toks[0]);
-        buf.rows.clear();
+        raw.read_id.clear();
+        raw.read_id.push_str(&toks[0]);
+        raw.text.clear();
+        raw.ends.clear();
+        raw.n = n;
+        raw.k = 0;
         if n == 0 {
             return Ok(true);
         }
@@ -761,78 +894,16 @@ impl<R: BufRead> ReportReader<R> {
                 n
             );
         }
-        buf.rows.reserve(n.min(MAX_PREALLOC));
-        let ReadRows { read_id, rows } = buf;
-        let read_id: &str = read_id;
-        let mut prev: u32 = 0;
-        self.array_line(n, "seqids", read_id, |i, tok| {
-            let v: u32 = num(tok, "seqid")?;
-            let seq = if i == 0 {
-                v
-            } else {
-                if v == 0 {
-                    bail!("seqid difference 0 (duplicate sequence)");
-                }
-                prev.checked_add(v)
-                    .ok_or_else(|| anyhow!("seqid overflows u32"))?
-            };
-            prev = seq;
-            rows.push(AlignRow {
-                seq: SeqId::new(seq),
-                loglik: 0.0,
-                pos: (0, 0),
-            });
-            Ok(())
-        })?;
-        let mut palette = std::mem::take(&mut self.palette);
-        palette.clear();
-        let parsed = self
-            .array_line(k, "log-likelihoods", read_id, |_, tok| {
-                let ll: EMProb = num(tok, "log-likelihood")?;
-                if !ll.is_finite() {
-                    bail!("log-likelihood is not finite: {}", tok);
-                }
-                palette.push(ll);
-                Ok(())
-            })
-            .and_then(|()| {
-                if k == 1 {
-                    rows.iter_mut().for_each(|r| r.loglik = palette[0]);
-                    return Ok(());
-                }
-                self.array_line(n, "log-likelihood indices", read_id, |i, tok| {
-                    let j: usize = num(tok, "log-likelihood index")?;
-                    rows[i].loglik = *palette
-                        .get(j)
-                        .ok_or_else(|| anyhow!("log-likelihood index {} is not below {}", j, k))?;
-                    Ok(())
-                })
-            });
-        self.palette = palette;
-        parsed?;
-        self.array_line(n, "forward positions", read_id, |i, tok| {
-            rows[i].pos.0 = num(tok, "forward position")?;
-            Ok(())
-        })?;
-        let reverse = |fwd: usize, off: i64| {
-            i64::try_from(fwd)
-                .ok()
-                .and_then(|f| f.checked_add(off))
-                .and_then(|r| usize::try_from(r).ok())
-                .ok_or_else(|| anyhow!("reverse position {} {:+} is out of range", fwd, off))
-        };
-        let mut shared: i64 = 0;
-        let got = self.array_line_of(n, true, "insert offsets", read_id, |i, tok| {
-            let off: i64 = num(tok, "insert offset")?;
-            shared = off;
-            rows[i].pos.1 = reverse(rows[i].pos.0, off)?;
-            Ok(())
-        })?;
-        if got == 1 {
-            for r in rows.iter_mut().skip(1) {
-                r.pos.1 = reverse(r.pos.0, shared)
-                    .with_context(|| format!("insert offset of read '{}'", read_id))?;
+        raw.k = k;
+        raw.first_line = self.line_no + 1;
+        for what in RawRead::line_names(k) {
+            self.line.clear();
+            self.line_no += 1;
+            if self.r.read_line(&mut self.line)? == 0 {
+                bail!("truncated {} of read '{}'", what, raw.read_id);
             }
+            raw.text.push_str(&self.line);
+            raw.ends.push(raw.text.len());
         }
         Ok(true)
     }
@@ -914,7 +985,8 @@ pub(crate) mod tests {
                 &[SeqId::new(4), SeqId::new(9), SeqId::new(2), SeqId::new(7)],
                 &tips,
             ),
-            props: vec![(3, 0.4), (8, 0.6)],
+            // The final leaves by label, as `ReportTree::final_leaf_props` gives them.
+            props: vec![(8, 0.6), (3, 0.4)],
         }
     }
 
@@ -970,10 +1042,48 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_report_holds_only_what_the_em_cannot_regenerate() {
+        let bytes = write_sample(Vec::new());
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            !text.contains("BEGIN PROPS;") && !text.contains("READ_POSTERIORS"),
+            "{text}"
+        );
+        // The final leaves' proportions come back from NODES, bit for bit.
+        let (head, _, _) = ReportReader::parse_head(bytes.as_slice()).unwrap();
+        assert_eq!(head.props, vec![(8, 0.6), (3, 0.4)]);
+        assert_eq!(head.props, sample_head().props);
+        // An earlier v4 report with PROPS and READ_POSTERIORS reads the same.
+        let al = text.find("BEGIN ALIGNMENT_LIKELIHOODS;").unwrap();
+        let profile = text.find("BEGIN PROFILE;").unwrap();
+        let old = format!(
+            "{}BEGIN PROPS;\n\tDIMENSIONS N=2;\n\tMATRIX\n\t3 4e-1\n\t8 6e-1\n\t;\nEND;\n\n{}BEGIN READ_POSTERIORS;\n\tDIMENSIONS NREADS=3;\n\tMATRIX\n\t'read_1/1' 1\n\t2\n\t1e0\n\t'no rows' 0\n\t'it''s' 1\n\t9\n\t1e0\n\t;\nEND;\n\n{}",
+            &text[..al],
+            &text[al..profile],
+            &text[profile..]
+        );
+        let (old_head, n, reads) = read_all(old.as_bytes());
+        assert_eq!(old_head, head);
+        assert_eq!((n, reads), (3, sample_reads()));
+        // Leaves of the final tree whose proportions do not sum to one are an error.
+        let bad = text.replacen(
+            "\t8 4 sequence active 1 3e1 6e-1",
+            "\t8 4 sequence active 1 3e1 5e-1",
+            1,
+        );
+        assert_ne!(bad, text, "the edit must change the report");
+        let err = ReportReader::parse_head(bad.as_bytes())
+            .err()
+            .expect("rejected")
+            .to_string();
+        assert!(err.contains("summing to 0.9"), "{err}");
+    }
+
+    #[test]
     fn head_and_reads_round_trip_exactly() {
         let bytes = write_sample(Vec::new());
         let text = String::from_utf8(bytes.clone()).unwrap();
-        assert!(text.starts_with("#NEXUS\n[PREMISE report v3]\n"));
+        assert!(text.starts_with("#NEXUS\n[PREMISE report v4]\n"));
         assert!(text.contains("\tINDEX 'idx with space.fmidx';\n\tINDEX_SHA256 aaaa"));
         assert!(text.contains("\t'read_1/1' 2 2\n\t2 5\n\t-6.9e2 -1.025e1\n\t0 1\n\t10 0\n\t10 0\n\t'no rows' 0\n\t'it''s' 1 1\n\t9\n\t-5e-1\n\t7\n\t1\n\t;\n"));
         assert!(text.contains("BEGIN PROFILE;\n\tRUNTIME write_s=2.5e-1 total_s=2.5e0;\n\tMEMORY peak_rss_kb=123456;\nEND;\n"));
@@ -996,6 +1106,95 @@ pub(crate) mod tests {
         assert_eq!(got, head);
         assert_eq!(n, 0);
         assert_eq!(sample_head().meta.source, None);
+    }
+
+    /// `PREMISE_TIMING_REPORT=x.report.zst cargo test --release -- --ignored
+    /// write_timing_report`: a large compressed report on the sample head, for timing
+    /// `premise analyze` end to end.
+    #[test]
+    #[ignore]
+    fn write_timing_report() {
+        let Ok(path) = std::env::var("PREMISE_TIMING_REPORT") else {
+            return;
+        };
+        let n_reads = 2_000_000usize;
+        let head = sample_head();
+        let seqs = [2u32, 4, 7, 9];
+        let mut w =
+            ReportWriter::begin(Sink::create(&path, true).unwrap(), &head, n_reads).unwrap();
+        let mut rows = Vec::new();
+        for r in 0..n_reads {
+            rows.clear();
+            for (i, &s) in seqs.iter().enumerate().filter(|(i, _)| (r + i) % 5 != 0) {
+                rows.push(AlignRow {
+                    seq: SeqId::new(s),
+                    loglik: -((((r * 7 + i * 13) % 97) as EMProb) / 8.0) - 3.0,
+                    pos: (1000 + (r * 37) % 50_000, 1300 + (r * 37) % 50_000 + i),
+                });
+            }
+            w.push_read(&format!("S0R{r}/1"), &rows).unwrap();
+        }
+        w.end_alignments().unwrap();
+        w.finish(&Profile::default()).unwrap().finish().unwrap();
+    }
+
+    /// `cargo test --release -- --ignored --nocapture report_reader_timing`: one pass over
+    /// a compressed report, decompression alone vs decompression and parsing.
+    #[test]
+    #[ignore]
+    fn report_reader_timing() {
+        let (n_reads, per_read) = (200_000usize, 50usize);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.report.zst");
+        let path = path.to_str().unwrap();
+        let head = sample_head();
+        let mut w = ReportWriter::begin(Sink::create(path, true).unwrap(), &head, n_reads).unwrap();
+        let mut rows = Vec::with_capacity(per_read);
+        for r in 0..n_reads {
+            rows.clear();
+            for i in 0..per_read {
+                rows.push(AlignRow {
+                    seq: SeqId::new((3 * i + r % 3) as u32),
+                    loglik: -(((i + r) % 5) as EMProb) - 12.75,
+                    pos: (1000 + 37 * r % 5000, 1300 + 37 * r % 5000 + i % 2),
+                });
+            }
+            w.push_read(&format!("S0R{r}/1"), &rows).unwrap();
+        }
+        w.end_alignments().unwrap();
+        w.finish(&Profile::default()).unwrap().finish().unwrap();
+        let mb = std::fs::metadata(path).unwrap().len() as f64 / 1e6;
+
+        let t = std::time::Instant::now();
+        let mut r = crate::report::nexus::open_report(path).unwrap();
+        let bytes = std::io::copy(&mut r, &mut std::io::sink()).unwrap();
+        let decompress = t.elapsed().as_secs_f64();
+
+        let t = std::time::Instant::now();
+        let (_, _, mut rr) =
+            ReportReader::parse_head(crate::report::nexus::open_report(path).unwrap()).unwrap();
+        let mut buf = ReadRows::default();
+        let mut n = 0;
+        while rr.next_read(&mut buf).unwrap() {
+            n += buf.rows.len();
+        }
+        let parse = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let mut r = crate::report::nexus::open_report(path).unwrap();
+        let mut line = Vec::new();
+        let mut lines = 0usize;
+        while r.read_until(b'\n', &mut line).unwrap() > 0 {
+            lines += 1;
+            line.clear();
+        }
+        eprintln!(
+            "split into {lines} lines only: {:.2} s",
+            t.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "{n_reads} reads x {per_read} rows ({n} rows), {mb:.1} MB zst, {:.1} MB text: decompress {decompress:.2} s, decompress+parse {parse:.2} s",
+            bytes as f64 / 1e6
+        );
     }
 
     #[test]
@@ -1054,19 +1253,19 @@ pub(crate) mod tests {
     #[test]
     fn malformed_heads_are_rejected_with_a_reason() {
         // Other format versions, old or new.
-        let e = head_err(|t| t.replacen("\tVERSION 3;", "\tVERSION 2;", 1));
+        let e = head_err(|t| t.replacen("\tVERSION 4;", "\tVERSION 3;", 1));
         assert!(e.contains("not the version this PREMISE reads"), "{e}");
-        let e = head_err(|t| t.replacen("\tVERSION 3;", "\tVERSION 4;", 1));
+        let e = head_err(|t| t.replacen("\tVERSION 4;", "\tVERSION 5;", 1));
         assert!(e.contains("not the version"), "{e}");
         let e = head_err(|t| t.replacen("\tINDEX_SHA256 aaaa", "\tINDEX_SHA256 zzzz", 1));
         assert!(e.contains("INDEX_SHA256"), "{e}");
         // A missing block.
         let e = head_err(|t| {
-            let a = t.find("BEGIN PROPS;").unwrap();
+            let a = t.find("BEGIN REFMAP;").unwrap();
             let b = t[a..].find("END;\n").unwrap() + a + 5;
             format!("{}{}", &t[..a], &t[b..])
         });
-        assert!(e.contains("no PROPS block"), "{e}");
+        assert!(e.contains("no REFMAP block"), "{e}");
         // TAXA / NODES disagreement.
         let e = head_err(|t| t.replacen("DIMENSIONS NTAX=10;", "DIMENSIONS NTAX=9;", 1));
         assert!(e.contains("TAXA: more than 9 labels"), "{e}");
@@ -1113,15 +1312,6 @@ pub(crate) mod tests {
             e.contains("REFMAP: sequence 2 maps to unknown vertex 80"),
             "{e}"
         );
-        // (EM_TRACE holds the same `3 4e-1 / 8 6e-1` rows; aim at the PROPS matrix.)
-        let e = head_err(|t| {
-            t.replacen(
-                "[node proportion]\n\tMATRIX\n\t3 4e-1\n\t8 6e-1\n",
-                "[node proportion]\n\tMATRIX\n\t3 4e-1\n\t88 6e-1\n",
-                1,
-            )
-        });
-        assert!(e.contains("PROPS: unknown vertex 88"), "{e}");
         // Truncated EM_TRACE.
         let e = head_err(|t| t.replacen("\t0 -1e1 4\n", "\t0 -1e1 40\n", 1));
         assert!(e.contains("EM_TRACE"), "{e}");

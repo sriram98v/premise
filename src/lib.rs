@@ -31,6 +31,7 @@ use io::{
     write_alignments,
 };
 use refit::{analyze_report, RefitParams, TableRequest};
+use report::export::props_nexus;
 use report::nexus::Sink;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -118,7 +119,7 @@ fn em_args() -> [Arg; 5] {
             .value_parser(clap::value_parser!(EMProb)),
         arg!(--rho <RHO>"Penalty weight rho: > 0 turns the penalty on, 0 leaves it off")
             .value_parser(clap::value_parser!(EMProb)),
-        arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold: relative change in the penalized log-likelihood")
+        arg!(--em_threshold <EM_THRESHOLD>"EM convergence threshold: relative change in the penalized log-likelihood, checked once 50 iterations have run")
             .value_parser(clap::value_parser!(EMProb)),
         arg!(--init <INIT> "Initial conditionals: `split` (each read's best-scoring sequences share one count, ties split evenly) or `uniform` (1/|children| at every vertex)")
             .value_parser(["split", "uniform"]),
@@ -187,25 +188,15 @@ fn analyze_args(cmd: Command) -> Command {
             .required(true)
             .value_parser(clap::value_parser!(String))
             )
-        .arg(arg!(-o --out <OUT_FILE> "Output prefix: <OUT_FILE>.matches / .posteriors / .props / .nodes / .report")
+        .arg(arg!(-o --out <OUT_FILE> "Output prefix: <OUT_FILE>.matches / .props / .report")
             .required(true)
             .value_parser(clap::value_parser!(String))
             )
         .arg(gamma_arg())
         .arg(matches_arg("Write <OUT_FILE>.matches: the vertex each read is assigned to at --gamma"))
-        .arg(Arg::new("posteriors")
-            .long("posteriors")
-            .help("Write <OUT_FILE>.posteriors: the posterior of every classified read on each EM leaf")
-            .num_args(0)
-            .action(ArgAction::SetTrue))
         .arg(Arg::new("props")
             .long("props")
-            .help("Write <OUT_FILE>.props, the proportions as a legacy table")
-            .num_args(0)
-            .action(ArgAction::SetTrue))
-        .arg(Arg::new("nodes")
-            .long("nodes")
-            .help("Write <OUT_FILE>.nodes, the fitted vertices as a legacy table")
+            .help("Write <OUT_FILE>.props: the fitted taxonomy as NEXUS, with the proportion of every vertex that has any")
             .num_args(0)
             .action(ArgAction::SetTrue))
         .arg(Arg::new("write-report")
@@ -235,8 +226,8 @@ fn analyze_args(cmd: Command) -> Command {
 
 fn gamma_arg() -> Arg {
     arg!(--gamma <GAMMA>)
-        .help("Confidence level in [0.5, 1), used with --seq2taxid: a read descends to the deepest vertex whose subtree posterior exceeds GAMMA. Without a taxonomy every read goes to its most probable sequence and GAMMA has no effect")
-        .default_value("0.5")
+        .help("Confidence level in [0.5, 1) for .matches: a read descends to the deepest vertex whose subtree posterior exceeds GAMMA (without --seq2taxid, to a sequence only when its posterior exceeds GAMMA)")
+        .default_value("0.6")
         .value_parser(clap::value_parser!(EMProb))
 }
 
@@ -389,15 +380,14 @@ pub fn run() -> Result<()> {
         )
         .subcommand(
             query_args(Command::new("query")
-                .about("Classify paired-end reads: align, fit the EM and write the report; with --matches also the .matches table"))
+                .about("Classify paired-end reads: align, fit the EM and write the report and the .props tree; with --matches also the .matches table"))
                 .arg(gamma_arg())
                 .arg(matches_arg("Write <OUT>.matches: the vertex each read is assigned to at --gamma"))
                 .arg(Arg::new("no-report")
                     .long("no-report")
-                    .help("Write only <OUT>.matches (needs --matches)")
+                    .help("Skip the report: write only <OUT>.props (and <OUT>.matches with --matches)")
                     .num_args(0)
-                    .action(ArgAction::SetTrue)
-                    .requires("matches"))
+                    .action(ArgAction::SetTrue))
                 .arg(Arg::new("compress")
                     .long("compress")
                     .help("zstd-compress the report (writes <OUT>.report.zst)")
@@ -499,6 +489,7 @@ pub fn run() -> Result<()> {
                 format!("{}.report", outfile)
             };
             let matches_path = format!("{}.matches", outfile);
+            let props_path = format!("{}.props", outfile);
             let mut written: Vec<&str> = Vec::new();
             if !no_report {
                 written.push(&report_path);
@@ -506,6 +497,7 @@ pub fn run() -> Result<()> {
             if write_matches {
                 written.push(&matches_path);
             }
+            written.push(&props_path);
             let run = || -> Result<analyze::AnalyzeSummary> {
                 let mut report = if no_report {
                     None
@@ -534,6 +526,8 @@ pub fn run() -> Result<()> {
                 if let Some(mut m) = matches {
                     m.flush()?;
                 }
+                std::fs::write(&props_path, props_nexus(&summary.head))
+                    .with_context(|| format!("failed to write '{}'", props_path))?;
                 Ok(summary)
             };
             let summary = run()
@@ -554,9 +548,7 @@ pub fn run() -> Result<()> {
                 out: sub_m.get_one::<String>("out").expect("required").as_str(),
                 gamma: parse_gamma(sub_m)?,
                 matches: sub_m.get_flag("matches"),
-                posteriors: sub_m.get_flag("posteriors"),
                 props: sub_m.get_flag("props"),
-                nodes: sub_m.get_flag("nodes"),
                 report: sub_m.get_flag("write-report"),
                 compress: sub_m.get_flag("compress"),
             };

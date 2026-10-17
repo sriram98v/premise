@@ -1,5 +1,6 @@
 //! `query --seq2taxid`: every taxid becomes an internal vertex over its index sequences.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -85,26 +86,11 @@ fn query(
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
     let output = run(&argv);
     ok(&output);
-    export_tables(&out);
     (out, output)
 }
 
 fn read(prefix: &Path, ext: &str) -> String {
     fs::read_to_string(format!("{}.{}", prefix.display(), ext)).expect("output file")
-}
-
-/// Regenerate the legacy `.props` / `.nodes` tables from the report.
-fn export_tables(prefix: &Path) {
-    let p = prefix.display();
-    ok(&run(&[
-        "analyze",
-        "-r",
-        &format!("{p}.report"),
-        "-o",
-        &p.to_string(),
-        "--props",
-        "--nodes",
-    ]));
 }
 
 /// One block of the report, from `BEGIN <name>;` to its `END;`.
@@ -143,9 +129,150 @@ fn aligns_no_pos(prefix: &Path) -> String {
     out.join("\n")
 }
 
-fn ids(table: &str) -> Vec<String> {
-    table
+/// Split a NEXUS row into tokens, keeping `'quoted labels'` together (`''` inside quotes
+/// is a literal quote).
+fn nexus_tokens(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                cur.push('\'');
+            }
+            '\'' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The token rows of a block's MATRIX, up to its closing `;`.
+fn matrix_rows(block: &str) -> Vec<Vec<String>> {
+    block
         .lines()
+        .skip_while(|l| !l.contains("MATRIX"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .map(nexus_tokens)
+        .collect()
+}
+
+/// The TAXLABELS of a TAXA block, in order.
+fn taxlabels(block: &str) -> Vec<String> {
+    block
+        .lines()
+        .skip_while(|l| !l.contains("TAXLABELS"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .flat_map(nexus_tokens)
+        .collect()
+}
+
+/// The final tree of the report's NODES block (the `active` and `collapsed` vertices),
+/// keyed by label: (parent label or `-`, rank, contigs, proportion).
+fn nodes_table(prefix: &Path) -> HashMap<String, (String, String, usize, f64)> {
+    let labels = taxlabels(&block(prefix, "TAXA"));
+    let rows = matrix_rows(&block(prefix, "NODES"));
+    assert_eq!(labels.len(), rows.len());
+    let label_of: HashMap<&str, &str> = rows
+        .iter()
+        .zip(&labels)
+        .map(|(r, label)| (r[0].as_str(), label.as_str()))
+        .collect();
+    rows.iter()
+        .zip(&labels)
+        .filter(|(r, _)| r[3] == "active" || r[3] == "collapsed")
+        .map(|(r, label)| {
+            assert_eq!(r.len(), 8, "{r:?}");
+            let parent = if r[1] == "-" {
+                "-"
+            } else {
+                label_of[r[1].as_str()]
+            };
+            (
+                label.clone(),
+                (
+                    parent.to_string(),
+                    r[2].clone(),
+                    r[4].parse().unwrap(),
+                    r[6].parse().unwrap(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Every row of the NEXUS `.props` tree in pre-order: (label, parent label or `-`, rank,
+/// proportion). Checks that the first row is the root with all the mass and that every
+/// other row's parent is an earlier row.
+fn props_tree(prefix: &Path) -> Vec<(String, String, String, f64)> {
+    let text = read(prefix, "props");
+    assert!(
+        text.starts_with("#NEXUS\n[PREMISE proportions v1]\n"),
+        "{text}"
+    );
+    let start = text.find("BEGIN PROPORTIONS;").expect("PROPORTIONS block");
+    let rows: Vec<(String, String, String, f64)> = matrix_rows(&text[start..])
+        .into_iter()
+        .map(|r| {
+            assert_eq!(r.len(), 4, "{r:?}");
+            (
+                r[0].clone(),
+                r[1].clone(),
+                r[2].clone(),
+                r[3].parse().unwrap(),
+            )
+        })
+        .collect();
+    let (root, rest) = rows.split_first().expect("a root row");
+    assert_eq!((root.1.as_str(), root.2.as_str()), ("-", "root"), "{text}");
+    assert!((root.3 - 1.0).abs() < 1e-9, "{text}");
+    for (i, (label, parent, ..)) in rest.iter().enumerate() {
+        assert!(
+            rows[..=i].iter().any(|r| r.0 == *parent),
+            "{label}: parent {parent} not an earlier row\n{text}"
+        );
+    }
+    rows
+}
+
+/// The leaves of the `.props` tree (rows that are no other row's parent): the final EM
+/// leaves with mass, label → proportion.
+fn props(prefix: &Path) -> HashMap<String, f64> {
+    let rows = props_tree(prefix);
+    rows.iter()
+        .filter(|(label, ..)| !rows.iter().any(|r| r.1 == *label))
+        .map(|(label, _, _, p)| (label.clone(), *p))
+        .collect()
+}
+
+/// Two leaf maps agree on their labels and, up to float summation order, their values.
+fn assert_same_props(a: &HashMap<String, f64>, b: &HashMap<String, f64>) {
+    assert_eq!(a.len(), b.len(), "{a:?} vs {b:?}");
+    for (k, v) in a {
+        assert!((b[k] - v).abs() <= 1e-9, "{k}: {a:?} vs {b:?}");
+    }
+}
+
+/// The rows of a `.matches` table after its leading `#` EM summary: the column header,
+/// then one row per read.
+fn table_lines(table: &str) -> impl Iterator<Item = &str> {
+    table.lines().filter(|l| !l.starts_with('#'))
+}
+
+fn ids(table: &str) -> Vec<String> {
+    table_lines(table)
         .skip(1)
         .filter_map(|l| l.split('\t').nth(1))
         .filter(|r| *r != "unclassified")
@@ -153,10 +280,10 @@ fn ids(table: &str) -> Vec<String> {
         .collect()
 }
 
-/// `.matches` without its position columns (tie placements are nondeterministic).
+/// `.matches` without its position columns (tie placements are nondeterministic) or its
+/// EM summary (whose full-precision log-likelihood two runs need not share).
 fn no_pos(table: &str) -> String {
-    table
-        .lines()
+    table_lines(table)
         .map(|l| l.split('\t').take(3).collect::<Vec<_>>().join("\t"))
         .collect::<Vec<_>>()
         .join("\n")
@@ -168,7 +295,15 @@ fn no_flag_header_is_refid() {
     let index = build_index(tmp.path());
     let (plain, output) = query(tmp.path(), &index, "plain", None);
     assert!(block(&plain, "PREMISE").contains("LABEL_HEADER RefID;"));
-    assert!(read(&plain, "matches").starts_with("ReadID\tRefID\tPosterior\t"));
+    // One `#` EM summary line, then the header.
+    let matches = read(&plain, "matches");
+    let (summary, rest) = matches.split_once('\n').unwrap();
+    assert!(summary.starts_with("# PREMISE "), "{summary}");
+    assert!(
+        summary.contains(" EM: init=split iter=5 ") && summary.ends_with("; gamma=0.6"),
+        "{summary}"
+    );
+    assert!(rest.starts_with("ReadID\tRefID\tPosterior\t"), "{matches}");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.contains("Taxa:"), "{stdout}");
 }
@@ -186,22 +321,33 @@ fn distinct_taxids_match_no_map() {
     // the taxid vertices are unary and change nothing but the table header
     let relabel = |t: String| t.replace("\tRefID\t", "\tTaxID\t");
     assert_eq!(aligns_no_pos(&plain), aligns_no_pos(&taxed));
-    assert_eq!(read(&plain, "props"), read(&taxed, "props"));
+    assert_same_props(&props(&plain), &props(&taxed));
     assert_eq!(
         no_pos(&relabel(read(&plain, "matches"))),
         no_pos(&read(&taxed, "matches"))
     );
-    let nodes = read(&taxed, "nodes");
-    assert!(
-        nodes.lines().any(|l| l.starts_with("1\troot\t-\t0\t")),
-        "{nodes}"
+    let nodes = nodes_table(&taxed);
+    let n1 = &nodes["1"];
+    assert_eq!(
+        (n1.0.as_str(), n1.1.as_str(), n1.2),
+        ("root", "-", 0),
+        "{nodes:?}"
     );
-    assert!(
-        nodes
-            .lines()
-            .any(|l| l.starts_with("ref_A\t1\tsequence\t1\t")),
-        "{nodes}"
+    let a = &nodes["ref_A"];
+    assert_eq!(
+        (a.0.as_str(), a.1.as_str(), a.2),
+        ("1", "sequence", 1),
+        "{nodes:?}"
     );
+    // .props holds the taxid vertices too, each over its sequence with the same mass
+    let tree = props_tree(&taxed);
+    for (seq, taxid) in [("ref_A", "1"), ("ref_B", "2")] {
+        let row = tree.iter().find(|r| r.0 == seq).expect("sequence row");
+        let up = tree.iter().find(|r| r.0 == taxid).expect("taxid row");
+        assert_eq!(row.1, taxid, "{tree:?}");
+        assert_eq!(up.1, "root", "{tree:?}");
+        assert!((row.3 - up.3).abs() < 1e-12, "unary edge: {tree:?}");
+    }
     assert!(block(&taxed, "PREMISE").contains("LABEL_HEADER TaxID;"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -223,29 +369,34 @@ fn shared_taxid_is_an_internal_vertex_over_its_sequences() {
     );
 
     // the leaves are the sequences; the taxid is the vertex above them
-    let props = read(&taxed, "props");
+    let props = props(&taxed);
     let mut total = 0.0;
-    for row in props.lines() {
-        let (name, prop) = row.split_once('\t').unwrap();
-        assert!(name == "ref_A" || name == "ref_B", "{props}");
-        total += prop.parse::<f64>().unwrap();
+    for (name, prop) in &props {
+        assert!(name == "ref_A" || name == "ref_B", "{props:?}");
+        total += prop;
     }
-    assert_eq!(props.lines().count(), 2, "{props}");
+    assert_eq!(props.len(), 2, "{props:?}");
     assert!((total - 1.0).abs() < 1e-9);
-    let nodes = read(&taxed, "nodes");
+    let tree = props_tree(&taxed);
     assert!(
-        nodes.lines().any(|l| l.starts_with("9\troot\t-\t0\t")),
-        "{nodes}"
+        tree.iter()
+            .any(|r| r.0 == "9" && r.1 == "root" && (r.3 - 1.0).abs() < 1e-9),
+        "{tree:?}"
     );
-    assert!(
-        nodes
-            .lines()
-            .any(|l| l.starts_with("ref_B\t9\tsequence\t1\t")),
-        "{nodes}"
+    let nodes = nodes_table(&taxed);
+    let nine = &nodes["9"];
+    assert_eq!(
+        (nine.0.as_str(), nine.1.as_str(), nine.2),
+        ("root", "-", 0),
+        "{nodes:?}"
     );
-    let nine = nodes.lines().find(|l| l.starts_with("9\t")).unwrap();
-    let pi: f64 = nine.split('\t').nth(5).unwrap().parse().unwrap();
-    assert!((pi - 1.0).abs() < 1e-9, "{nine}");
+    let b = &nodes["ref_B"];
+    assert_eq!(
+        (b.0.as_str(), b.1.as_str(), b.2),
+        ("9", "sequence", 1),
+        "{nodes:?}"
+    );
+    assert!((nine.3 - 1.0).abs() < 1e-9, "{nine:?}");
 
     for id in ids(&read(&taxed, "matches")) {
         assert!(id == "9" || id == "ref_A" || id == "ref_B", "{id}");
@@ -292,21 +443,24 @@ fn partial_map_keeps_unmapped_sequence_as_own_column_and_warns() {
         stderr.contains("1 of 2 index sequences have no taxid"),
         "{stderr}"
     );
-    let props = read(&taxed, "props");
-    for row in props.lines() {
-        let name = row.split('\t').next().unwrap();
-        assert!(name == "ref_A" || name == "ref_B", "{props}");
+    let props = props(&taxed);
+    for name in props.keys() {
+        assert!(name == "ref_A" || name == "ref_B", "{props:?}");
     }
-    let nodes = read(&taxed, "nodes");
-    assert!(
-        nodes.lines().any(|l| l.starts_with("ref_A\t9\tsequence\t")),
-        "{nodes}"
+    let nodes = nodes_table(&taxed);
+    let a = &nodes["ref_A"];
+    assert_eq!((a.0.as_str(), a.1.as_str()), ("9", "sequence"), "{nodes:?}");
+    let b = &nodes["ref_B"];
+    assert_eq!(
+        (b.0.as_str(), b.1.as_str()),
+        ("root", "sequence"),
+        "{nodes:?}"
     );
+    // .props places the unmapped sequence directly under the root too
+    let tree = props_tree(&taxed);
     assert!(
-        nodes
-            .lines()
-            .any(|l| l.starts_with("ref_B\troot\tsequence\t")),
-        "{nodes}"
+        tree.iter().any(|r| r.0 == "ref_B" && r.1 == "root"),
+        "{tree:?}"
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(

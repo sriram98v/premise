@@ -3,6 +3,7 @@
 //! paths.
 
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -101,23 +102,92 @@ fn with_ext(prefix: &Path, ext: &str) -> PathBuf {
     PathBuf::from(format!("{}.{ext}", prefix.display()))
 }
 
+/// The rows of a `.matches` table after its leading `#` EM summary: the column header,
+/// then one row per read.
+fn table_lines(table: &str) -> impl Iterator<Item = &str> {
+    table.lines().filter(|l| !l.starts_with('#'))
+}
+
+/// The leading `# …` EM summary line of a `.matches` table, checked for its shape and
+/// for the gamma the table was cut at.
+fn matches_summary(table: &str, gamma: &str) -> String {
+    let first = table.lines().next().expect("a summary line");
+    assert!(first.starts_with("# PREMISE "), "{first}");
+    assert!(first.contains(" EM: init="), "{first}");
+    assert!(first.ends_with(&format!("; gamma={gamma}")), "{first}");
+    assert!(
+        !table.lines().skip(1).any(|l| l.starts_with('#')),
+        "a single summary line\n{table}"
+    );
+    first.to_string()
+}
+
+/// The `[…]` EM summary on the second comment line of a NEXUS `.props`, without brackets.
+fn props_summary(props: &str) -> String {
+    let line = props.lines().nth(2).expect("a summary line");
+    assert!(
+        props.starts_with("#NEXUS\n[PREMISE proportions v1]\n["),
+        "{props}"
+    );
+    let inner = line
+        .strip_prefix('[')
+        .and_then(|l| l.strip_suffix(']'))
+        .unwrap_or_else(|| panic!("{line}"));
+    assert!(inner.contains("EM: init="), "{line}");
+    inner.to_string()
+}
+
+/// The `.matches` summary of a table cut at `gamma` and the `.props` summary of the same
+/// fit: the same text but for the `; gamma=…` that only the table has.
+fn assert_same_summary(matches: &str, props: &str, gamma: &str) {
+    let m = matches_summary(matches, gamma);
+    let want = m
+        .strip_prefix("# ")
+        .and_then(|s| s.strip_suffix(&format!("; gamma={gamma}")))
+        .unwrap();
+    assert_eq!(props_summary(props), want);
+}
+
+/// `key=value` of an EM summary or a PARAMS line.
+fn kv(text: &str, key: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || c == ';' || c == ',')
+        .find_map(|t| t.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key}= in {text}"))
+        .to_string()
+}
+
+/// The EM settings of a summary are the report's PARAMS.
+fn assert_summary_params(summary: &str, report: &str) {
+    let params = premise_line(report, "PARAMS");
+    for key in ["init", "iter", "rho", "omega", "em_threshold", "penalty"] {
+        assert_eq!(kv(summary, key), kv(&params, key), "{summary}\nvs {params}");
+    }
+}
+
 /// `.matches` without its position columns: tied placements land on any of the
-/// equally good positions, so two runs only agree up to them.
+/// equally good positions, so two runs only agree up to them. Without the EM summary
+/// too: its full-precision log-likelihood is a float sum whose order two runs need not
+/// share.
 fn no_pos(table: &str) -> String {
-    table
-        .lines()
+    table_lines(table)
         .map(|l| l.split('\t').take(3).collect::<Vec<_>>().join("\t"))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-/// Split a NEXUS row into tokens, keeping `'quoted labels'` together.
+/// Split a NEXUS row into tokens, keeping `'quoted labels'` together (`''` inside quotes
+/// is a literal quote).
 fn nexus_tokens(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quoted = false;
-    for ch in line.chars() {
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
+            '\'' if quoted && chars.peek() == Some(&'\'') => {
+                chars.next();
+                cur.push('\'');
+            }
             '\'' => quoted = !quoted,
             c if c.is_whitespace() && !quoted => {
                 if !cur.is_empty() {
@@ -140,6 +210,287 @@ fn block(report: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("no {name} block"));
     let end = report[start..].find("END;").expect("block end") + start;
     report[start..end].to_string()
+}
+
+/// The MATRIX lines of a block (trimmed), up to its closing `;`.
+fn matrix_lines(block: &str) -> Vec<String> {
+    block
+        .lines()
+        .skip_while(|l| !l.contains("MATRIX"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// A delta-coded seqid line (first absolute, then differences) as absolute seqids.
+fn seqids(line: &str) -> Vec<usize> {
+    line.split_whitespace()
+        .scan(0usize, |acc, t| {
+            *acc += t.parse::<usize>().unwrap();
+            Some(*acc)
+        })
+        .collect()
+}
+
+/// Every read of a report's ALIGNMENT_LIKELIHOODS in order: (read id, [(seqid,
+/// log-likelihood)] in row order). Checks the announced read count on the way.
+fn alignment_rows(report: &str) -> Vec<(String, Vec<(usize, f64)>)> {
+    let blk = block(report, "ALIGNMENT_LIKELIHOODS");
+    let lines = matrix_lines(&blk);
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let hdr = nexus_tokens(&lines[i]);
+        i += 1;
+        if hdr[1] == "0" {
+            out.push((hdr[0].clone(), Vec::new()));
+            continue;
+        }
+        let n: usize = hdr[1].parse().unwrap();
+        let k: usize = hdr[2].parse().unwrap();
+        let seqs = seqids(&lines[i]);
+        let lls: Vec<f64> = lines[i + 1]
+            .split_whitespace()
+            .map(|t| t.parse().unwrap())
+            .collect();
+        let idx: Vec<usize> = if k > 1 {
+            lines[i + 2]
+                .split_whitespace()
+                .map(|t| t.parse().unwrap())
+                .collect()
+        } else {
+            vec![0; n]
+        };
+        assert_eq!((seqs.len(), lls.len(), idx.len()), (n, k, n), "{hdr:?}");
+        out.push((
+            hdr[0].clone(),
+            seqs.into_iter()
+                .zip(idx)
+                .map(|(s, j)| (s, lls[j]))
+                .collect(),
+        ));
+        // seqids, log-likelihoods, indices when k > 1, positions, insert offsets
+        i += if k > 1 { 5 } else { 4 };
+    }
+    assert!(
+        blk.contains(&format!("DIMENSIONS NREADS={};", out.len())),
+        "{blk}"
+    );
+    out
+}
+
+/// Every read of a report's ALIGNMENT_LIKELIHOODS in order: (read id, aligned seqids).
+fn alignment_seqids(report: &str) -> Vec<(String, Vec<usize>)> {
+    alignment_rows(report)
+        .into_iter()
+        .map(|(id, rows)| (id, rows.into_iter().map(|r| r.0).collect()))
+        .collect()
+}
+
+/// Every read's posterior on each of its alignment rows, recomputed from what the report
+/// stores (it keeps no posteriors): `π̃_s · exp(ll_s − max ll) / Σ`, where `π̃_s` is the
+/// NODES proportion of the final EM leaf owning the sequence's tip shared among its
+/// contigs (0 once pruned). All zeros when none of the read's sequences has mass.
+fn posteriors(report: &str) -> Vec<(String, Vec<(usize, f64)>)> {
+    let tree = Tree::of(report);
+    alignment_rows(report)
+        .into_iter()
+        .map(|(id, rows)| {
+            let m = rows.iter().map(|r| r.1).fold(f64::NEG_INFINITY, f64::max);
+            let w: Vec<f64> = rows
+                .iter()
+                .map(|&(s, ll)| tree.pi_tilde(s) * (ll - m).exp())
+                .collect();
+            let d: f64 = w.iter().sum();
+            let post = rows
+                .iter()
+                .zip(&w)
+                .map(|(r, w)| (r.0, if d > 0.0 { w / d } else { 0.0 }))
+                .collect();
+            (id, post)
+        })
+        .collect()
+}
+
+/// The tree of a report: TAXLABELS, NODES and REFMAP joined up.
+struct Tree {
+    /// label → NODES id
+    id: HashMap<String, String>,
+    /// NODES id → (parent id or `-`, status)
+    node: HashMap<String, (String, String)>,
+    /// NODES id → (contigs, proportion)
+    fit: HashMap<String, (usize, f64)>,
+    /// seqid → NODES id of the sequence's own vertex
+    seq: HashMap<usize, String>,
+}
+
+impl Tree {
+    fn of(report: &str) -> Tree {
+        let labels: Vec<String> = block(report, "TAXA")
+            .lines()
+            .skip_while(|l| !l.contains("TAXLABELS"))
+            .skip(1)
+            .take_while(|l| l.trim() != ";")
+            .flat_map(nexus_tokens)
+            .collect();
+        let rows: Vec<Vec<String>> = matrix_lines(&block(report, "NODES"))
+            .iter()
+            .map(|l| nexus_tokens(l))
+            .collect();
+        assert_eq!(labels.len(), rows.len());
+        let seq = matrix_lines(&block(report, "REFMAP"))
+            .iter()
+            .map(|l| {
+                let (s, n) = l.split_once(' ').unwrap();
+                (s.parse().unwrap(), n.to_string())
+            })
+            .collect();
+        Tree {
+            id: labels
+                .into_iter()
+                .zip(&rows)
+                .map(|(l, r)| (l, r[0].clone()))
+                .collect(),
+            node: rows
+                .iter()
+                .map(|r| (r[0].clone(), (r[1].clone(), r[3].clone())))
+                .collect(),
+            fit: rows
+                .iter()
+                .map(|r| (r[0].clone(), (r[4].parse().unwrap(), r[6].parse().unwrap())))
+                .collect(),
+            seq,
+        }
+    }
+
+    /// The final EM leaf owning vertex `v`: `v` itself unless it was pooled (then its
+    /// parent's owner, i.e. the nearest collapsed ancestor) or pruned (`None`).
+    fn em_leaf<'a>(&'a self, v: &'a str) -> Option<&'a str> {
+        let (parent, status) = &self.node[v];
+        match status.as_str() {
+            "pruned" => None,
+            "pooled" => self.em_leaf(parent),
+            _ => Some(v),
+        }
+    }
+
+    /// `π̃_s`: the proportion of the EM leaf owning sequence `s`, over its contigs.
+    fn pi_tilde(&self, s: usize) -> f64 {
+        match self.em_leaf(&self.seq[&s]).map(|l| self.fit[l]) {
+            Some((n, p)) if n > 0 => p / n as f64,
+            _ => 0.0,
+        }
+    }
+
+    /// Whether vertex `anc` is `v` or one of its ancestors.
+    fn covers(&self, anc: &str, v: &str) -> bool {
+        let mut cur = v;
+        loop {
+            if cur == anc {
+                return true;
+            }
+            match self.node.get(cur) {
+                Some((p, _)) if p != "-" => cur = p,
+                _ => return false,
+            }
+        }
+    }
+
+    /// A read's posterior on the subtree under vertex `v` (a NODES id).
+    fn mass(&self, v: &str, posts: &[(usize, f64)]) -> f64 {
+        posts
+            .iter()
+            .filter(|(s, _)| self.covers(v, &self.seq[s]))
+            .map(|(_, p)| p)
+            .sum()
+    }
+
+    /// The final-tree (`active` / `collapsed`) children of vertex `v`.
+    fn final_children(&self, v: &str) -> Vec<&str> {
+        self.node
+            .iter()
+            .filter(|(_, (p, st))| p == v && (st == "active" || st == "collapsed"))
+            .map(|(id, _)| id.as_str())
+            .collect()
+    }
+
+    fn root(&self) -> &str {
+        self.node
+            .iter()
+            .find(|(_, (p, _))| p == "-")
+            .map(|(id, _)| id.as_str())
+            .expect("a root")
+    }
+}
+
+/// The report holds no PROPS or READ_POSTERIORS (the EM regenerates both from NODES and
+/// ALIGNMENT_LIKELIHOODS) and its blocks come in their fixed order.
+fn check_blocks(report: &str) {
+    assert!(!report.contains("BEGIN PROPS;"), "{report}");
+    assert!(!report.contains("READ_POSTERIORS"), "{report}");
+    let order: Vec<&str> = report
+        .lines()
+        .filter_map(|l| l.strip_prefix("BEGIN "))
+        .map(|l| l.trim_end_matches(';'))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "PREMISE",
+            "EM_TRACE",
+            "TAXA",
+            "TREES",
+            "NODES",
+            "REFMAP",
+            "ALIGNMENT_LIKELIHOODS",
+            "PROFILE"
+        ]
+    );
+}
+
+/// Every row of `matches` is the gamma descent over the posteriors recomputed from the
+/// report ([`posteriors`]): the assigned vertex holds the printed posterior, which is
+/// above gamma, and none of its final children is; an unclassified read has no child of
+/// the root above gamma. Each read's posteriors sum to one, or to zero when its
+/// sequences were all pruned.
+fn check_posteriors(report: &str, matches: &str, gamma: f64) {
+    check_blocks(report);
+    let posts = posteriors(report);
+    for (id, rows) in &posts {
+        let sum: f64 = rows.iter().map(|r| r.1).sum();
+        assert!((sum - 1.0).abs() < 1e-9 || sum == 0.0, "{id}: {rows:?}");
+    }
+    let tree = Tree::of(report);
+    let by_read: HashMap<&str, &[(usize, f64)]> = posts
+        .iter()
+        .map(|(id, rows)| (id.as_str(), rows.as_slice()))
+        .collect();
+    let mut n = 0;
+    for line in table_lines(matches).skip(1) {
+        n += 1;
+        let cols: Vec<&str> = line.split('\t').collect();
+        let rows = by_read[cols[0]];
+        let below = |v: &str| -> Vec<f64> {
+            tree.final_children(v)
+                .into_iter()
+                .map(|c| tree.mass(c, rows))
+                .collect()
+        };
+        if cols[1] == "unclassified" {
+            let kids = below(tree.root());
+            assert!(kids.iter().all(|m| *m <= gamma), "{line}: {kids:?}");
+            continue;
+        }
+        let v = &tree.id[cols[1]];
+        let mass = tree.mass(v, rows);
+        let printed: f64 = cols[2].parse().unwrap();
+        assert!((mass - printed).abs() < 1e-4, "{line}: {mass}");
+        assert!(mass > gamma, "{line}: {mass}");
+        let kids = below(v);
+        assert!(kids.iter().all(|m| *m <= gamma), "{line}: {kids:?}");
+    }
+    assert_eq!(n, posts.len(), "one .matches row per read");
 }
 
 const GAMMAS: [&str; 4] = ["0.5", "0.6", "0.9", "0.99"];
@@ -189,7 +540,21 @@ fn analyze_reproduces_query_for_every_gamma() {
             ]);
             ok(&run_owned(&q));
             let want = read(&with_ext(&direct, "matches"));
-            assert!(want.lines().count() == 6, "header + 5 reads: {want}");
+            assert!(
+                want.lines().count() == 7,
+                "summary + header + 5 reads: {want}"
+            );
+            // The summary is the run's EM, cut at this gamma, as in its .props.
+            let direct_report = read(&with_ext(&direct, "report"));
+            let summary = matches_summary(&want, g);
+            assert_summary_params(&summary, &direct_report);
+            assert_eq!(kv(&summary, "iter"), "20", "{summary}");
+            let rho = cfg.rho.map_or("0e0".to_string(), |r| format!("{r}e0"));
+            assert_eq!(kv(&summary, "rho"), rho, "{summary}");
+            assert!(!summary.contains("refit of"), "{summary}");
+            assert_same_summary(&want, &read(&with_ext(&direct, "props")), g);
+            // Every row is the gamma descent over the posteriors the report implies.
+            check_posteriors(&direct_report, &want, g.parse().unwrap());
 
             // From the run's own report: byte-identical.
             let own = tmp.path().join(format!("{tag}-own{g}"));
@@ -234,28 +599,82 @@ fn query_flags_choose_the_outputs() {
         tree: false,
         rho: None,
     };
-    // --no-report with --matches: only the table.
+    // By default: the report and the proportions.
+    let dflt = tmp.path().join("dflt");
+    let out = run_owned(&query_args(&index, tmp.path(), &dflt, &cfg));
+    ok(&out);
+    assert!(with_ext(&dflt, "report").exists() && with_ext(&dflt, "props").exists());
+    assert!(!with_ext(&dflt, "matches").exists());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dflt.report") && stdout.contains("dflt.props"),
+        "{stdout}"
+    );
+    // --no-report with --matches: the table and the proportions, no report.
     let only = tmp.path().join("only");
     let mut q = query_args(&index, tmp.path(), &only, &cfg);
     q.extend(["--matches", "--gamma", "0.6", "--no-report"].map(str::to_string));
     let out = run_owned(&q);
     ok(&out);
-    assert!(with_ext(&only, "matches").exists());
+    assert!(with_ext(&only, "matches").exists() && with_ext(&only, "props").exists());
     assert!(!with_ext(&only, "report").exists());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("only.matches") && !stdout.contains("report"),
+        stdout.contains("only.matches")
+            && stdout.contains("only.props")
+            && !stdout.contains("report"),
         "{stdout}"
     );
-    // --no-report without --matches is a usage error, before any work is done.
-    let bad = tmp.path().join("bad");
-    let mut q = query_args(&index, tmp.path(), &bad, &cfg);
+    // --no-report alone is fine too: only the proportions.
+    let props_only = tmp.path().join("po");
+    let mut q = query_args(&index, tmp.path(), &props_only, &cfg);
     q.push("--no-report".to_string());
     let out = run_owned(&q);
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--matches"), "{stderr}");
-    assert!(!with_ext(&bad, "matches").exists() && !with_ext(&bad, "report").exists());
+    ok(&out);
+    assert!(with_ext(&props_only, "props").exists());
+    assert!(
+        !with_ext(&props_only, "matches").exists() && !with_ext(&props_only, "report").exists()
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("po.props") && !stdout.contains("report"),
+        "{stdout}"
+    );
+    // The proportions do not depend on which other outputs were asked for.
+    let leaves = props_map(&read(&with_ext(&props_only, "props")));
+    assert_eq!(
+        leaves.iter().map(|l| l.0.as_str()).collect::<Vec<_>>(),
+        ["ref_A", "ref_B"]
+    );
+    for other in [&dflt, &only] {
+        let theirs = props_map(&read(&with_ext(other, "props")));
+        assert_eq!(theirs.len(), leaves.len());
+        for ((la, a), (lb, b)) in leaves.iter().zip(&theirs) {
+            assert_eq!(la, lb);
+            assert!((a - b).abs() <= 1e-9, "{la}: {a} vs {b}");
+        }
+    }
+    // --matches without --gamma uses gamma 0.6.
+    let dg = tmp.path().join("dg");
+    let mut q = query_args(&index, tmp.path(), &dg, &cfg);
+    q.push("--matches".to_string());
+    ok(&run_owned(&q));
+    let at6 = tmp.path().join("at6");
+    ok(&run(&[
+        "analyze",
+        "-r",
+        with_ext(&dg, "report").to_str().unwrap(),
+        "--matches",
+        "--gamma",
+        "0.6",
+        "-o",
+        at6.to_str().unwrap(),
+    ]));
+    assert_eq!(
+        read(&with_ext(&dg, "matches")),
+        read(&with_ext(&at6, "matches"))
+    );
+    let bad = tmp.path().join("bad");
     // --gamma out of [0.5, 1).
     for g in ["0.49", "1", "1.5"] {
         let mut q = query_args(&index, tmp.path(), &bad, &cfg);
@@ -310,7 +729,6 @@ fn compressed_report_gives_the_same_matches_and_tables() {
         "-o",
         from_zst.to_str().unwrap(),
         "--props",
-        "--nodes",
     ]));
     // Head-only export needs no --matches.
     ok(&run(&[
@@ -320,30 +738,54 @@ fn compressed_report_gives_the_same_matches_and_tables() {
         "-o",
         tmp.path().join("p").to_str().unwrap(),
         "--props",
-        "--nodes",
     ]));
     assert!(!tmp.path().join("p.matches").exists());
     assert_eq!(
         no_pos(&read(&with_ext(&from_zst, "matches"))),
         no_pos(&read(&with_ext(&plain, "matches")))
     );
+    // `analyze --props` reproduces each query's own .props byte for byte; the two runs
+    // agree up to float summation order.
     assert_eq!(
         read(&tmp.path().join("z.props")),
-        read(&tmp.path().join("p.props"))
+        read(&tmp.path().join("zst.props"))
     );
     assert_eq!(
-        read(&tmp.path().join("z.nodes")),
-        read(&tmp.path().join("p.nodes"))
+        read(&tmp.path().join("p.props")),
+        read(&tmp.path().join("plain.props"))
     );
-    let nodes = read(&tmp.path().join("p.nodes"));
-    assert!(nodes.starts_with("TaxID\tParent\tRank\tContigs\tCount\tProportion\tConditional\n"));
+    assert_same_props(
+        &read(&tmp.path().join("z.props")),
+        &read(&tmp.path().join("p.props")),
+    );
+    // Both references collapsed into species 11, which pools them.
+    let nodes = final_nodes(&read(&tmp.path().join("plain.report")));
     assert!(
-        nodes.lines().any(|l| l.starts_with("11\t10\tspecies\t2\t")),
-        "{nodes}"
+        nodes.contains(&(
+            "11".to_string(),
+            "10".to_string(),
+            "species".to_string(),
+            "2".to_string()
+        )),
+        "{nodes:?}"
     );
     let props = read(&tmp.path().join("p.props"));
-    assert_eq!(props.lines().count(), 1, "{props}");
-    assert!(props.starts_with("11\t1.0000000000e0"), "{props}");
+    let rows: Vec<(String, String)> = props_rows(&props).into_iter().map(|r| (r.0, r.1)).collect();
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+    assert_eq!(
+        rows,
+        vec![
+            pair("root", "-"),
+            pair("1", "root"),
+            pair("10", "1"),
+            pair("11", "10")
+        ],
+        "{props}"
+    );
+    let leaves = props_map(&props);
+    assert_eq!(leaves.len(), 1, "{props}");
+    assert_eq!(leaves[0].0, "11", "{props}");
+    assert!((leaves[0].1 - 1.0).abs() < 1e-12, "{props}");
 }
 
 #[test]
@@ -364,9 +806,9 @@ fn report_head_records_the_run_without_paths() {
     ok(&run_owned(&q));
     let report = read(&tmp.path().join("meta.report"));
     for needle in [
-        "#NEXUS\n[PREMISE report v3]\n",
+        "#NEXUS\n[PREMISE report v4]\n",
         "BEGIN PREMISE;",
-        "\tVERSION 3;",
+        "\tVERSION 4;",
         "\tLABEL_HEADER TaxID;",
         "\tINDEX ref.fmidx;",
         "\tINDEX_SHA256 ",
@@ -385,13 +827,37 @@ fn report_head_records_the_run_without_paths() {
         "TREE taxonomy = [&R] ",
         "BEGIN NODES;",
         "BEGIN REFMAP;",
-        "BEGIN PROPS;",
         "BEGIN ALIGNMENT_LIKELIHOODS;",
         "BEGIN PROFILE;",
         "peak_rss_kb=",
     ] {
         assert!(report.contains(needle), "missing {needle:?} in\n{report}");
     }
+    // No PROPS or READ_POSTERIORS (the final leaves' proportions are NODES', the
+    // posteriors follow from them and ALIGNMENT_LIKELIHOODS), the blocks in order; the
+    // recomputed posteriors explain .matches.
+    check_blocks(&report);
+    let matches = read(&tmp.path().join("meta.matches"));
+    check_posteriors(&report, &matches, 0.6);
+    // The .matches summary is this run's EM: the PARAMS, then the EM line's iterations
+    // and final log-likelihood.
+    let summary = matches_summary(&matches, "0.6");
+    assert_summary_params(&summary, &report);
+    assert!(
+        summary.contains("rho=3.5e0") && summary.contains("penalty=1"),
+        "{summary}"
+    );
+    let em = premise_line(&report, "EM");
+    assert!(
+        summary.contains(&format!("; {} iterations, ", kv(&em, "iterations"))),
+        "{summary} vs {em}"
+    );
+    let final_ll = kv(&em, "final_ll");
+    assert!(
+        summary.contains(&format!("final penalized log-likelihood {final_ll}")),
+        "{summary} vs {em}"
+    );
+    assert_same_summary(&matches, &read(&tmp.path().join("meta.props")), "0.6");
     // The tree is written once per field: TREES is topology over TAXA indices, the
     // statuses live in NODES.
     assert!(!report.contains("TRANSLATE"), "{report}");
@@ -596,7 +1062,8 @@ fn analyze_needs_an_output_and_a_valid_gamma() {
     assert!(String::from_utf8_lossy(&no_out.stderr).contains("--out"));
     let no_output = run(&["analyze", "-r", r, "-o", o]);
     assert!(!no_output.status.success());
-    assert!(String::from_utf8_lossy(&no_output.stderr).contains("nothing to do"));
+    assert!(String::from_utf8_lossy(&no_output.stderr)
+        .contains("analyze: nothing to do; give --matches, --props or --write-report"));
     let bad_gamma = run(&["analyze", "-r", r, "--matches", "--gamma", "1", "-o", o]);
     assert!(!bad_gamma.status.success());
     assert!(String::from_utf8_lossy(&bad_gamma.stderr).contains("--gamma must be in [0.5, 1)"));
@@ -650,13 +1117,95 @@ fn analyze_needs_an_output_and_a_valid_gamma() {
     assert!(!run(&["gen_matches", "-r", r]).status.success());
 }
 
-/// `label → value` of a `.props` table.
-fn props_map(table: &str) -> Vec<(String, f64)> {
-    table
-        .lines()
+/// The PROPORTIONS rows of a NEXUS `.props` in pre-order: (label, parent label or `-`,
+/// rank, proportion). Checks that the first row is the root with all the mass and that
+/// every other row's parent is an earlier row.
+fn props_rows(text: &str) -> Vec<(String, String, String, f64)> {
+    assert!(
+        text.starts_with("#NEXUS\n[PREMISE proportions v1]\n"),
+        "{text}"
+    );
+    let rows: Vec<(String, String, String, f64)> = matrix_lines(&block(text, "PROPORTIONS"))
+        .iter()
         .map(|l| {
-            let (label, v) = l.split_once('\t').unwrap();
-            (label.to_string(), v.parse::<f64>().unwrap())
+            let c = nexus_tokens(l);
+            assert_eq!(c.len(), 4, "{l}");
+            (
+                c[0].clone(),
+                c[1].clone(),
+                c[2].clone(),
+                c[3].parse().unwrap(),
+            )
+        })
+        .collect();
+    let (root, rest) = rows.split_first().expect("a root row");
+    assert_eq!((root.1.as_str(), root.2.as_str()), ("-", "root"), "{text}");
+    assert!((root.3 - 1.0).abs() < 1e-9, "{text}");
+    for (i, (label, parent, ..)) in rest.iter().enumerate() {
+        assert!(
+            rows[..=i].iter().any(|r| r.0 == *parent),
+            "{label}: parent {parent} not an earlier row\n{text}"
+        );
+    }
+    rows
+}
+
+/// `label → value` of the leaves of a `.props` tree (rows that are no other row's
+/// parent), in row order: the final EM leaves with mass.
+fn props_map(text: &str) -> Vec<(String, f64)> {
+    let rows = props_rows(text);
+    rows.iter()
+        .filter(|(label, ..)| !rows.iter().any(|r| r.1 == *label))
+        .map(|(label, _, _, p)| (label.clone(), *p))
+        .collect()
+}
+
+/// Two `.props` trees agree row by row on labels, parents and ranks, and on the
+/// proportions up to float summation order.
+fn assert_same_props(a: &str, b: &str) {
+    let (ra, rb) = (props_rows(a), props_rows(b));
+    assert_eq!(ra.len(), rb.len(), "{a}\nvs\n{b}");
+    for (x, y) in ra.iter().zip(&rb) {
+        assert_eq!((&x.0, &x.1, &x.2), (&y.0, &y.1, &y.2));
+        assert!(
+            (x.3 - y.3).abs() <= 1e-9 * x.3.abs().max(1e-300),
+            "{}: {} vs {}",
+            x.0,
+            x.3,
+            y.3
+        );
+    }
+}
+
+/// The final-tree rows of a report's NODES block (`active` / `collapsed`), as (label,
+/// parent label or `-`, rank, contigs).
+fn final_nodes(report: &str) -> Vec<(String, String, String, String)> {
+    let labels: Vec<String> = block(report, "TAXA")
+        .lines()
+        .skip_while(|l| !l.contains("TAXLABELS"))
+        .skip(1)
+        .take_while(|l| l.trim() != ";")
+        .flat_map(nexus_tokens)
+        .collect();
+    let rows: Vec<Vec<String>> = matrix_lines(&block(report, "NODES"))
+        .iter()
+        .map(|l| nexus_tokens(l))
+        .collect();
+    let label_of: HashMap<&str, &str> = rows
+        .iter()
+        .zip(&labels)
+        .map(|(r, l)| (r[0].as_str(), l.as_str()))
+        .collect();
+    rows.iter()
+        .zip(&labels)
+        .filter(|(r, _)| r[3] == "active" || r[3] == "collapsed")
+        .map(|(r, l)| {
+            let parent = if r[1] == "-" {
+                "-"
+            } else {
+                label_of[r[1].as_str()]
+            };
+            (l.clone(), parent.to_string(), r[2].clone(), r[4].clone())
         })
         .collect()
 }
@@ -669,18 +1218,6 @@ fn premise_line(report: &str, cmd: &str) -> String {
         .unwrap_or_else(|| panic!("no {cmd} line"))
         .trim_end_matches(';')
         .to_string()
-}
-
-/// The parsed `.posteriors` rows of a read: `(label, posterior)`, `None` for `-`.
-fn posterior_rows(table: &str, read: &str) -> Vec<(String, Option<f64>)> {
-    table
-        .lines()
-        .skip(1)
-        .filter_map(|l| {
-            let cols: Vec<&str> = l.split('\t').collect();
-            (cols[0] == read).then(|| (cols[1].to_string(), cols[2].parse::<f64>().ok()))
-        })
-        .collect()
 }
 
 #[test]
@@ -706,46 +1243,52 @@ fn analyze_writes_every_table_from_the_stored_fit() {
         "--gamma",
         "0.6",
         "--props",
-        "--posteriors",
-        "--nodes",
     ]);
     ok(&out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for ext in ["matches", "posteriors", "props", "nodes"] {
+    for ext in ["matches", "props"] {
         assert!(stdout.contains(&format!("t.{ext}")), "{stdout}");
         assert!(with_ext(&t, ext).exists(), "{ext}");
     }
-    assert!(!with_ext(&t, "report").exists());
+    for ext in ["report", "posteriors", "nodes"] {
+        assert!(!with_ext(&t, ext).exists(), "{ext}");
+    }
     let matches = read(&with_ext(&t, "matches"));
     assert_eq!(matches, read(&with_ext(&q, "matches")));
+    // .props is the query's own, the fit collapsed everything into species 11.
     let props = read(&with_ext(&t, "props"));
-    assert!(props.starts_with("11\t1.0000000000e0"), "{props}");
-    // .posteriors: one row per EM leaf of every classified read, summing to 1; the
-    // unclassified reads of .matches are unclassified here too.
-    let posteriors = read(&with_ext(&t, "posteriors"));
-    assert_eq!(
-        posteriors.lines().next().unwrap(),
-        "ReadID\tTaxID\tPosterior"
-    );
-    let mut classified = 0;
-    for line in matches.lines().skip(1) {
-        let cols: Vec<&str> = line.split('\t').collect();
-        let rows = posterior_rows(&posteriors, cols[0]);
-        if cols[1] == "unclassified" {
-            assert_eq!(rows, vec![("unclassified".to_string(), None)], "{line}");
-            continue;
-        }
-        classified += 1;
-        assert!(!rows.is_empty(), "{line}");
-        let sum: f64 = rows.iter().map(|r| r.1.unwrap()).sum();
-        assert!((sum - 1.0).abs() < 1e-4, "{line}: {rows:?}");
-        // The fit collapsed everything into species 11, the only leaf.
-        assert_eq!(rows[0].0, "11", "{rows:?}");
+    assert_eq!(props, read(&with_ext(&q, "props")));
+    let leaves = props_map(&props);
+    assert_eq!(leaves.len(), 1, "{props}");
+    assert_eq!(leaves[0].0, "11", "{props}");
+    assert!((leaves[0].1 - 1.0).abs() < 1e-12, "{props}");
+    // The posteriors the report implies: one entry per read, the classified reads of
+    // .matches at species 11 with their posterior there.
+    let report = read(&with_ext(&q, "report"));
+    check_posteriors(&report, &matches, 0.6);
+    let posts = posteriors(&report);
+    assert_eq!(posts.len(), 5);
+    let classified: Vec<&str> = table_lines(&matches)
+        .skip(1)
+        .filter_map(|l| l.split('\t').nth(1))
+        .filter(|l| *l != "unclassified")
+        .collect();
+    assert!(!classified.is_empty(), "{matches}");
+    assert!(classified.iter().all(|l| *l == "11"), "{matches}");
+    // The flags of the old tables are gone.
+    for flag in ["--nodes", "--posteriors"] {
+        let gone = run(&[
+            "analyze",
+            "-r",
+            with_ext(&q, "report").to_str().unwrap(),
+            "-o",
+            tmp.path().join("gone").to_str().unwrap(),
+            flag,
+        ]);
+        assert!(!gone.status.success(), "{flag}");
     }
-    assert!(classified >= 1, "{matches}");
-    assert_eq!(posteriors.lines().count(), 1 + 5);
-    // Without the penalty both references stay leaves: reads aligning to both get two
-    // rows in label order, and the pooled view disappears.
+    // Without the penalty both references stay leaves: the refit report's posteriors put
+    // each read on its own reference.
     let two = tmp.path().join("two");
     ok(&run(&[
         "analyze",
@@ -757,34 +1300,113 @@ fn analyze_writes_every_table_from_the_stored_fit() {
         "--matches",
         "--gamma",
         "0.51",
-        "--posteriors",
+        "--write-report",
     ]));
     let matches = read(&with_ext(&two, "matches"));
-    let posteriors = read(&with_ext(&two, "posteriors"));
-    let mut seen: Vec<String> = Vec::new();
-    for line in matches.lines().skip(1) {
-        let cols: Vec<&str> = line.split('\t').collect();
-        let rows = posterior_rows(&posteriors, cols[0]);
-        if cols[1] == "unclassified" {
-            assert_eq!(rows, vec![("unclassified".to_string(), None)], "{line}");
-            continue;
-        }
-        let labels: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-        let mut sorted = labels.clone();
-        sorted.sort_unstable();
-        assert_eq!(labels, sorted, "{line}: {rows:?}");
-        assert!(
-            labels.iter().all(|l| ["ref_A", "ref_B"].contains(l)),
-            "{rows:?}"
-        );
-        assert_eq!(labels[0], cols[1], "{line}: {rows:?}");
-        let sum: f64 = rows.iter().map(|r| r.1.unwrap()).sum();
-        assert!((sum - 1.0).abs() < 1e-4, "{line}: {rows:?}");
-        seen.extend(rows.into_iter().map(|r| r.0));
-    }
+    let report = read(&with_ext(&two, "report"));
+    check_posteriors(&report, &matches, 0.51);
+    // The refit's summary is its own EM (penalty off), naming the report it refits.
+    let summary = matches_summary(&matches, "0.51");
+    assert_summary_params(&summary, &report);
+    assert!(summary.contains("penalty=0"), "{summary}");
+    assert!(
+        summary.contains(", refit of q.report; gamma=0.51"),
+        "{summary}"
+    );
+    let seen: Vec<&str> = table_lines(&matches)
+        .skip(1)
+        .filter_map(|l| l.split('\t').nth(1))
+        .filter(|l| *l != "unclassified")
+        .collect();
+    assert!(
+        seen.iter().all(|l| ["ref_A", "ref_B"].contains(l)),
+        "{matches}"
+    );
     // Both leaves appear (the fixture's reads each align to one reference only, so the
     // pooled multi-row case is covered by the unit tests).
-    assert!(seen.iter().any(|l| l == "ref_A") && seen.iter().any(|l| l == "ref_B"));
+    assert!(
+        seen.contains(&"ref_A") && seen.contains(&"ref_B"),
+        "{matches}"
+    );
+}
+
+/// The report keeps no PROPS or READ_POSTERIORS, in a query's report or a refit's: the
+/// posteriors are regenerated from ALIGNMENT_LIKELIHOODS and the fit's NODES, and each
+/// report's regenerated posteriors are its own fit's and explain its own `.matches`.
+#[test]
+fn report_omits_what_the_em_regenerates() {
+    let tmp = tempfile::tempdir().unwrap();
+    let index = build_index(tmp.path());
+    let cfg = Cfg {
+        tree: true,
+        rho: None,
+    };
+    let q = tmp.path().join("q");
+    let mut args = query_args(&index, tmp.path(), &q, &cfg);
+    args.extend(["--matches", "--gamma", "0.6"].map(str::to_string));
+    ok(&run_owned(&args));
+    let q_text = read(&with_ext(&q, "report"));
+    check_blocks(&q_text);
+    let aligned: Vec<String> = alignment_seqids(&q_text).into_iter().map(|r| r.0).collect();
+    assert_eq!(aligned.len(), 5);
+    check_posteriors(&q_text, &read(&with_ext(&q, "matches")), 0.6);
+    // Unpenalized, both species stay: every read is all on the reference it aligns to.
+    for (_, rows) in posteriors(&q_text) {
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!((rows[0].1 - 1.0).abs() < 1e-12, "{rows:?}");
+    }
+    // A refit with the penalty writes a v4 report with the same blocks, no more.
+    let r = tmp.path().join("r");
+    let out = run(&[
+        "analyze",
+        "-r",
+        with_ext(&q, "report").to_str().unwrap(),
+        "-o",
+        r.to_str().unwrap(),
+        "--rho",
+        "3.5",
+        "--write-report",
+        "--matches",
+        "--gamma",
+        "0.6",
+    ]);
+    ok(&out);
+    let r_text = read(&with_ext(&r, "report"));
+    assert!(
+        r_text.starts_with("#NEXUS\n[PREMISE report v4]\n"),
+        "{r_text}"
+    );
+    assert_eq!(premise_line(&r_text, "VERSION"), "4");
+    check_blocks(&r_text);
+    assert_eq!(
+        block(&r_text, "ALIGNMENT_LIKELIHOODS"),
+        block(&q_text, "ALIGNMENT_LIKELIHOODS")
+    );
+    let r_matches = read(&with_ext(&r, "matches"));
+    check_posteriors(&r_text, &r_matches, 0.6);
+    let summary = matches_summary(&r_matches, "0.6");
+    assert_summary_params(&summary, &r_text);
+    assert!(summary.contains("rho=3.5e0"), "{summary}");
+    assert!(summary.contains(", refit of q.report; "), "{summary}");
+    assert!(
+        premise_line(&r_text, "EM").contains("collapsed=1"),
+        "{r_text}"
+    );
+    // The refit pooled both references under species 11: the reads keep their posterior
+    // on their own sequence, all of it now under 11.
+    let tree = Tree::of(&r_text);
+    let eleven = &tree.id["11"];
+    for (id, rows) in posteriors(&r_text) {
+        assert!(
+            (tree.mass(eleven, &rows) - 1.0).abs() < 1e-9,
+            "{id}: {rows:?}"
+        );
+    }
+    assert_ne!(
+        block(&r_text, "NODES"),
+        block(&q_text, "NODES"),
+        "the refit's own tree"
+    );
 }
 
 #[test]
@@ -811,8 +1433,6 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
         "--gamma",
         "0.6",
         "--props",
-        "--nodes",
-        "--posteriors",
     ]));
     // The same EM parameters again, explicitly: a refit.
     let same = tmp.path().join("same");
@@ -828,54 +1448,70 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
         "--gamma",
         "0.6",
         "--props",
-        "--nodes",
-        "--posteriors",
         "--write-report",
     ]);
     ok(&out);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Refit of q.report"), "{stdout}");
     assert!(stdout.contains("same.report"), "{stdout}");
-    // Proportions agree up to float summation order (the rows are in report order now).
-    let want = props_map(&read(&with_ext(&base, "props")));
-    let got = props_map(&read(&with_ext(&same, "props")));
-    assert_eq!(want.len(), got.len());
-    for ((la, a), (lb, b)) in want.iter().zip(&got) {
-        assert_eq!(la, lb);
-        assert!(
-            (a - b).abs() <= 1e-9 * a.abs().max(1e-300),
-            "{la}: {a} vs {b}"
-        );
-    }
-    // Same vertices, parents, ranks and contig counts in .nodes.
-    let first4 = |t: &str| -> Vec<String> {
-        t.lines()
-            .map(|l| l.split('\t').take(4).collect::<Vec<_>>().join("\t"))
-            .collect()
-    };
+    // The stored fit's .props is the query's own; the refit's agrees with it up to float
+    // summation order.
     assert_eq!(
-        first4(&read(&with_ext(&same, "nodes"))),
-        first4(&read(&with_ext(&base, "nodes")))
+        read(&with_ext(&base, "props")),
+        read(&with_ext(&q, "props"))
     );
-    // Same assignments and posteriors (to the printed digits) as the stored fit.
+    assert_same_props(
+        &read(&with_ext(&base, "props")),
+        &read(&with_ext(&same, "props")),
+    );
+    // Same final vertices, parents, ranks and contig counts in NODES.
+    let q_text = read(&q_report);
+    let r_text = read(&with_ext(&same, "report"));
+    assert_eq!(final_nodes(&r_text), final_nodes(&q_text));
+    // Same assignments as the stored fit (below the summaries, which name the fits).
     let two_cols = |t: &str| -> Vec<String> {
-        t.lines()
+        table_lines(t)
             .map(|l| l.split('\t').take(2).collect::<Vec<_>>().join("\t"))
             .collect()
     };
-    assert_eq!(
-        two_cols(&read(&with_ext(&same, "matches"))),
-        two_cols(&read(&with_ext(&base, "matches")))
+    let (same_m, base_m) = (
+        read(&with_ext(&same, "matches")),
+        read(&with_ext(&base, "matches")),
     );
+    assert_eq!(two_cols(&same_m), two_cols(&base_m));
+    // The stored fit's summary is the query's own; the refit's has the same settings and
+    // names its source, in .matches and in .props alike.
     assert_eq!(
-        two_cols(&read(&with_ext(&same, "posteriors"))),
-        two_cols(&read(&with_ext(&base, "posteriors")))
+        matches_summary(&base_m, "0.6"),
+        matches_summary(&read(&with_ext(&q, "matches")), "0.6")
     );
+    let (sb, ss) = (
+        matches_summary(&base_m, "0.6"),
+        matches_summary(&same_m, "0.6"),
+    );
+    assert!(!sb.contains("refit of"), "{sb}");
+    assert!(ss.contains(", refit of q.report; gamma=0.6"), "{ss}");
+    let settings = |s: &str| s.split(';').next().unwrap().to_string();
+    assert_eq!(settings(&sb), settings(&ss));
+    assert_same_summary(&base_m, &read(&with_ext(&base, "props")), "0.6");
+    assert_same_summary(&same_m, &read(&with_ext(&same, "props")), "0.6");
+    // Same read posteriors: the same sequences per read, the same values up to float
+    // summation order; and each report's posteriors explain its own .matches.
+    let (pq, pr) = (posteriors(&q_text), posteriors(&r_text));
+    assert_eq!(pq.len(), pr.len());
+    for ((ia, ra), (ib, rb)) in pq.iter().zip(&pr) {
+        assert_eq!(ia, ib);
+        assert_eq!(ra.len(), rb.len(), "{ia}: {ra:?} vs {rb:?}");
+        for ((sa, a), (sb, b)) in ra.iter().zip(rb) {
+            assert_eq!(sa, sb, "{ia}");
+            assert!((a - b).abs() <= 1e-9, "{ia}: {ra:?} vs {rb:?}");
+        }
+    }
+    check_posteriors(&q_text, &read(&with_ext(&base, "matches")), 0.6);
+    check_posteriors(&r_text, &read(&with_ext(&same, "matches")), 0.6);
     // The refit report: lineage, the same EM, the alignment rows copied through.
-    let q_text = read(&q_report);
-    let r_text = read(&with_ext(&same, "report"));
     assert_eq!(premise_line(&r_text, "SOURCE"), "q.report");
-    assert_eq!(premise_line(&r_text, "VERSION"), "3");
+    assert_eq!(premise_line(&r_text, "VERSION"), "4");
     assert_eq!(
         premise_line(&r_text, "PARAMS"),
         premise_line(&q_text, "PARAMS")
@@ -924,9 +1560,8 @@ fn refit_with_the_reports_parameters_reproduces_the_fit() {
         "--gamma",
         "0.6",
         "--props",
-        "--posteriors",
     ]));
-    for ext in ["matches", "posteriors", "props"] {
+    for ext in ["matches", "props"] {
         assert_eq!(
             read(&with_ext(&chain, ext)),
             read(&with_ext(&same, ext)),
@@ -983,11 +1618,8 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
     assert!(premise_line(&text, "PARAMS").ends_with("init=split penalty=0"));
     assert!(premise_line(&text, "PARAMS").contains("rho=3.5e0"));
     let props = refit("nop-props", &["--no-penalty"]);
-    assert_eq!(props.lines().count(), 2, "{props}");
-    assert!(
-        props.contains("ref_A\t") && props.contains("ref_B\t"),
-        "{props}"
-    );
+    let leaves: Vec<String> = props_map(&props).into_iter().map(|l| l.0).collect();
+    assert_eq!(leaves, ["ref_A", "ref_B"], "{props}");
     // A huge rho collapses the whole sample into the root.
     let text = report_of("big", &["--rho", "1000"]);
     assert!(
@@ -1079,7 +1711,7 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("announces 6 reads but holds 5"));
     assert!(!with_ext(&b, "props").exists() && !with_ext(&b, "report").exists());
     // ... but a file of an earlier run that this run never opened survives.
-    fs::write(with_ext(&b, "posteriors"), "old\n").unwrap();
+    fs::write(with_ext(&b, "report"), "old\n").unwrap();
     let out = run(&[
         "analyze",
         "-r",
@@ -1092,6 +1724,6 @@ fn refit_overrides_change_the_penalty_and_are_recorded() {
         "--props",
     ]);
     assert!(!out.status.success());
-    assert_eq!(read(&with_ext(&b, "posteriors")), "old\n");
+    assert_eq!(read(&with_ext(&b, "report")), "old\n");
     assert!(!with_ext(&b, "props").exists() && !with_ext(&b, "matches").exists());
 }
